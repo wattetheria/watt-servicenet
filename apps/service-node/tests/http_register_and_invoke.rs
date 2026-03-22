@@ -3,8 +3,8 @@ use axum::http::{Request, StatusCode};
 use axum::{Json, Router, routing::post};
 use std::sync::Arc;
 use tower::ServiceExt;
-use wattswarm_servicenet_node::build_local_app;
-use wattswarm_servicenet_registry::ServiceRegistry;
+use watt_servicenet_node::build_local_app;
+use watt_servicenet_registry::ServiceRegistry;
 
 fn provider_payload() -> serde_json::Value {
     serde_json::json!({

@@ -2,11 +2,11 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::time::sleep;
-use wattswarm_servicenet_p2p::{
+use watt_servicenet_p2p::{
     Multiaddr, ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime,
     ServiceNetworkRuntimeEvent,
 };
-use wattswarm_servicenet_protocol::{
+use watt_servicenet_protocol::{
     ProviderRecord, ProviderStatus, SERVICE_PROTOCOL_SCHEMA_VERSION,
 };
 

@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::fs;
 use tokio::sync::RwLock;
 use uuid::Uuid;
-use wattswarm_servicenet_protocol::{
+use watt_servicenet_protocol::{
     AgentDeployment, AgentHealthRecord, AgentReviewProfile, AgentSubmissionQuery,
     AgentSubmissionRecord, AgentSubmissionStatus, AgentTrustRecord, ApproveAgentSubmissionRequest,
     AuthContextQuery, AuthContextRecord, BlockEntityRequest, CreateModerationCaseRequest,
@@ -2413,12 +2413,12 @@ fn update_health_record(
 ) {
     let now = Utc::now();
     match receipt.status {
-        wattswarm_servicenet_protocol::ReceiptStatus::Succeeded => {
+        watt_servicenet_protocol::ReceiptStatus::Succeeded => {
             *success_count += 1;
             *status = HealthStatus::Online;
         }
-        wattswarm_servicenet_protocol::ReceiptStatus::Rejected
-        | wattswarm_servicenet_protocol::ReceiptStatus::Failed => {
+        watt_servicenet_protocol::ReceiptStatus::Rejected
+        | watt_servicenet_protocol::ReceiptStatus::Failed => {
             *failure_count += 1;
             *status = HealthStatus::Degraded;
         }
@@ -2432,9 +2432,9 @@ fn update_health_record(
 
 fn update_trust_for_receipt(state: &mut RegistryState, receipt: &ExecutionReceipt) {
     let delta = match receipt.status {
-        wattswarm_servicenet_protocol::ReceiptStatus::Succeeded => 0.02,
-        wattswarm_servicenet_protocol::ReceiptStatus::Rejected => -0.05,
-        wattswarm_servicenet_protocol::ReceiptStatus::Failed => -0.1,
+        watt_servicenet_protocol::ReceiptStatus::Succeeded => 0.02,
+        watt_servicenet_protocol::ReceiptStatus::Rejected => -0.05,
+        watt_servicenet_protocol::ReceiptStatus::Failed => -0.1,
     };
     let provider_trust = state
         .provider_trust
@@ -2492,7 +2492,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
     use tempfile::tempdir;
-    use wattswarm_servicenet_protocol::{
+    use watt_servicenet_protocol::{
         AgentArtifacts, AgentAttestations, ApproveAgentSubmissionRequest, AuthModel,
         CreateProviderOwnershipChallengeRequest, ProviderOwnershipOperation,
         RegisterAuthContextRequest, RiskLevel, RunVerifierSweepRequest,
@@ -2529,7 +2529,7 @@ mod tests {
             }),
             deployment: AgentDeployment {
                 runtime: "remote_http".to_owned(),
-                endpoint: wattswarm_servicenet_protocol::AgentDeploymentEndpoint {
+                endpoint: watt_servicenet_protocol::AgentDeploymentEndpoint {
                     url: "https://stripe-agent.example.com/a2a".to_owned(),
                     protocol_binding: "JSONRPC".to_owned(),
                     protocol_version: "1.0".to_owned(),
@@ -2558,7 +2558,7 @@ mod tests {
                 receipt_id: Uuid::new_v4(),
                 agent_id: "stripe-agent".to_owned(),
                 provider_id: "provider-1".to_owned(),
-                status: wattswarm_servicenet_protocol::ReceiptStatus::Succeeded,
+                status: watt_servicenet_protocol::ReceiptStatus::Succeeded,
                 verification: VerificationVerdict::Pending,
                 request_digest: "req".to_owned(),
                 result_digest: Some("res".to_owned()),
@@ -2778,7 +2778,7 @@ mod tests {
                 receipt_id: Uuid::new_v4(),
                 agent_id: "risk-medium".to_owned(),
                 provider_id: "provider-1".to_owned(),
-                status: wattswarm_servicenet_protocol::ReceiptStatus::Succeeded,
+                status: watt_servicenet_protocol::ReceiptStatus::Succeeded,
                 verification: VerificationVerdict::Pending,
                 request_digest: "req".to_owned(),
                 result_digest: Some("res".to_owned()),

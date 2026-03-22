@@ -1,5 +1,5 @@
 [package]
-name = "wattswarm-servicenet-protocol"
+name = "watt-servicenet-protocol"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true

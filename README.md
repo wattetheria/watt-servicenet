@@ -1,4 +1,4 @@
-# wattswarm-servicenet
+# watt-servicenet
 
 Decentralized agent registry and execution gateway for agent networks.
 
@@ -46,23 +46,23 @@ The public and internal model in this repository is now agent-native:
 Run the node:
 
 ```bash
-cargo run -p wattswarm-servicenet-node
+cargo run -p watt-servicenet-node
 ```
 
 Run the node with file-backed persistence:
 
 ```bash
-SERVICENET_REGISTRY_FILE=.data/registry.json cargo run -p wattswarm-servicenet-node
+SERVICENET_REGISTRY_FILE=.data/registry.json cargo run -p watt-servicenet-node
 ```
 
 Run the node with PostgreSQL-backed persistence:
 
 ```bash
-SERVICENET_DATABASE_URL=postgres://servicenet:servicenet@127.0.0.1:55433/wattswarm-servicenet \
+SERVICENET_DATABASE_URL=postgres://servicenet:servicenet@127.0.0.1:55433/watt-servicenet \
 SERVICENET_DATABASE_SCHEMA=public \
 SERVICENET_REQUIRE_PROVIDER_OWNERSHIP_CHALLENGES=1 \
 SERVICENET_SECRET_BROKER_KEY=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc= \
-cargo run -p wattswarm-servicenet-node
+cargo run -p watt-servicenet-node
 ```
 
 Run with Docker Compose:
@@ -77,7 +77,7 @@ Run the node with P2P registry sync enabled:
 SERVICENET_P2P_ENABLED=1 \
 SERVICENET_P2P_NETWORK_ID=devnet \
 SERVICENET_P2P_LISTEN_ADDRS=/ip4/0.0.0.0/tcp/4101 \
-cargo run -p wattswarm-servicenet-node
+cargo run -p watt-servicenet-node
 ```
 
 Join an existing peer:
@@ -87,7 +87,7 @@ SERVICENET_P2P_ENABLED=1 \
 SERVICENET_P2P_NETWORK_ID=devnet \
 SERVICENET_P2P_LISTEN_ADDRS=/ip4/0.0.0.0/tcp/4102 \
 SERVICENET_P2P_BOOTSTRAP_PEERS=/ip4/127.0.0.1/tcp/4101/p2p/<PEER_ID> \
-cargo run -p wattswarm-servicenet-node
+cargo run -p watt-servicenet-node
 ```
 
 Current P2P behavior:
@@ -130,8 +130,8 @@ This repository currently depends on the shared local crate
 `../wattswarm/crates/network-substrate`, so container builds use the parent `Watt` directory as
 the Docker build context.
 
-- `Dockerfile`: multi-stage build for `wattswarm-servicenet-node`
-- `docker-compose.yml`: local runtime with PostgreSQL + `wattswarm-servicenet-node`
+- `Dockerfile`: multi-stage build for `watt-servicenet-node`
+- `docker-compose.yml`: local runtime with PostgreSQL + `watt-servicenet-node`
 - `.dockerignore`: excludes local build and OS junk from repo-local Docker workflows
 - PostgreSQL is exposed on `127.0.0.1:55433`
 - database-backed runs now require `SERVICENET_SECRET_BROKER_KEY`

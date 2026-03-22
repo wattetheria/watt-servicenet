@@ -1,13 +1,13 @@
 use chrono::Utc;
 use serde_json::json;
 use uuid::Uuid;
-use wattswarm_servicenet_protocol::{
+use watt_servicenet_protocol::{
     AgentArtifacts, AgentAttestations, AgentDeployment, AgentDeploymentEndpoint,
     AgentReviewProfile, ApproveAgentSubmissionRequest, ExecutionReceipt, ReceiptQuery,
     ReceiptStatus, RegisterProviderRequest, RiskLevel, RotateProviderKeyRequest, StoredReceipt,
     SubmitAgentRequest, VerificationVerdict,
 };
-use wattswarm_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
+use watt_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
 
 fn database_url() -> Option<String> {
     std::env::var("SERVICENET_TEST_DATABASE_URL").ok()
@@ -144,7 +144,7 @@ async fn postgres_store_handles_provider_agent_and_rotation_flow() {
     let revoked = registry
         .revoke_provider(
             "provider-pg",
-            wattswarm_servicenet_protocol::RevokeProviderRequest {
+            watt_servicenet_protocol::RevokeProviderRequest {
                 reason: Some("compromised".to_owned()),
             },
         )
@@ -152,7 +152,7 @@ async fn postgres_store_handles_provider_agent_and_rotation_flow() {
         .expect("provider should revoke");
     assert_eq!(
         revoked.status,
-        wattswarm_servicenet_protocol::ProviderStatus::Revoked
+        watt_servicenet_protocol::ProviderStatus::Revoked
     );
 }
 
@@ -209,6 +209,6 @@ async fn postgres_store_persists_agent_receipts_and_health() {
         .expect("agent health should load");
     assert_eq!(
         agent_health[0].status,
-        wattswarm_servicenet_protocol::HealthStatus::Online
+        watt_servicenet_protocol::HealthStatus::Online
     );
 }

@@ -2,10 +2,10 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::time::sleep;
-use wattswarm_servicenet_p2p::{
+use watt_servicenet_p2p::{
     ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime, ServiceNetworkRuntimeEvent,
 };
-use wattswarm_servicenet_protocol::{PublishedAgentRecord, PublishedAgentStatus, RiskLevel};
+use watt_servicenet_protocol::{PublishedAgentRecord, PublishedAgentStatus, RiskLevel};
 
 fn demo_published_agent() -> PublishedAgentRecord {
     PublishedAgentRecord {
@@ -23,15 +23,15 @@ fn demo_published_agent() -> PublishedAgentRecord {
             "securitySchemes": { "oauth2": { "type": "oauth2" } },
             "security": [{ "oauth2": ["payments:write"] }]
         }),
-        deployment: wattswarm_servicenet_protocol::AgentDeployment {
+        deployment: watt_servicenet_protocol::AgentDeployment {
             runtime: "remote_http".to_owned(),
-            endpoint: wattswarm_servicenet_protocol::AgentDeploymentEndpoint {
+            endpoint: watt_servicenet_protocol::AgentDeploymentEndpoint {
                 url: "https://stripe-agent.example.com/a2a".to_owned(),
                 protocol_binding: "JSONRPC".to_owned(),
                 protocol_version: "1.0".to_owned(),
             },
         },
-        review: wattswarm_servicenet_protocol::AgentReviewProfile {
+        review: watt_servicenet_protocol::AgentReviewProfile {
             risk_level: RiskLevel::Medium,
             data_classes: vec!["financial".to_owned()],
             destructive_actions: vec!["payments.refund".to_owned()],
@@ -97,7 +97,7 @@ async fn published_agent_gossip_syncs_between_two_nodes() {
 
 async fn wait_for_listen_addr(
     runtime: &mut ServiceNetworkRuntime,
-) -> anyhow::Result<wattswarm_servicenet_p2p::Multiaddr> {
+) -> anyhow::Result<watt_servicenet_p2p::Multiaddr> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if Instant::now() >= deadline {

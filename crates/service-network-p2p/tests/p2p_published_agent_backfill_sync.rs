@@ -2,11 +2,11 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::time::sleep;
-use wattswarm_servicenet_p2p::{
+use watt_servicenet_p2p::{
     Multiaddr, ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime,
     ServiceNetworkRuntimeEvent,
 };
-use wattswarm_servicenet_protocol::{PublishedAgentRecord, PublishedAgentStatus, RiskLevel};
+use watt_servicenet_protocol::{PublishedAgentRecord, PublishedAgentStatus, RiskLevel};
 
 fn demo_published_agent() -> PublishedAgentRecord {
     PublishedAgentRecord {
@@ -24,15 +24,15 @@ fn demo_published_agent() -> PublishedAgentRecord {
             "securitySchemes": { "oauth2": { "type": "oauth2" } },
             "security": [{ "oauth2": ["messaging:write"] }]
         }),
-        deployment: wattswarm_servicenet_protocol::AgentDeployment {
+        deployment: watt_servicenet_protocol::AgentDeployment {
             runtime: "remote_http".to_owned(),
-            endpoint: wattswarm_servicenet_protocol::AgentDeploymentEndpoint {
+            endpoint: watt_servicenet_protocol::AgentDeploymentEndpoint {
                 url: "https://twilio-agent.example.com/a2a".to_owned(),
                 protocol_binding: "JSONRPC".to_owned(),
                 protocol_version: "1.0".to_owned(),
             },
         },
-        review: wattswarm_servicenet_protocol::AgentReviewProfile {
+        review: watt_servicenet_protocol::AgentReviewProfile {
             risk_level: RiskLevel::Low,
             data_classes: vec![],
             destructive_actions: vec![],

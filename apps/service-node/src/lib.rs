@@ -9,12 +9,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
-use wattswarm_servicenet_gateway::{GatewayError, GatewayPolicyConfig, GatewayService};
-use wattswarm_servicenet_p2p::{
+use watt_servicenet_gateway::{GatewayError, GatewayPolicyConfig, GatewayService};
+use watt_servicenet_p2p::{
     PeerHandshakeMetadata, ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime,
     ServiceNetworkRuntimeEvent, encode_servicenet_agent_version,
 };
-use wattswarm_servicenet_protocol::{
+use watt_servicenet_protocol::{
     AgentSubmissionQuery, ApproveAgentSubmissionRequest, AuthContextQuery, BlockEntityRequest,
     CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest, GetAgentTaskRequest,
     InvokeAgentRequest, ModerationCaseQuery, ReceiptQuery, RegisterAuthContextRequest,
@@ -22,7 +22,7 @@ use wattswarm_servicenet_protocol::{
     RevokeProviderRequest, RotateProviderKeyRequest, RunVerifierSweepRequest, SubmitAgentRequest,
     VerifyReceiptRequest,
 };
-use wattswarm_servicenet_registry::{RegistryError, ServiceRegistry, ServiceRegistryConfig};
+use watt_servicenet_registry::{RegistryError, ServiceRegistry, ServiceRegistryConfig};
 
 #[derive(Clone)]
 struct AppState {
@@ -182,7 +182,7 @@ fn build_app(state: RouterState) -> Router {
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
-        "service": "wattswarm-servicenet-node"
+        "service": "watt-servicenet-node"
     }))
 }
 
@@ -627,8 +627,8 @@ enum AppError {
 
 #[derive(Debug)]
 enum P2pCommand {
-    PublishProvider(wattswarm_servicenet_protocol::ProviderRecord),
-    PublishAgent(wattswarm_servicenet_protocol::PublishedAgentRecord),
+    PublishProvider(watt_servicenet_protocol::ProviderRecord),
+    PublishAgent(watt_servicenet_protocol::PublishedAgentRecord),
 }
 
 async fn start_p2p_sync_if_enabled(

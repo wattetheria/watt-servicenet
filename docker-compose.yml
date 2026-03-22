@@ -4,11 +4,11 @@ services:
     environment:
       POSTGRES_USER: servicenet
       POSTGRES_PASSWORD: servicenet
-      POSTGRES_DB: wattswarm-servicenet
+      POSTGRES_DB: watt-servicenet
     ports:
       - "55433:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U servicenet -d wattswarm-servicenet"]
+      test: ["CMD-SHELL", "pg_isready -U servicenet -d watt-servicenet"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -25,7 +25,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      SERVICENET_DATABASE_URL: postgres://servicenet:servicenet@postgres:5432/wattswarm-servicenet
+      SERVICENET_DATABASE_URL: postgres://servicenet:servicenet@postgres:5432/watt-servicenet
       SERVICENET_DATABASE_SCHEMA: public
       SERVICENET_HTTP_ADDR: 0.0.0.0:8042
       SERVICENET_REQUIRE_PROVIDER_OWNERSHIP_CHALLENGES: "1"

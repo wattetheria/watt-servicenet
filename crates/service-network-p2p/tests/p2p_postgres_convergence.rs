@@ -3,16 +3,16 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tokio::time::sleep;
 use uuid::Uuid;
-use wattswarm_servicenet_p2p::{
+use watt_servicenet_p2p::{
     Multiaddr, ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime,
     ServiceNetworkRuntimeEvent,
 };
-use wattswarm_servicenet_protocol::{
+use watt_servicenet_protocol::{
     AgentDeployment, AgentDeploymentEndpoint, AgentReviewProfile, ProviderRecord, ProviderStatus,
     PublishedAgentRecord, PublishedAgentStatus, RegisterProviderRequest, RevokeProviderRequest,
     RiskLevel,
 };
-use wattswarm_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
+use watt_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
 
 fn database_url() -> Option<String> {
     std::env::var("SERVICENET_TEST_DATABASE_URL").ok()

@@ -4027,18 +4027,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wattswarm-network-substrate"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libp2p",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "wattswarm-servicenet-gateway"
+name = "watt-servicenet-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -4050,12 +4039,12 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
- "wattswarm-servicenet-protocol",
- "wattswarm-servicenet-registry",
+ "watt-servicenet-protocol",
+ "watt-servicenet-registry",
 ]
 
 [[package]]
-name = "wattswarm-servicenet-node"
+name = "watt-servicenet-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -4067,14 +4056,14 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
- "wattswarm-servicenet-gateway",
- "wattswarm-servicenet-p2p",
- "wattswarm-servicenet-protocol",
- "wattswarm-servicenet-registry",
+ "watt-servicenet-gateway",
+ "watt-servicenet-p2p",
+ "watt-servicenet-protocol",
+ "watt-servicenet-registry",
 ]
 
 [[package]]
-name = "wattswarm-servicenet-p2p"
+name = "watt-servicenet-p2p"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -4083,13 +4072,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+ "watt-servicenet-protocol",
+ "watt-servicenet-registry",
  "wattswarm-network-substrate",
- "wattswarm-servicenet-protocol",
- "wattswarm-servicenet-registry",
 ]
 
 [[package]]
-name = "wattswarm-servicenet-protocol"
+name = "watt-servicenet-protocol"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -4102,7 +4091,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wattswarm-servicenet-registry"
+name = "watt-servicenet-registry"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -4118,7 +4107,18 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
- "wattswarm-servicenet-protocol",
+ "watt-servicenet-protocol",
+]
+
+[[package]]
+name = "wattswarm-network-substrate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libp2p",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

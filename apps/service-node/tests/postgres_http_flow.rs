@@ -2,8 +2,8 @@ use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 use uuid::Uuid;
-use wattswarm_servicenet_node::build_local_app;
-use wattswarm_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
+use watt_servicenet_node::build_local_app;
+use watt_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
 
 fn database_url() -> Option<String> {
     std::env::var("SERVICENET_TEST_DATABASE_URL").ok()

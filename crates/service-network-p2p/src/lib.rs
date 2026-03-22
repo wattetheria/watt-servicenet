@@ -5,7 +5,7 @@ use wattswarm_network_substrate::{
     RawBackfillRequest, RawBackfillResponse, RawGossipMessage, SubstrateConfig, SubstrateNode,
     SubstrateRuntime, SubstrateRuntimeEvent, SwarmScope, TopicKind, TopicNamespace,
 };
-use wattswarm_servicenet_protocol::{ProviderRecord, PublishedAgentRecord};
+use watt_servicenet_protocol::{ProviderRecord, PublishedAgentRecord};
 
 pub use wattswarm_network_substrate::{Multiaddr, PeerHandshakeMetadata, PeerId};
 
@@ -397,7 +397,7 @@ impl ServiceNetworkRuntime {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use wattswarm_servicenet_protocol::{
+    use watt_servicenet_protocol::{
         AgentDeployment, AgentDeploymentEndpoint, AgentReviewProfile, ProviderStatus,
         PublishedAgentStatus, RiskLevel, SERVICE_PROTOCOL_SCHEMA_VERSION,
     };

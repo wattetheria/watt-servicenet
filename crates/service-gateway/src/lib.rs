@@ -5,12 +5,12 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
-use wattswarm_servicenet_protocol::{
+use watt_servicenet_protocol::{
     AuthContextRecord, ExecutionReceipt, GetAgentTaskRequest, InvokeAgentRequest,
     InvokeAgentResponse, PublishedAgentRecord, ReceiptStatus, RiskLevel, StoredReceipt,
     VerificationVerdict,
 };
-use wattswarm_servicenet_registry::{RegistryError, ServiceRegistry};
+use watt_servicenet_registry::{RegistryError, ServiceRegistry};
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -255,7 +255,7 @@ impl GatewayService {
             .get_agent_trust(&record.agent_id)
             .await
             .map_err(map_registry_error)?;
-        if provider.status == wattswarm_servicenet_protocol::ProviderStatus::Revoked {
+        if provider.status == watt_servicenet_protocol::ProviderStatus::Revoked {
             return Err(GatewayError::Rejected("provider is revoked".to_owned()));
         }
         if provider_trust.blocked {
@@ -466,7 +466,7 @@ mod tests {
     use super::*;
     use axum::{Json, Router, routing::post};
     use std::sync::Arc;
-    use wattswarm_servicenet_protocol::{
+    use watt_servicenet_protocol::{
         AgentArtifacts, AgentAttestations, AgentDeployment, AgentDeploymentEndpoint,
         AgentReviewProfile, ApproveAgentSubmissionRequest, AuthModel, RegisterAuthContextRequest,
         RegisterProviderRequest, RiskLevel, SubmitAgentRequest,
@@ -632,7 +632,7 @@ mod tests {
             .expect("invoke should succeed");
         assert_eq!(response.agent_id, "stripe-agent");
         let receipts = registry
-            .list_receipts(&wattswarm_servicenet_protocol::ReceiptQuery {
+            .list_receipts(&watt_servicenet_protocol::ReceiptQuery {
                 agent_id: Some("stripe-agent".to_owned()),
                 ..Default::default()
             })
@@ -647,7 +647,7 @@ mod tests {
         registry
             .block_agent(
                 "stripe-agent",
-                wattswarm_servicenet_protocol::BlockEntityRequest {
+                watt_servicenet_protocol::BlockEntityRequest {
                     reason: Some("manual".to_owned()),
                 },
             )

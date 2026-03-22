@@ -1,5 +1,5 @@
 [package]
-name = "wattswarm-servicenet-p2p"
+name = "watt-servicenet-p2p"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -11,9 +11,9 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 wattswarm-network-substrate.workspace = true
-wattswarm-servicenet-protocol = { path = "../service-protocol" }
+watt-servicenet-protocol = { path = "../service-protocol" }
 
 [dev-dependencies]
 tokio.workspace = true
 uuid.workspace = true
-wattswarm-servicenet-registry = { path = "../service-registry" }
+watt-servicenet-registry = { path = "../service-registry" }

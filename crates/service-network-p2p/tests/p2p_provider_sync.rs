@@ -2,10 +2,10 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::time::sleep;
-use wattswarm_servicenet_p2p::{
+use watt_servicenet_p2p::{
     ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime, ServiceNetworkRuntimeEvent,
 };
-use wattswarm_servicenet_protocol::{
+use watt_servicenet_protocol::{
     ProviderRecord, ProviderStatus, SERVICE_PROTOCOL_SCHEMA_VERSION,
 };
 
@@ -131,7 +131,7 @@ async fn provider_revocation_update_syncs_between_two_nodes() {
 
 async fn wait_for_listen_addr(
     runtime: &mut ServiceNetworkRuntime,
-) -> anyhow::Result<wattswarm_servicenet_p2p::Multiaddr> {
+) -> anyhow::Result<watt_servicenet_p2p::Multiaddr> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if Instant::now() >= deadline {
