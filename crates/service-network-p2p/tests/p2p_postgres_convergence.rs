@@ -25,7 +25,7 @@ fn schema_name(prefix: &str) -> String {
 fn provider_request() -> RegisterProviderRequest {
     RegisterProviderRequest {
         provider_id: "provider-p2p".to_owned(),
-        provider_public_key: "cHJvdmlkZXItcDJwLWRldmtleQ==".to_owned(),
+        provider_did: "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp".to_owned(),
         display_name: Some("Provider P2P".to_owned()),
         ownership_challenge_id: None,
         ownership_signature: None,

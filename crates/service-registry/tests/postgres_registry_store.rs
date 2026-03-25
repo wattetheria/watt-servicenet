@@ -1,11 +1,14 @@
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use chrono::Utc;
+use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
 use uuid::Uuid;
 use watt_servicenet_protocol::{
     AgentArtifacts, AgentAttestations, AgentDeployment, AgentDeploymentEndpoint,
     AgentReviewProfile, ApproveAgentSubmissionRequest, ExecutionReceipt, ReceiptQuery,
     ReceiptStatus, RegisterProviderRequest, RiskLevel, RotateProviderKeyRequest, StoredReceipt,
-    SubmitAgentRequest, VerificationVerdict,
+    SubmitAgentRequest, VerificationVerdict, build_agent_attestation_payload,
 };
 use watt_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
 
@@ -17,10 +20,34 @@ fn schema_name(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
 }
 
+fn provider_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[21u8; 32])
+}
+
+fn did_from_signing_key(signing_key: &SigningKey) -> String {
+    format!(
+        "did:key:z{}",
+        bs58::encode(
+            [
+                &[0xed, 0x01][..],
+                &signing_key.verifying_key().to_bytes()[..]
+            ]
+            .concat()
+        )
+        .into_string()
+    )
+}
+
+fn sign_submission_attestation(request: &mut SubmitAgentRequest, signing_key: &SigningKey) {
+    let payload = serde_jcs::to_vec(&build_agent_attestation_payload(request)).unwrap();
+    request.attestations.attestation_signature =
+        STANDARD.encode(signing_key.sign(&payload).to_bytes());
+}
+
 fn provider_request() -> RegisterProviderRequest {
     RegisterProviderRequest {
         provider_id: "provider-pg".to_owned(),
-        provider_public_key: "cHJvdmlkZXItcGctZGV2a2V5".to_owned(),
+        provider_did: did_from_signing_key(&provider_signing_key()),
         display_name: Some("Provider PG".to_owned()),
         ownership_challenge_id: None,
         ownership_signature: None,
@@ -28,7 +55,7 @@ fn provider_request() -> RegisterProviderRequest {
 }
 
 fn agent_submission() -> SubmitAgentRequest {
-    SubmitAgentRequest {
+    let mut request = SubmitAgentRequest {
         provider_id: "provider-pg".to_owned(),
         agent_id: "stripe-agent".to_owned(),
         version: "0.1.0".to_owned(),
@@ -60,11 +87,16 @@ fn agent_submission() -> SubmitAgentRequest {
         },
         artifacts: AgentArtifacts::default(),
         attestations: AgentAttestations {
-            provider_signature: "signed-by-provider".to_owned(),
+            attestation_signature: String::new(),
+            provider_attester_did: None,
+            delegation_token: None,
             source_commit: Some("abc123".to_owned()),
             build_digest: Some("sha256:demo".to_owned()),
         },
-    }
+    };
+    let provider_key = provider_signing_key();
+    sign_submission_attestation(&mut request, &provider_key);
+    request
 }
 
 fn stored_receipt() -> StoredReceipt {
@@ -131,7 +163,8 @@ async fn postgres_store_handles_provider_agent_and_rotation_flow() {
         .rotate_provider_key(
             "provider-pg",
             RotateProviderKeyRequest {
-                new_public_key: "bmV3LXByb3ZpZGVyLXBnLWtleQ==".to_owned(),
+                new_provider_did: "did:key:z6MkhY7vL8T5d4w8n8f1M5uH1D2e4Q9zP3n5K7s2V4x6Y8Za"
+                    .to_owned(),
                 reason: Some("rotation".to_owned()),
                 ownership_challenge_id: None,
                 ownership_signature: None,
@@ -139,7 +172,10 @@ async fn postgres_store_handles_provider_agent_and_rotation_flow() {
         )
         .await
         .expect("provider key should rotate");
-    assert_eq!(rotated.provider_public_key, "bmV3LXByb3ZpZGVyLXBnLWtleQ==");
+    assert_eq!(
+        rotated.provider_did,
+        "did:key:z6MkhY7vL8T5d4w8n8f1M5uH1D2e4Q9zP3n5K7s2V4x6Y8Za"
+    );
 
     let revoked = registry
         .revoke_provider(

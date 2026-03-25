@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::json;
 use uuid::Uuid;
 
 pub const SERVICE_PROTOCOL_SCHEMA_VERSION: u32 = 1;
@@ -38,7 +39,7 @@ pub struct ProviderRecord {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     pub provider_id: String,
-    pub provider_public_key: String,
+    pub provider_did: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub status: ProviderStatus,
@@ -176,7 +177,8 @@ pub enum ProviderOwnershipOperation {
 pub struct ProviderOwnershipChallenge {
     pub challenge_id: Uuid,
     pub provider_id: String,
-    pub public_key: String,
+    #[serde(alias = "public_key")]
+    pub provider_did: String,
     pub operation: ProviderOwnershipOperation,
     pub challenge: String,
     pub issued_at: DateTime<Utc>,
@@ -188,7 +190,8 @@ pub struct ProviderOwnershipChallenge {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateProviderOwnershipChallengeRequest {
     pub provider_id: String,
-    pub public_key: String,
+    #[serde(alias = "public_key")]
+    pub provider_did: String,
     pub operation: ProviderOwnershipOperation,
 }
 
@@ -237,7 +240,7 @@ pub struct VerifyReceiptRequest {
 pub struct AuthContextRecord {
     pub auth_context_id: Uuid,
     pub secret_ref: Uuid,
-    pub subject: String,
+    pub subject_did: String,
     pub provider_id: String,
     pub auth_model: AuthModel,
     pub token_preview: String,
@@ -248,7 +251,7 @@ pub struct AuthContextRecord {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegisterAuthContextRequest {
-    pub subject: String,
+    pub subject_did: String,
     pub provider_id: String,
     pub auth_model: AuthModel,
     pub token: String,
@@ -261,7 +264,7 @@ pub struct AuthContextQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject: Option<String>,
+    pub subject_did: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -411,11 +414,31 @@ pub struct AgentArtifacts {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentAttestations {
-    pub provider_signature: String,
+    pub attestation_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_attester_did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_digest: Option<String>,
+}
+
+pub fn build_agent_attestation_payload(request: &SubmitAgentRequest) -> Value {
+    json!({
+        "provider_id": request.provider_id,
+        "agent_id": request.agent_id,
+        "version": request.version,
+        "agent_card": request.agent_card,
+        "deployment": request.deployment,
+        "review": request.review,
+        "artifacts": request.artifacts,
+        "provider_attester_did": request.attestations.provider_attester_did,
+        "delegation_token": request.attestations.delegation_token,
+        "source_commit": request.attestations.source_commit,
+        "build_digest": request.attestations.build_digest,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -546,7 +569,7 @@ pub struct InvokeAgentResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegisterProviderRequest {
     pub provider_id: String,
-    pub provider_public_key: String,
+    pub provider_did: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -557,7 +580,7 @@ pub struct RegisterProviderRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RotateProviderKeyRequest {
-    pub new_public_key: String,
+    pub new_provider_did: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -580,7 +603,7 @@ mod tests {
     fn protocol_defaults_schema_version_to_v1() {
         let provider: ProviderRecord = serde_json::from_value(serde_json::json!({
             "provider_id": "provider-1",
-            "provider_public_key": "cHJvdmlkZXI=",
+            "provider_did": "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp",
             "status": "active",
             "registered_at": "2026-03-22T00:00:00Z"
         }))
@@ -624,7 +647,7 @@ mod tests {
                 "documentation_url": "https://example.com/docs"
             },
             "attestations": {
-                "provider_signature": "sig",
+                "attestation_signature": "sig",
                 "source_commit": "abc123"
             }
         }))

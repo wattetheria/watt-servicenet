@@ -1,11 +1,11 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use watt_servicenet_protocol::{ProviderRecord, PublishedAgentRecord};
 use wattswarm_network_substrate::{
     BackfillRequestId, BackfillResponseChannel, NetworkRuntimeObservabilitySnapshot,
     RawBackfillRequest, RawBackfillResponse, RawGossipMessage, SubstrateConfig, SubstrateNode,
     SubstrateRuntime, SubstrateRuntimeEvent, SwarmScope, TopicKind, TopicNamespace,
 };
-use watt_servicenet_protocol::{ProviderRecord, PublishedAgentRecord};
 
 pub use wattswarm_network_substrate::{Multiaddr, PeerHandshakeMetadata, PeerId};
 
@@ -17,6 +17,7 @@ pub fn encode_servicenet_agent_version(metadata: &PeerHandshakeMetadata) -> Stri
     metadata.encode_agent_version_with_prefix(SERVICENET_IDENTIFY_AGENT_PREFIX)
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum ServiceNetworkMessage {
@@ -119,6 +120,7 @@ impl ServiceNetworkNode {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ServiceNetworkRuntimeEvent {
     NewListenAddr {
@@ -406,7 +408,7 @@ mod tests {
         ProviderRecord {
             schema_version: SERVICE_PROTOCOL_SCHEMA_VERSION,
             provider_id: "provider-local".to_owned(),
-            provider_public_key: "cHJvdmlkZXItbG9jYWwtZGV2a2V5".to_owned(),
+            provider_did: "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp".to_owned(),
             display_name: Some("Provider Local".to_owned()),
             status: ProviderStatus::Active,
             registered_at: chrono::Utc::now(),

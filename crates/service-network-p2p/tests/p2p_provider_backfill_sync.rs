@@ -6,15 +6,13 @@ use watt_servicenet_p2p::{
     Multiaddr, ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime,
     ServiceNetworkRuntimeEvent,
 };
-use watt_servicenet_protocol::{
-    ProviderRecord, ProviderStatus, SERVICE_PROTOCOL_SCHEMA_VERSION,
-};
+use watt_servicenet_protocol::{ProviderRecord, ProviderStatus, SERVICE_PROTOCOL_SCHEMA_VERSION};
 
 fn demo_provider() -> ProviderRecord {
     ProviderRecord {
         schema_version: SERVICE_PROTOCOL_SCHEMA_VERSION,
         provider_id: "provider-local".to_owned(),
-        provider_public_key: "cHJvdmlkZXItbG9jYWwtZGV2a2V5".to_owned(),
+        provider_did: "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp".to_owned(),
         display_name: Some("Provider Local".to_owned()),
         status: ProviderStatus::Active,
         registered_at: Utc::now(),

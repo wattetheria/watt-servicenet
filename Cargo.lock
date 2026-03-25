@@ -2853,7 +2853,9 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -3037,6 +3039,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3076,6 +3084,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "serde_jcs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cacecf649bc1a7c5f0e299cc813977c6a78116abda2b93b1ee01735b71ead9a8"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4027,13 +4046,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "watt-did"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bs58",
+ "ed25519-dalek",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "watt-servicenet-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
+ "bs58",
  "chrono",
+ "ed25519-dalek",
  "reqwest",
+ "serde_jcs",
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
@@ -4050,8 +4087,10 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "bs58",
  "ed25519-dalek",
  "serde",
+ "serde_jcs",
  "serde_json",
  "tokio",
  "tower",
@@ -4088,6 +4127,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
+ "watt-did",
 ]
 
 [[package]]
@@ -4097,16 +4137,19 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "bs58",
  "chacha20poly1305",
  "chrono",
  "ed25519-dalek",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+ "watt-did",
  "watt-servicenet-protocol",
 ]
 

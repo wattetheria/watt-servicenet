@@ -196,7 +196,7 @@ async fn register_provider(
         .await
         .map_err(AppError::from)?;
     if let Some(sender) = &state.p2p_commands {
-        let _ = sender.try_send(P2pCommand::PublishProvider(provider.clone()));
+        let _ = sender.try_send(P2pCommand::PublishProvider(Box::new(provider.clone())));
     }
     Ok((StatusCode::CREATED, Json(serde_json::json!(provider))))
 }
@@ -259,7 +259,7 @@ async fn rotate_provider_key(
         .await
         .map_err(AppError::from)?;
     if let Some(sender) = &state.p2p_commands {
-        let _ = sender.try_send(P2pCommand::PublishProvider(provider.clone()));
+        let _ = sender.try_send(P2pCommand::PublishProvider(Box::new(provider.clone())));
     }
     Ok(Json(serde_json::json!(provider)))
 }
@@ -275,7 +275,7 @@ async fn revoke_provider(
         .await
         .map_err(AppError::from)?;
     if let Some(sender) = &state.p2p_commands {
-        let _ = sender.try_send(P2pCommand::PublishProvider(provider.clone()));
+        let _ = sender.try_send(P2pCommand::PublishProvider(Box::new(provider.clone())));
     }
     Ok(Json(serde_json::json!(provider)))
 }
@@ -348,7 +348,7 @@ async fn approve_agent_submission(
         .await
         .map_err(AppError::from)?;
     if let Some(sender) = &state.p2p_commands {
-        let _ = sender.try_send(P2pCommand::PublishAgent(item.clone()));
+        let _ = sender.try_send(P2pCommand::PublishAgent(Box::new(item.clone())));
     }
     Ok(Json(serde_json::json!(item)))
 }
@@ -627,8 +627,8 @@ enum AppError {
 
 #[derive(Debug)]
 enum P2pCommand {
-    PublishProvider(watt_servicenet_protocol::ProviderRecord),
-    PublishAgent(watt_servicenet_protocol::PublishedAgentRecord),
+    PublishProvider(Box<watt_servicenet_protocol::ProviderRecord>),
+    PublishAgent(Box<watt_servicenet_protocol::PublishedAgentRecord>),
 }
 
 async fn start_p2p_sync_if_enabled(

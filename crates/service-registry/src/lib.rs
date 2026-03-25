@@ -15,6 +15,11 @@ use thiserror::Error;
 use tokio::fs;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+use watt_did::proof::ProofVerifier;
+use watt_did::{
+    CompactJoseEdDsaVerifier, Did, DidKey, DidKeyPublicKey, JoseValidationOptions, ProofAlgorithm,
+    ProofEnvelope, UcanCapability,
+};
 use watt_servicenet_protocol::{
     AgentDeployment, AgentHealthRecord, AgentReviewProfile, AgentSubmissionQuery,
     AgentSubmissionRecord, AgentSubmissionStatus, AgentTrustRecord, ApproveAgentSubmissionRequest,
@@ -27,7 +32,7 @@ use watt_servicenet_protocol::{
     RegisterAuthContextRequest, RegisterProviderRequest, RejectAgentSubmissionRequest,
     ResolveModerationCaseRequest, RevokeProviderRequest, RiskLevel, RotateProviderKeyRequest,
     RunVerifierSweepRequest, SERVICE_PROTOCOL_SCHEMA_VERSION, StoredReceipt, SubmitAgentRequest,
-    VerificationRecord, VerificationVerdict, VerifyReceiptRequest,
+    VerificationRecord, VerificationVerdict, VerifyReceiptRequest, build_agent_attestation_payload,
 };
 
 #[derive(Debug, Error)]
@@ -317,7 +322,7 @@ impl PostgresRegistryStore {
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."auth_contexts" (
                     auth_context_id UUID PRIMARY KEY,
                     provider_id TEXT NOT NULL,
-                    subject TEXT NOT NULL,
+                    subject_did TEXT NOT NULL,
                     expires_at TIMESTAMPTZ NULL,
                     record_json JSONB NOT NULL
                 )"#
@@ -670,12 +675,12 @@ impl RegistryStore for PostgresRegistryStore {
 
         for record in state.auth_contexts.values() {
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."auth_contexts" (auth_context_id, provider_id, subject, expires_at, record_json) VALUES ($1, $2, $3, $4, $5)"#,
+                r#"INSERT INTO "{}"."auth_contexts" (auth_context_id, provider_id, subject_did, expires_at, record_json) VALUES ($1, $2, $3, $4, $5)"#,
                 self.schema
             ))
             .bind(record.auth_context_id)
             .bind(&record.provider_id)
-            .bind(&record.subject)
+            .bind(&record.subject_did)
             .bind(record.expires_at)
             .bind(serde_json::to_value(record)?)
             .execute(&mut *tx)
@@ -853,18 +858,19 @@ impl ServiceRegistry {
                 "provider_id must not be empty".to_owned(),
             ));
         }
-        if request.public_key.trim().is_empty() {
+        if request.provider_did.trim().is_empty() {
             return Err(RegistryError::InvalidOwnershipChallenge(
-                "public_key must not be empty".to_owned(),
+                "provider_did must not be empty".to_owned(),
             ));
         }
+        validate_provider_did(&request.provider_did)?;
         let mut nonce = [0u8; 32];
         OsRng.fill_bytes(&mut nonce);
         let now = Utc::now();
         let challenge = ProviderOwnershipChallenge {
             challenge_id: Uuid::new_v4(),
             provider_id: request.provider_id,
-            public_key: request.public_key,
+            provider_did: request.provider_did,
             operation: request.operation,
             challenge: STANDARD.encode(nonce),
             issued_at: now,
@@ -900,11 +906,12 @@ impl ServiceRegistry {
                 "provider_id must not be empty".to_owned(),
             ));
         }
-        if request.provider_public_key.trim().is_empty() {
+        if request.provider_did.trim().is_empty() {
             return Err(RegistryError::InvalidProvider(
-                "provider_public_key must not be empty".to_owned(),
+                "provider_did must not be empty".to_owned(),
             ));
         }
+        validate_provider_did(&request.provider_did)?;
         let mut state = self.load_state().await?;
         if state.providers.contains_key(&request.provider_id) {
             return Err(RegistryError::ProviderAlreadyExists(request.provider_id));
@@ -912,7 +919,7 @@ impl ServiceRegistry {
         self.consume_provider_ownership_challenge(
             &mut state,
             &request.provider_id,
-            &request.provider_public_key,
+            &request.provider_did,
             ProviderOwnershipOperation::Register,
             request.ownership_challenge_id,
             request.ownership_signature.as_deref(),
@@ -921,7 +928,7 @@ impl ServiceRegistry {
         let provider = ProviderRecord {
             schema_version: SERVICE_PROTOCOL_SCHEMA_VERSION,
             provider_id: request.provider_id,
-            provider_public_key: request.provider_public_key,
+            provider_did: request.provider_did,
             display_name: request.display_name,
             status: ProviderStatus::Active,
             registered_at: Utc::now(),
@@ -979,16 +986,17 @@ impl ServiceRegistry {
         provider_id: &str,
         request: RotateProviderKeyRequest,
     ) -> Result<ProviderRecord, RegistryError> {
-        if request.new_public_key.trim().is_empty() {
+        if request.new_provider_did.trim().is_empty() {
             return Err(RegistryError::InvalidProvider(
-                "new_public_key must not be empty".to_owned(),
+                "new_provider_did must not be empty".to_owned(),
             ));
         }
+        validate_provider_did(&request.new_provider_did)?;
         let mut state = self.load_state().await?;
         self.consume_provider_ownership_challenge(
             &mut state,
             provider_id,
-            &request.new_public_key,
+            &request.new_provider_did,
             ProviderOwnershipOperation::RotateKey,
             request.ownership_challenge_id,
             request.ownership_signature.as_deref(),
@@ -997,7 +1005,7 @@ impl ServiceRegistry {
             .providers
             .get_mut(provider_id)
             .ok_or_else(|| RegistryError::ProviderNotFound(provider_id.to_owned()))?;
-        provider.provider_public_key = request.new_public_key;
+        provider.provider_did = request.new_provider_did;
         provider.revoked_at = None;
         provider.revoke_reason = None;
         let provider = provider.clone();
@@ -1903,11 +1911,12 @@ impl ServiceRegistry {
         &self,
         request: RegisterAuthContextRequest,
     ) -> Result<AuthContextRecord, RegistryError> {
-        if request.subject.trim().is_empty() {
+        if request.subject_did.trim().is_empty() {
             return Err(RegistryError::InvalidAuthContext(
-                "subject must not be empty".to_owned(),
+                "subject_did must not be empty".to_owned(),
             ));
         }
+        validate_subject_did(&request.subject_did)?;
         if request.token.trim().is_empty() {
             return Err(RegistryError::InvalidAuthContext(
                 "token must not be empty".to_owned(),
@@ -1922,7 +1931,7 @@ impl ServiceRegistry {
         let record = AuthContextRecord {
             auth_context_id,
             secret_ref,
-            subject: request.subject,
+            subject_did: request.subject_did,
             provider_id: request.provider_id,
             auth_model: request.auth_model,
             token_preview: mask_secret(&request.token),
@@ -1981,9 +1990,9 @@ impl ServiceRegistry {
             })
             .filter(|record| {
                 query
-                    .subject
+                    .subject_did
                     .as_deref()
-                    .is_none_or(|subject| record.subject == subject)
+                    .is_none_or(|subject_did| record.subject_did == subject_did)
             })
             .collect::<Vec<_>>();
         items.sort_by(|left, right| left.created_at.cmp(&right.created_at));
@@ -1994,7 +2003,7 @@ impl ServiceRegistry {
         &self,
         state: &mut RegistryState,
         provider_id: &str,
-        public_key: &str,
+        provider_did: &str,
         operation: ProviderOwnershipOperation,
         challenge_id: Option<Uuid>,
         signature: Option<&str>,
@@ -2019,9 +2028,9 @@ impl ServiceRegistry {
                 "challenge provider_id does not match".to_owned(),
             ));
         }
-        if challenge.public_key != public_key {
+        if challenge.provider_did != provider_did {
             return Err(RegistryError::InvalidOwnershipChallenge(
-                "challenge public_key does not match".to_owned(),
+                "challenge provider_did does not match".to_owned(),
             ));
         }
         if challenge.operation != operation {
@@ -2039,7 +2048,7 @@ impl ServiceRegistry {
                 "challenge expired".to_owned(),
             ));
         }
-        verify_challenge_signature(public_key, &challenge.challenge, signature)?;
+        verify_challenge_signature(provider_did, &challenge.challenge, signature)?;
         challenge.completed_at = Some(Utc::now());
         Ok(())
     }
@@ -2057,12 +2066,181 @@ fn validate_provider_record(provider: &ProviderRecord) -> Result<(), RegistryErr
             "provider_id must not be empty".to_owned(),
         ));
     }
-    if provider.provider_public_key.trim().is_empty() {
+    if provider.provider_did.trim().is_empty() {
         return Err(RegistryError::InvalidProvider(
-            "provider_public_key must not be empty".to_owned(),
+            "provider_did must not be empty".to_owned(),
         ));
     }
+    validate_provider_did(&provider.provider_did)?;
     Ok(())
+}
+
+fn validate_provider_did(provider_did: &str) -> Result<(), RegistryError> {
+    let did = Did::parse(provider_did).map_err(|error| {
+        RegistryError::InvalidProvider(format!("invalid provider_did: {error}"))
+    })?;
+    if did.method() != "key" {
+        return Err(RegistryError::InvalidProvider(
+            "provider_did must use did:key".to_owned(),
+        ));
+    }
+    let did_key = DidKey::from_did(did).map_err(|error| {
+        RegistryError::InvalidProvider(format!("invalid provider_did: {error}"))
+    })?;
+    match did_key
+        .decode_public_key()
+        .map_err(|error| RegistryError::InvalidProvider(format!("invalid provider_did: {error}")))?
+    {
+        DidKeyPublicKey::Ed25519(_) => Ok(()),
+        _ => Err(RegistryError::InvalidProvider(
+            "provider_did must resolve to an Ed25519 verification key".to_owned(),
+        )),
+    }
+}
+
+fn validate_subject_did(subject_did: &str) -> Result<(), RegistryError> {
+    Did::parse(subject_did)
+        .map(|_| ())
+        .map_err(|error| RegistryError::InvalidAuthContext(format!("invalid subject_did: {error}")))
+}
+
+fn validate_agent_attestations(
+    request: &SubmitAgentRequest,
+    provider: &ProviderRecord,
+) -> Result<(), RegistryError> {
+    let attester_did = request
+        .attestations
+        .provider_attester_did
+        .as_deref()
+        .unwrap_or(&provider.provider_did);
+    validate_provider_did(attester_did)?;
+
+    if attester_did != provider.provider_did {
+        let delegation_token =
+            request
+                .attestations
+                .delegation_token
+                .as_deref()
+                .ok_or_else(|| {
+                    RegistryError::InvalidAgent(
+                        "delegation_token is required when provider_attester_did differs from provider_did"
+                            .to_owned(),
+                    )
+                })?;
+        verify_provider_attestation_delegation(
+            &provider.provider_did,
+            attester_did,
+            delegation_token,
+        )?;
+    }
+
+    verify_agent_attestation_signature(attester_did, request)?;
+    Ok(())
+}
+
+fn verify_provider_attestation_delegation(
+    provider_did: &str,
+    attester_did: &str,
+    delegation_token: &str,
+) -> Result<(), RegistryError> {
+    let issuer = Did::parse(provider_did)
+        .map_err(|error| RegistryError::InvalidAgent(format!("invalid provider_did: {error}")))?;
+    let attester = Did::parse(attester_did).map_err(|error| {
+        RegistryError::InvalidAgent(format!("invalid provider_attester_did: {error}"))
+    })?;
+    let document = DidKey::from_did(issuer.clone())
+        .map_err(|error| RegistryError::InvalidAgent(format!("invalid provider_did: {error}")))?
+        .to_document()
+        .map_err(|error| RegistryError::InvalidAgent(format!("invalid provider_did: {error}")))?;
+    let verifier = CompactJoseEdDsaVerifier::new(JoseValidationOptions {
+        expected_issuer: Some(issuer.to_string()),
+        expected_subject: Some(attester.to_string()),
+        expected_audience: vec!["watt:servicenet:public-agent-attestation".to_owned()],
+        current_time_ms: Some(Utc::now().timestamp_millis().max(0) as u64),
+        require_exp: true,
+        require_sub: true,
+    });
+    verifier
+        .verify(
+            &ProofEnvelope {
+                algorithm: ProofAlgorithm::Jwt,
+                value: delegation_token.to_owned(),
+                verification_method: None,
+                challenge: None,
+                nonce: None,
+                created_at: None,
+                expires_at: None,
+            },
+            &issuer,
+            &document,
+        )
+        .map_err(|error| {
+            RegistryError::InvalidAgent(format!("invalid attestation delegation token: {error}"))
+        })?;
+
+    let capabilities = extract_capabilities_from_token(delegation_token)?;
+    let allows_attestation = capabilities.iter().any(|capability| {
+        (capability.resource == "*"
+            || capability.resource == "urn:watt:servicenet:public-agent-attestation")
+            && (capability.ability == "*" || capability.ability == "attest")
+    });
+    if !allows_attestation {
+        return Err(RegistryError::InvalidAgent(
+            "delegation_token missing public-agent attestation capability".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn verify_agent_attestation_signature(
+    attester_did: &str,
+    request: &SubmitAgentRequest,
+) -> Result<(), RegistryError> {
+    let public_key_bytes = public_key_bytes_from_ref(attester_did)?;
+    let signature_bytes = STANDARD
+        .decode(&request.attestations.attestation_signature)
+        .map_err(|_| {
+            RegistryError::InvalidAgent("invalid attestation signature encoding".to_owned())
+        })?;
+    let public_key_bytes: [u8; 32] = public_key_bytes.try_into().map_err(|_| {
+        RegistryError::InvalidAgent("invalid attester public key length".to_owned())
+    })?;
+    let signature_bytes: [u8; 64] = signature_bytes.try_into().map_err(|_| {
+        RegistryError::InvalidAgent("invalid attestation signature length".to_owned())
+    })?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
+        .map_err(|_| RegistryError::InvalidAgent("invalid attester public key bytes".to_owned()))?;
+    let payload =
+        serde_jcs::to_vec(&build_agent_attestation_payload(request)).map_err(|error| {
+            RegistryError::InvalidAgent(format!("canonicalize attestation payload: {error}"))
+        })?;
+    verifying_key
+        .verify(&payload, &Signature::from_bytes(&signature_bytes))
+        .map_err(|_| {
+            RegistryError::InvalidAgent("attestation signature verification failed".to_owned())
+        })
+}
+
+fn extract_capabilities_from_token(
+    delegation_token: &str,
+) -> Result<Vec<UcanCapability>, RegistryError> {
+    let payload_b64 = delegation_token.split('.').nth(1).ok_or_else(|| {
+        RegistryError::InvalidAgent("delegation_token must be compact JWT".to_owned())
+    })?;
+    #[derive(serde::Deserialize)]
+    struct DelegationClaims {
+        #[serde(default)]
+        capabilities: Vec<UcanCapability>,
+    }
+    let payload_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .map_err(|_| {
+            RegistryError::InvalidAgent("invalid delegation_token payload encoding".to_owned())
+        })?;
+    let claims: DelegationClaims = serde_json::from_slice(&payload_json)
+        .map_err(|_| RegistryError::InvalidAgent("invalid delegation_token payload".to_owned()))?;
+    Ok(claims.capabilities)
 }
 
 fn validate_submit_agent_request(
@@ -2098,14 +2276,19 @@ fn validate_submit_agent_request(
     {
         return Err(RegistryError::ProviderBlocked(request.provider_id.clone()));
     }
-    if request.attestations.provider_signature.trim().is_empty() {
+    let provider = state
+        .providers
+        .get(&request.provider_id)
+        .ok_or_else(|| RegistryError::ProviderNotFound(request.provider_id.clone()))?;
+    if request.attestations.attestation_signature.trim().is_empty() {
         return Err(RegistryError::InvalidAgent(
-            "attestations.provider_signature must not be empty".to_owned(),
+            "attestations.attestation_signature must not be empty".to_owned(),
         ));
     }
     validate_agent_card(&request.agent_card)?;
     validate_agent_deployment(&request.deployment)?;
     validate_agent_review_profile(&request.review)?;
+    validate_agent_attestations(request, provider)?;
     Ok(())
 }
 
@@ -2207,19 +2390,19 @@ fn validate_agent_card(agent_card: &serde_json::Value) -> Result<(), RegistryErr
         ));
     }
     require_card_string_field(agent_card, "protocolVersion")?;
-    if !agent_card
+    if agent_card
         .get("skills")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|skills| !skills.is_empty())
+        .is_none_or(|skills| skills.is_empty())
     {
         return Err(RegistryError::InvalidAgent(
             "agent_card.skills must contain at least one skill".to_owned(),
         ));
     }
-    if !agent_card
+    if agent_card
         .get("securitySchemes")
         .and_then(serde_json::Value::as_object)
-        .is_some_and(|schemes| !schemes.is_empty())
+        .is_none_or(|schemes| schemes.is_empty())
     {
         return Err(RegistryError::InvalidAgent(
             "agent_card.securitySchemes must not be empty".to_owned(),
@@ -2253,13 +2436,11 @@ fn is_secure_or_loopback_url(url: &str) -> bool {
 }
 
 fn verify_challenge_signature(
-    public_key: &str,
+    provider_did: &str,
     challenge: &str,
     signature: &str,
 ) -> Result<(), RegistryError> {
-    let public_key_bytes = STANDARD.decode(public_key).map_err(|_| {
-        RegistryError::InvalidOwnershipChallenge("invalid public key encoding".to_owned())
-    })?;
+    let public_key_bytes = public_key_bytes_from_ref(provider_did)?;
     let signature_bytes = STANDARD.decode(signature).map_err(|_| {
         RegistryError::InvalidOwnershipChallenge("invalid signature encoding".to_owned())
     })?;
@@ -2282,6 +2463,34 @@ fn verify_challenge_signature(
                 "challenge signature verification failed".to_owned(),
             )
         })
+}
+
+fn public_key_bytes_from_ref(provider_did: &str) -> Result<Vec<u8>, RegistryError> {
+    if provider_did.starts_with("did:") {
+        let did = Did::parse(provider_did).map_err(|error| {
+            RegistryError::InvalidOwnershipChallenge(format!("invalid DID key reference: {error}"))
+        })?;
+        let did_key = DidKey::from_did(did).map_err(|error| {
+            RegistryError::InvalidOwnershipChallenge(format!(
+                "unsupported DID key reference: {error}"
+            ))
+        })?;
+        let public_key = match did_key.decode_public_key().map_err(|error| {
+            RegistryError::InvalidOwnershipChallenge(format!("invalid DID key reference: {error}"))
+        })? {
+            DidKeyPublicKey::Ed25519(bytes) => bytes.to_vec(),
+            _ => {
+                return Err(RegistryError::InvalidOwnershipChallenge(
+                    "provider DID must resolve to an Ed25519 verification key".to_owned(),
+                ));
+            }
+        };
+        return Ok(public_key);
+    }
+
+    Err(RegistryError::InvalidOwnershipChallenge(
+        "provider_did must be a valid did:key".to_owned(),
+    ))
 }
 
 fn default_provider_health(provider_id: &str) -> ProviderHealthRecord {
@@ -2400,6 +2609,7 @@ fn update_health_for_receipt(state: &mut RegistryState, receipt: &ExecutionRecei
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_health_record(
     status: &mut HealthStatus,
     success_count: &mut u64,
@@ -2488,7 +2698,7 @@ fn clamp_score(score: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose::STANDARD;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
     use tempfile::tempdir;
@@ -2498,14 +2708,81 @@ mod tests {
         RegisterAuthContextRequest, RiskLevel, RunVerifierSweepRequest,
     };
 
+    fn provider_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[21u8; 32])
+    }
+
+    fn delegated_attester_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[22u8; 32])
+    }
+
+    fn did_from_signing_key(signing_key: &SigningKey) -> String {
+        format!(
+            "did:key:z{}",
+            bs58::encode(
+                [
+                    &[0xed, 0x01][..],
+                    &signing_key.verifying_key().to_bytes()[..]
+                ]
+                .concat()
+            )
+            .into_string()
+        )
+    }
+
+    fn sign_delegation_token(
+        issuer_signing_key: &SigningKey,
+        issuer_did: &str,
+        subject_did: &str,
+    ) -> String {
+        let header_b64 = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "alg": "EdDSA",
+                "typ": "JWT",
+                "kid": "#key-1",
+            }))
+            .unwrap(),
+        );
+        let payload_b64 = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "iss": issuer_did,
+                "sub": subject_did,
+                "aud": ["watt:servicenet:public-agent-attestation"],
+                "iat": 1000_u64,
+                "nbf": 1000_u64,
+                "exp": 9_999_999_999_999_u64,
+                "capabilities": [{
+                    "resource": "urn:watt:servicenet:public-agent-attestation",
+                    "ability": "attest"
+                }]
+            }))
+            .unwrap(),
+        );
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let signature = issuer_signing_key.sign(signing_input.as_bytes());
+        format!(
+            "{header_b64}.{payload_b64}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
+    fn sign_submission_attestation(
+        request: &mut SubmitAgentRequest,
+        attester_signing_key: &SigningKey,
+        provider_attester_did: Option<String>,
+        delegation_token: Option<String>,
+    ) {
+        request.attestations.provider_attester_did = provider_attester_did;
+        request.attestations.delegation_token = delegation_token;
+        let payload = serde_jcs::to_vec(&build_agent_attestation_payload(request)).unwrap();
+        request.attestations.attestation_signature =
+            STANDARD.encode(attester_signing_key.sign(&payload).to_bytes());
+    }
+
     fn demo_provider() -> RegisterProviderRequest {
         RegisterProviderRequest {
             provider_id: "provider-1".to_owned(),
-            provider_public_key: STANDARD.encode(
-                SigningKey::from_bytes(&[3u8; 32])
-                    .verifying_key()
-                    .to_bytes(),
-            ),
+            provider_did: did_from_signing_key(&provider_signing_key()),
             display_name: Some("Provider One".to_owned()),
             ownership_challenge_id: None,
             ownership_signature: None,
@@ -2513,7 +2790,7 @@ mod tests {
     }
 
     fn demo_agent_submission(agent_id: &str) -> SubmitAgentRequest {
-        SubmitAgentRequest {
+        let mut request = SubmitAgentRequest {
             provider_id: "provider-1".to_owned(),
             agent_id: agent_id.to_owned(),
             version: "0.1.0".to_owned(),
@@ -2545,11 +2822,16 @@ mod tests {
             },
             artifacts: AgentArtifacts::default(),
             attestations: AgentAttestations {
-                provider_signature: "signed-by-provider".to_owned(),
+                attestation_signature: String::new(),
+                provider_attester_did: None,
+                delegation_token: None,
                 source_commit: None,
                 build_digest: None,
             },
-        }
+        };
+        let provider_key = provider_signing_key();
+        sign_submission_attestation(&mut request, &provider_key, None, None);
+        request
     }
 
     fn demo_receipt() -> StoredReceipt {
@@ -2694,7 +2976,17 @@ mod tests {
         let challenge = registry
             .create_provider_ownership_challenge(CreateProviderOwnershipChallengeRequest {
                 provider_id: "provider-challenge".to_owned(),
-                public_key: STANDARD.encode(signing_key.verifying_key().to_bytes()),
+                provider_did: format!(
+                    "did:key:z{}",
+                    bs58::encode(
+                        [
+                            &[0xed, 0x01][..],
+                            &signing_key.verifying_key().to_bytes()[..]
+                        ]
+                        .concat()
+                    )
+                    .into_string()
+                ),
                 operation: ProviderOwnershipOperation::Register,
             })
             .await
@@ -2705,7 +2997,7 @@ mod tests {
         let provider = registry
             .register_provider(RegisterProviderRequest {
                 provider_id: "provider-challenge".to_owned(),
-                provider_public_key: STANDARD.encode(signing_key.verifying_key().to_bytes()),
+                provider_did: challenge.provider_did.clone(),
                 display_name: Some("Provider Challenge".to_owned()),
                 ownership_challenge_id: Some(challenge.challenge_id),
                 ownership_signature: Some(signature),
@@ -2713,6 +3005,42 @@ mod tests {
             .await
             .expect("provider should register");
         assert_eq!(provider.provider_id, "provider-challenge");
+    }
+
+    #[tokio::test]
+    async fn provider_ownership_challenge_accepts_did_key_reference() {
+        let signing_key = SigningKey::from_bytes(&[32u8; 32]);
+        let public_key_bytes = signing_key.verifying_key().to_bytes();
+        let provider_did = format!(
+            "did:key:z{}",
+            bs58::encode([&[0xed, 0x01][..], &public_key_bytes[..]].concat()).into_string()
+        );
+        let registry = ServiceRegistry::in_memory_with_config(ServiceRegistryConfig {
+            require_provider_ownership_challenges: true,
+            ..Default::default()
+        });
+        let challenge = registry
+            .create_provider_ownership_challenge(CreateProviderOwnershipChallengeRequest {
+                provider_id: "provider-did".to_owned(),
+                provider_did: provider_did.clone(),
+                operation: ProviderOwnershipOperation::Register,
+            })
+            .await
+            .expect("challenge should issue");
+        let signature =
+            STANDARD.encode(signing_key.sign(challenge.challenge.as_bytes()).to_bytes());
+
+        let provider = registry
+            .register_provider(RegisterProviderRequest {
+                provider_id: "provider-did".to_owned(),
+                provider_did,
+                display_name: Some("Provider DID".to_owned()),
+                ownership_challenge_id: Some(challenge.challenge_id),
+                ownership_signature: Some(signature),
+            })
+            .await
+            .expect("provider should register");
+        assert_eq!(provider.provider_id, "provider-did");
     }
 
     #[tokio::test]
@@ -2732,7 +3060,7 @@ mod tests {
             .expect("provider should register");
         let record = registry
             .register_auth_context(RegisterAuthContextRequest {
-                subject: "user-1".to_owned(),
+                subject_did: "did:key:z6MkfZ7QWbG4zY4C8z8c2jv7b6hJ6x9o4D7hS1x2T3y4Z5k6".to_owned(),
                 provider_id: "provider-1".to_owned(),
                 auth_model: AuthModel::BearerToken,
                 token: "super-secret-token".to_owned(),
@@ -2749,6 +3077,35 @@ mod tests {
         let bytes = std::fs::read(path).expect("registry file should exist");
         let content = String::from_utf8(bytes).expect("registry file should be utf8");
         assert!(!content.contains("super-secret-token"));
+    }
+
+    #[tokio::test]
+    async fn delegated_attester_can_submit_public_agent_with_valid_token() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+
+        let provider_key = provider_signing_key();
+        let provider_did = did_from_signing_key(&provider_key);
+        let attester_key = delegated_attester_signing_key();
+        let attester_did = did_from_signing_key(&attester_key);
+        let delegation_token = sign_delegation_token(&provider_key, &provider_did, &attester_did);
+
+        let mut request = demo_agent_submission("delegated-agent");
+        sign_submission_attestation(
+            &mut request,
+            &attester_key,
+            Some(attester_did),
+            Some(delegation_token),
+        );
+
+        let submission = registry
+            .submit_agent(request)
+            .await
+            .expect("delegated attester should submit");
+        assert_eq!(submission.agent_id, "delegated-agent");
     }
 
     #[tokio::test]

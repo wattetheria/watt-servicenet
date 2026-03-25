@@ -1,21 +1,43 @@
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use axum::{Json, Router, routing::post};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use ed25519_dalek::{Signer, SigningKey};
 use std::sync::Arc;
 use tower::ServiceExt;
 use watt_servicenet_node::build_local_app;
+use watt_servicenet_protocol::build_agent_attestation_payload;
 use watt_servicenet_registry::ServiceRegistry;
+
+fn provider_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[21u8; 32])
+}
+
+fn did_from_signing_key(signing_key: &SigningKey) -> String {
+    format!(
+        "did:key:z{}",
+        bs58::encode(
+            [
+                &[0xed, 0x01][..],
+                &signing_key.verifying_key().to_bytes()[..]
+            ]
+            .concat()
+        )
+        .into_string()
+    )
+}
 
 fn provider_payload() -> serde_json::Value {
     serde_json::json!({
         "provider_id": "provider-local",
-        "provider_public_key": "cHJvdmlkZXItbG9jYWwtZGV2a2V5",
+        "provider_did": did_from_signing_key(&provider_signing_key()),
         "display_name": "Provider Local"
     })
 }
 
 fn valid_agent_submission_payload(url_base: &str, endpoint_url: &str) -> serde_json::Value {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "provider_id": "provider-local",
         "agent_id": "stripe-agent",
         "version": "0.1.0",
@@ -59,11 +81,24 @@ fn valid_agent_submission_payload(url_base: &str, endpoint_url: &str) -> serde_j
             "security_url": "https://stripe-agent.example.com/security"
         },
         "attestations": {
-            "provider_signature": "signed-by-provider",
+            "attestation_signature": "",
             "source_commit": "abc123",
             "build_digest": "sha256:def456"
         }
-    })
+    });
+    let signing_key = provider_signing_key();
+    let signature = STANDARD.encode(
+        signing_key
+            .sign(
+                &serde_jcs::to_vec(&build_agent_attestation_payload(
+                    &serde_json::from_value(payload.clone()).expect("submission should parse"),
+                ))
+                .expect("attestation payload should canonicalize"),
+            )
+            .to_bytes(),
+    );
+    payload["attestations"]["attestation_signature"] = serde_json::Value::String(signature);
+    payload
 }
 
 async fn response_json(response: axum::response::Response) -> serde_json::Value {

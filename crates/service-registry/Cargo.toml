@@ -2,8 +2,6 @@
 name = "watt-servicenet-registry"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
-authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -14,13 +12,16 @@ chrono.workspace = true
 ed25519-dalek.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_jcs = "0.1"
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+watt-did = { path = "../../../watt-did" }
 watt-servicenet-protocol = { path = "../service-protocol" }
 
 [dev-dependencies]
 base64.workspace = true
+bs58 = "0.5"
 ed25519-dalek.workspace = true
 tempfile.workspace = true

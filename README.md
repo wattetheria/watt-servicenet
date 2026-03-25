@@ -161,7 +161,7 @@ curl -X POST http://127.0.0.1:8042/v1/providers/register \
   -H 'content-type: application/json' \
   -d '{
     "provider_id": "provider-local",
-    "provider_public_key": "cHJvdmlkZXItbG9jYWwtZGV2a2V5",
+    "provider_did": "did:key:z6MkhaXgBZDvotD1X9gRrYkM5Xq9jYQqK6d8r8bQdE1mV2Xa",
     "display_name": "Provider Local",
     "ownership_challenge_id": "<CHALLENGE_ID>",
     "ownership_signature": "<BASE64_ED25519_SIGNATURE>"
@@ -217,7 +217,7 @@ curl -X POST http://127.0.0.1:8042/v1/agent-submissions \
       "security_url": "https://stripe-agent.example.com/security"
     },
     "attestations": {
-      "provider_signature": "<PROVIDER_SIGNATURE>",
+      "attestation_signature": "<ATTESTATION_SIGNATURE>",
       "source_commit": "<COMMIT_SHA>",
       "build_digest": "<BUILD_DIGEST>"
     }
@@ -268,7 +268,7 @@ Register an auth context:
 curl -X POST http://127.0.0.1:8042/v1/auth-contexts/register \
   -H 'content-type: application/json' \
   -d '{
-    "subject": "user-1",
+    "subject_did": "did:key:z6MkhaXgBZDvotD1X9gRrYkM5Xq9jYQqK6d8r8bQdE1mV2Xa",
     "provider_id": "provider-local",
     "auth_model": { "mode": "bearer_token" },
     "token": "secret-token"

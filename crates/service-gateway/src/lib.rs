@@ -465,17 +465,44 @@ fn map_registry_error(error: RegistryError) -> GatewayError {
 mod tests {
     use super::*;
     use axum::{Json, Router, routing::post};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use ed25519_dalek::{Signer, SigningKey};
     use std::sync::Arc;
     use watt_servicenet_protocol::{
         AgentArtifacts, AgentAttestations, AgentDeployment, AgentDeploymentEndpoint,
         AgentReviewProfile, ApproveAgentSubmissionRequest, AuthModel, RegisterAuthContextRequest,
-        RegisterProviderRequest, RiskLevel, SubmitAgentRequest,
+        RegisterProviderRequest, RiskLevel, SubmitAgentRequest, build_agent_attestation_payload,
     };
+
+    fn provider_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[21u8; 32])
+    }
+
+    fn did_from_signing_key(signing_key: &SigningKey) -> String {
+        format!(
+            "did:key:z{}",
+            bs58::encode(
+                [
+                    &[0xed, 0x01][..],
+                    &signing_key.verifying_key().to_bytes()[..]
+                ]
+                .concat()
+            )
+            .into_string()
+        )
+    }
+
+    fn sign_submission_attestation(request: &mut SubmitAgentRequest, signing_key: &SigningKey) {
+        let payload = serde_jcs::to_vec(&build_agent_attestation_payload(request)).unwrap();
+        request.attestations.attestation_signature =
+            STANDARD.encode(signing_key.sign(&payload).to_bytes());
+    }
 
     fn provider_request() -> RegisterProviderRequest {
         RegisterProviderRequest {
             provider_id: "provider-1".to_owned(),
-            provider_public_key: "cHJvdmlkZXItMS1kZXZrZXk=".to_owned(),
+            provider_did: did_from_signing_key(&provider_signing_key()),
             display_name: Some("Provider One".to_owned()),
             ownership_challenge_id: None,
             ownership_signature: None,
@@ -483,7 +510,7 @@ mod tests {
     }
 
     fn agent_submission(url_base: &str, endpoint_url: &str) -> SubmitAgentRequest {
-        SubmitAgentRequest {
+        let mut request = SubmitAgentRequest {
             provider_id: "provider-1".to_owned(),
             agent_id: "stripe-agent".to_owned(),
             version: "0.1.0".to_owned(),
@@ -515,11 +542,16 @@ mod tests {
             },
             artifacts: AgentArtifacts::default(),
             attestations: AgentAttestations {
-                provider_signature: "sig".to_owned(),
+                attestation_signature: String::new(),
+                provider_attester_did: None,
+                delegation_token: None,
                 source_commit: None,
                 build_digest: None,
             },
-        }
+        };
+        let provider_key = provider_signing_key();
+        sign_submission_attestation(&mut request, &provider_key);
+        request
     }
 
     async fn start_mock_a2a_server() -> String {
@@ -683,7 +715,7 @@ mod tests {
         let (registry, gateway) = approved_gateway().await;
         let auth_context = registry
             .register_auth_context(RegisterAuthContextRequest {
-                subject: "user-1".to_owned(),
+                subject_did: "did:key:z6MkfZ7QWbG4zY4C8z8c2jv7b6hJ6x9o4D7hS1x2T3y4Z5k6".to_owned(),
                 provider_id: "provider-1".to_owned(),
                 auth_model: AuthModel::BearerToken,
                 token: "secret-token".to_owned(),
