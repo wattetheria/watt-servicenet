@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
@@ -643,6 +644,9 @@ async fn start_p2p_sync_if_enabled(
     }
 
     let mut config = ServiceNetworkP2pConfig::default();
+    config.state_dir = std::env::var("SERVICENET_P2P_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_p2p_state_dir());
     if let Ok(listen_addrs) = std::env::var("SERVICENET_P2P_LISTEN_ADDRS") {
         config.listen_addrs = split_csv(&listen_addrs);
     }
@@ -686,6 +690,12 @@ async fn start_p2p_sync_if_enabled(
     });
 
     Ok(Some(tx))
+}
+
+fn default_p2p_state_dir() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".servicenet-p2p-state")
 }
 
 fn handle_p2p_command(

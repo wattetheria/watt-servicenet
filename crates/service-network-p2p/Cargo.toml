@@ -6,8 +6,13 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+hex.workspace = true
+libp2p-identity.workspace = true
+rand = "0.8"
 serde.workspace = true
 serde_json.workspace = true
+wattswarm-artifact-store.workspace = true
+wattswarm-crypto = { path = "../../../wattswarm/crates/crypto" }
 wattswarm-network-substrate.workspace = true
 wattswarm-network-transport-core.workspace = true
 wattswarm-network-transport-iroh.workspace = true

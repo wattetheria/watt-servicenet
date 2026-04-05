@@ -1,16 +1,23 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
 use watt_servicenet_protocol::{ProviderRecord, PublishedAgentRecord};
+use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_substrate::{
     BackfillRequestId, BackfillResponseChannel, NetworkRuntimeObservabilitySnapshot,
     RawBackfillRequest, RawBackfillResponse, RawGossipMessage, SubstrateConfig, SubstrateNode,
     SubstrateRuntime, SubstrateRuntimeEvent, SwarmScope, TopicKind, TopicNamespace,
 };
 use wattswarm_network_transport_core::{
-    DirectDataTransportAdapter, PeerTransportCapabilities, TransferIntent,
+    DirectDataFetchRequest, DirectDataObjectKind, PeerTransportCapabilities, TransferIntent,
     TransportContactMaterial, TransportRoute, TransportRouter,
 };
-use wattswarm_network_transport_iroh::IrohTransportAdapter;
+use wattswarm_network_transport_iroh::{
+    export_local_contact_material, fetch_direct_data, shutdown_local_iroh_data_plane,
+};
 
 pub use wattswarm_network_substrate::{Multiaddr, PeerHandshakeMetadata, PeerId};
 pub use wattswarm_network_transport_core::{
@@ -23,17 +30,37 @@ pub use wattswarm_network_transport_core::{
 pub const SERVICENET_IDENTIFY_AGENT_PREFIX: &str = "wattswarm-servicenet-p2p";
 pub const PROVIDER_FEED_KEY: &str = "provider_record";
 pub const PUBLISHED_AGENT_FEED_KEY: &str = "published_agent_record";
+const NODE_SEED_FILE: &str = "node_seed.hex";
+const CONTACT_MATERIAL_FILE: &str = "peer_transport_contacts.json";
+const STATE_LOCK_FILE: &str = ".servicenet-p2p.lock";
 
 pub fn encode_servicenet_agent_version(metadata: &PeerHandshakeMetadata) -> String {
     metadata.encode_agent_version_with_prefix(SERVICENET_IDENTIFY_AGENT_PREFIX)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceNetworkContentRef {
+    pub uri: String,
+    pub digest: String,
+    pub size_bytes: u64,
+    pub mime: String,
+    pub created_at: u64,
+    pub producer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceNetworkContentEnvelope {
+    pub content_ref: ServiceNetworkContentRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_contact_material: Option<TransportContactMaterial>,
 }
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum ServiceNetworkMessage {
-    ProviderPublished(ProviderRecord),
-    PublishedAgentRecordPublished(PublishedAgentRecord),
+    ProviderPublished(ServiceNetworkContentEnvelope),
+    PublishedAgentRecordPublished(ServiceNetworkContentEnvelope),
 }
 
 impl ServiceNetworkMessage {
@@ -48,6 +75,7 @@ impl ServiceNetworkMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceNetworkP2pConfig {
+    pub state_dir: PathBuf,
     pub namespace: TopicNamespace,
     pub protocol_version: String,
     pub identify_agent_version: String,
@@ -78,6 +106,7 @@ impl Default for ServiceNetworkP2pConfig {
 impl ServiceNetworkP2pConfig {
     fn from_substrate(config: SubstrateConfig) -> Self {
         Self {
+            state_dir: PathBuf::from(".servicenet-p2p-state"),
             namespace: config.namespace,
             protocol_version: config.protocol_version,
             identify_agent_version: config.identify_agent_version,
@@ -121,12 +150,21 @@ impl ServiceNetworkP2pConfig {
 
 pub struct ServiceNetworkNode {
     inner: SubstrateNode,
+    state_dir: PathBuf,
+    lock_path: PathBuf,
+    lock_file: File,
 }
 
 impl ServiceNetworkNode {
     pub fn generate(config: ServiceNetworkP2pConfig) -> Result<Self> {
+        initialize_state_dir(&config.state_dir)?;
+        let (lock_path, lock_file) = acquire_state_dir_lock(&config.state_dir)?;
+        let local_key = load_or_create_identity_keypair(&config.state_dir.join(NODE_SEED_FILE))?;
         Ok(Self {
-            inner: SubstrateNode::generate(config.as_substrate())?,
+            inner: SubstrateNode::new(config.as_substrate(), local_key)?,
+            state_dir: config.state_dir,
+            lock_path,
+            lock_file,
         })
     }
 }
@@ -172,15 +210,18 @@ pub enum ServiceNetworkRuntimeEvent {
 
 pub struct ServiceNetworkRuntime {
     inner: SubstrateRuntime,
-    iroh_adapter: IrohTransportAdapter,
+    state_dir: PathBuf,
+    lock_path: PathBuf,
+    lock_file: File,
 }
 
 impl ServiceNetworkRuntime {
     pub fn new(node: ServiceNetworkNode) -> Result<Self> {
-        let local_peer_id = node.inner.local_peer_id();
         Ok(Self {
             inner: SubstrateRuntime::new(node.inner)?,
-            iroh_adapter: IrohTransportAdapter::from_local_peer_id(&local_peer_id)?,
+            state_dir: node.state_dir,
+            lock_path: node.lock_path,
+            lock_file: node.lock_file,
         })
     }
 
@@ -201,21 +242,14 @@ impl ServiceNetworkRuntime {
     }
 
     pub fn transport_capabilities(&self) -> PeerTransportCapabilities {
-        self.iroh_adapter.capabilities().clone()
+        PeerTransportCapabilities::iroh_direct_default()
     }
 
     pub fn export_transport_contact_material(
         &self,
         generated_at: u64,
     ) -> Result<TransportContactMaterial> {
-        let listen_addrs = self
-            .listen_addrs()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        Ok(self
-            .iroh_adapter
-            .export_contact_material(&listen_addrs, generated_at)?)
+        export_local_contact_material(&self.state_dir, &self.local_peer_id(), generated_at)
     }
 
     pub fn recommended_transfer_route(
@@ -227,7 +261,8 @@ impl ServiceNetworkRuntime {
     }
 
     pub fn publish_provider(&mut self, provider: &ProviderRecord) -> Result<()> {
-        let message = ServiceNetworkMessage::ProviderPublished(provider.clone());
+        let envelope = self.materialize_record_envelope(provider)?;
+        let message = ServiceNetworkMessage::ProviderPublished(envelope);
         self.inner.publish(
             &SwarmScope::Global,
             TopicKind::Rules,
@@ -236,7 +271,8 @@ impl ServiceNetworkRuntime {
     }
 
     pub fn publish_published_agent_record(&mut self, record: &PublishedAgentRecord) -> Result<()> {
-        let message = ServiceNetworkMessage::PublishedAgentRecordPublished(record.clone());
+        let envelope = self.materialize_record_envelope(record)?;
+        let message = ServiceNetworkMessage::PublishedAgentRecordPublished(envelope);
         self.inner.publish(
             &SwarmScope::Global,
             TopicKind::Rules,
@@ -271,8 +307,11 @@ impl ServiceNetworkRuntime {
     ) -> Result<()> {
         let items = providers
             .iter()
-            .map(serde_json::to_vec)
-            .collect::<serde_json::Result<Vec<_>>>()?;
+            .map(|provider| {
+                let envelope = self.materialize_record_envelope(provider)?;
+                Ok(serde_json::to_vec(&envelope)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
         self.inner.send_backfill_response(
             channel,
             RawBackfillResponse {
@@ -307,8 +346,11 @@ impl ServiceNetworkRuntime {
     ) -> Result<()> {
         let items = records
             .iter()
-            .map(serde_json::to_vec)
-            .collect::<serde_json::Result<Vec<_>>>()?;
+            .map(|record| {
+                let envelope = self.materialize_record_envelope(record)?;
+                Ok(serde_json::to_vec(&envelope)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
         self.inner.send_backfill_response(
             channel,
             RawBackfillResponse {
@@ -322,7 +364,8 @@ impl ServiceNetworkRuntime {
 
     pub async fn next_event(&mut self) -> Result<ServiceNetworkRuntimeEvent> {
         loop {
-            if let Some(event) = Self::map_runtime_event(self.inner.next_event().await?)? {
+            let runtime_event = self.inner.next_event().await?;
+            if let Some(event) = self.map_runtime_event(runtime_event)? {
                 return Ok(event);
             }
         }
@@ -331,12 +374,13 @@ impl ServiceNetworkRuntime {
     pub fn try_next_event(&mut self) -> Result<Option<ServiceNetworkRuntimeEvent>> {
         self.inner
             .try_next_event()?
-            .map(Self::map_runtime_event)
+            .map(|event| self.map_runtime_event(event))
             .transpose()
             .map(|event| event.flatten())
     }
 
     fn map_runtime_event(
+        &mut self,
         event: SubstrateRuntimeEvent,
     ) -> Result<Option<ServiceNetworkRuntimeEvent>> {
         Ok(match event {
@@ -355,13 +399,19 @@ impl ServiceNetworkRuntime {
                         ..
                     },
             } => match ServiceNetworkMessage::decode_json(&payload)? {
-                ServiceNetworkMessage::ProviderPublished(provider) => {
+                ServiceNetworkMessage::ProviderPublished(envelope) => {
+                    let provider = self
+                        .hydrate_remote_record::<ProviderRecord>(&propagation_source, envelope)?;
                     Some(ServiceNetworkRuntimeEvent::ProviderPublished {
                         peer: propagation_source,
                         provider,
                     })
                 }
-                ServiceNetworkMessage::PublishedAgentRecordPublished(record) => {
+                ServiceNetworkMessage::PublishedAgentRecordPublished(envelope) => {
+                    let record = self.hydrate_remote_record::<PublishedAgentRecord>(
+                        &propagation_source,
+                        envelope,
+                    )?;
                     Some(ServiceNetworkRuntimeEvent::PublishedAgentRecordPublished {
                         peer: propagation_source,
                         record,
@@ -404,8 +454,12 @@ impl ServiceNetworkRuntime {
                 let providers = response
                     .items
                     .into_iter()
-                    .map(|item| serde_json::from_slice::<ProviderRecord>(&item))
-                    .collect::<serde_json::Result<Vec<_>>>()?;
+                    .map(|item| -> Result<ProviderRecord> {
+                        let envelope =
+                            serde_json::from_slice::<ServiceNetworkContentEnvelope>(&item)?;
+                        self.hydrate_remote_record::<ProviderRecord>(&peer, envelope)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 Some(ServiceNetworkRuntimeEvent::ProviderSyncResponse {
                     peer,
                     request_id,
@@ -422,8 +476,12 @@ impl ServiceNetworkRuntime {
                 let records = response
                     .items
                     .into_iter()
-                    .map(|item| serde_json::from_slice::<PublishedAgentRecord>(&item))
-                    .collect::<serde_json::Result<Vec<_>>>()?;
+                    .map(|item| -> Result<PublishedAgentRecord> {
+                        let envelope =
+                            serde_json::from_slice::<ServiceNetworkContentEnvelope>(&item)?;
+                        self.hydrate_remote_record::<PublishedAgentRecord>(&peer, envelope)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 Some(ServiceNetworkRuntimeEvent::PublishedAgentSyncResponse {
                     peer,
                     request_id,
@@ -433,34 +491,239 @@ impl ServiceNetworkRuntime {
             _ => None,
         })
     }
+
+    fn materialize_record_envelope<T>(&self, record: &T) -> Result<ServiceNetworkContentEnvelope>
+    where
+        T: Serialize,
+    {
+        let content_ref = materialize_json_content_artifact(
+            &self.state_dir,
+            &self.local_peer_id().to_string(),
+            record,
+        )?;
+        Ok(ServiceNetworkContentEnvelope {
+            content_ref,
+            transport_contact_material: Some(self.export_transport_contact_material(now_ms())?),
+        })
+    }
+
+    fn hydrate_remote_record<T>(
+        &mut self,
+        remote_peer: &PeerId,
+        envelope: ServiceNetworkContentEnvelope,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let contact =
+            self.resolve_remote_contact(remote_peer, envelope.transport_contact_material)?;
+        let bytes = fetch_direct_data(
+            &self.state_dir,
+            &self.local_peer_id(),
+            &contact,
+            &DirectDataFetchRequest {
+                object_kind: DirectDataObjectKind::ReferenceArtifact,
+                object_id: envelope.content_ref.digest.clone(),
+                scope: None,
+                source_uri: Some(envelope.content_ref.uri.clone()),
+                expected_digest: Some(envelope.content_ref.digest.clone()),
+                expected_size: Some(envelope.content_ref.size_bytes),
+            },
+        )?
+        .bytes;
+        let artifact_store = open_local_artifact_store(&self.state_dir)?;
+        artifact_store.write_validated_bytes(
+            ArtifactKind::Reference,
+            &envelope.content_ref.digest,
+            None,
+            &bytes,
+            Some(&envelope.content_ref.digest),
+            Some(envelope.content_ref.size_bytes),
+        )?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    fn resolve_remote_contact(
+        &mut self,
+        remote_peer: &PeerId,
+        inline_contact: Option<TransportContactMaterial>,
+    ) -> Result<TransportContactMaterial> {
+        let remote_peer_id = remote_peer.to_string();
+        if let Some(contact) = inline_contact {
+            if contact.peer_id != remote_peer_id {
+                bail!(
+                    "transport contact peer mismatch: expected {}, got {}",
+                    remote_peer_id,
+                    contact.peer_id
+                );
+            }
+            save_remote_contact_material(&self.state_dir, &remote_peer_id, contact.clone())?;
+            return Ok(contact);
+        }
+        load_remote_contact_material(&self.state_dir, &remote_peer_id)?
+            .ok_or_else(|| anyhow!("missing transport contact material for {remote_peer_id}"))
+    }
+}
+
+impl Drop for ServiceNetworkRuntime {
+    fn drop(&mut self) {
+        shutdown_local_iroh_data_plane(&self.state_dir);
+        let _ = fs::remove_file(&self.lock_path);
+        let _ = self.lock_file.sync_all();
+    }
+}
+
+fn initialize_state_dir(state_dir: &Path) -> Result<()> {
+    fs::create_dir_all(state_dir)?;
+    open_local_artifact_store(state_dir)?;
+    Ok(())
+}
+
+fn acquire_state_dir_lock(state_dir: &Path) -> Result<(PathBuf, File)> {
+    let lock_path = state_dir.join(STATE_LOCK_FILE);
+    let lock_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| anyhow!("lock state dir {}: {err}", state_dir.display()))?;
+    Ok((lock_path, lock_file))
+}
+
+fn load_or_create_identity_keypair(seed_file: &Path) -> Result<libp2p_identity::Keypair> {
+    if seed_file.exists() {
+        let mut bytes = hex::decode(fs::read_to_string(seed_file)?.trim())?;
+        if bytes.len() != 32 {
+            bail!("seed must be 32 bytes");
+        }
+        return Ok(libp2p_identity::Keypair::ed25519_from_bytes(&mut bytes)?);
+    }
+
+    let seed: [u8; 32] = rand::random();
+    if let Some(parent) = seed_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(seed_file, hex::encode(seed))?;
+    Ok(libp2p_identity::Keypair::ed25519_from_bytes(seed.to_vec())?)
+}
+
+fn artifact_store_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("artifacts")
+}
+
+fn open_local_artifact_store(state_dir: &Path) -> Result<ArtifactStore> {
+    let store = ArtifactStore::new(artifact_store_path(state_dir));
+    store.ensure_layout()?;
+    Ok(store)
+}
+
+fn content_artifact_uri(digest: &str) -> String {
+    format!("artifact://reference/{digest}")
+}
+
+fn materialize_json_content_artifact<T>(
+    state_dir: &Path,
+    producer: &str,
+    content: &T,
+) -> Result<ServiceNetworkContentRef>
+where
+    T: Serialize,
+{
+    let bytes = serde_json::to_vec(content)?;
+    let digest = format!("sha256:{}", wattswarm_crypto::sha256_hex(&bytes));
+    let artifact_store = open_local_artifact_store(state_dir)?;
+    artifact_store.write_validated_bytes(
+        ArtifactKind::Reference,
+        &digest,
+        None,
+        &bytes,
+        Some(&digest),
+        Some(bytes.len() as u64),
+    )?;
+    Ok(ServiceNetworkContentRef {
+        uri: content_artifact_uri(&digest),
+        digest,
+        size_bytes: bytes.len() as u64,
+        mime: "application/json".to_owned(),
+        created_at: now_ms(),
+        producer: producer.to_owned(),
+    })
+}
+
+fn contact_materials_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(CONTACT_MATERIAL_FILE)
+}
+
+fn load_remote_contact_materials(
+    state_dir: &Path,
+) -> Result<BTreeMap<String, TransportContactMaterial>> {
+    let path = contact_materials_path(state_dir);
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn save_remote_contact_material(
+    state_dir: &Path,
+    peer_id: &str,
+    contact: TransportContactMaterial,
+) -> Result<()> {
+    let mut contacts = load_remote_contact_materials(state_dir)?;
+    contacts.insert(peer_id.to_owned(), contact);
+    fs::write(
+        contact_materials_path(state_dir),
+        serde_json::to_vec_pretty(&contacts)?,
+    )?;
+    Ok(())
+}
+
+fn load_remote_contact_material(
+    state_dir: &Path,
+    peer_id: &str,
+) -> Result<Option<TransportContactMaterial>> {
+    Ok(load_remote_contact_materials(state_dir)?.remove(peer_id))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
+    use uuid::Uuid;
     use watt_servicenet_protocol::{
-        AgentDeployment, AgentDeploymentEndpoint, AgentReviewProfile, ProviderStatus,
-        PublishedAgentStatus, RiskLevel, SERVICE_PROTOCOL_SCHEMA_VERSION,
+        AgentDeployment, AgentDeploymentEndpoint, AgentReviewProfile, PublishedAgentStatus,
+        RiskLevel,
     };
     use wattswarm_network_transport_core::{TransferKind, TransportRoute};
 
-    fn demo_provider() -> ProviderRecord {
-        ProviderRecord {
-            schema_version: SERVICE_PROTOCOL_SCHEMA_VERSION,
-            provider_id: "provider-local".to_owned(),
-            provider_did: "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp".to_owned(),
-            display_name: Some("Provider Local".to_owned()),
-            status: ProviderStatus::Active,
-            registered_at: chrono::Utc::now(),
-            revoked_at: None,
-            revoke_reason: None,
-        }
+    fn temp_state_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "servicenet-p2p-{prefix}-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).expect("create temp state dir");
+        dir
     }
 
     #[test]
     fn provider_message_round_trip() {
-        let message = ServiceNetworkMessage::ProviderPublished(demo_provider());
+        let message = ServiceNetworkMessage::ProviderPublished(ServiceNetworkContentEnvelope {
+            content_ref: ServiceNetworkContentRef {
+                uri: "artifact://reference/sha256:demo".to_owned(),
+                digest: "sha256:demo".to_owned(),
+                size_bytes: 42,
+                mime: "application/json".to_owned(),
+                created_at: 123,
+                producer: "peer-a".to_owned(),
+            },
+            transport_contact_material: None,
+        });
         let bytes = message.encode_json().expect("encode should work");
         let decoded = ServiceNetworkMessage::decode_json(&bytes).expect("decode should work");
         assert_eq!(message, decoded);
@@ -468,7 +731,18 @@ mod tests {
 
     #[test]
     fn published_agent_message_round_trip() {
-        let message = ServiceNetworkMessage::PublishedAgentRecordPublished(demo_published_agent());
+        let message =
+            ServiceNetworkMessage::PublishedAgentRecordPublished(ServiceNetworkContentEnvelope {
+                content_ref: ServiceNetworkContentRef {
+                    uri: "artifact://reference/sha256:demo-agent".to_owned(),
+                    digest: "sha256:demo-agent".to_owned(),
+                    size_bytes: 84,
+                    mime: "application/json".to_owned(),
+                    created_at: 456,
+                    producer: "peer-b".to_owned(),
+                },
+                transport_contact_material: None,
+            });
         let bytes = message.encode_json().expect("encode should work");
         let decoded = ServiceNetworkMessage::decode_json(&bytes).expect("decode should work");
         assert_eq!(message, decoded);
@@ -485,21 +759,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn published_agent_gossip_round_trip_from_substrate_event() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn published_agent_gossip_round_trip_from_substrate_event() {
         let record = demo_published_agent();
+        let sender_runtime = ServiceNetworkRuntime::new(
+            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
+                state_dir: temp_state_dir("mapping-sender"),
+                ..ServiceNetworkP2pConfig::default()
+            })
+            .expect("node should start"),
+        )
+        .expect("sender runtime should start");
+        let mut receiver_runtime = ServiceNetworkRuntime::new(
+            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
+                state_dir: temp_state_dir("mapping-receiver"),
+                ..ServiceNetworkP2pConfig::default()
+            })
+            .expect("receiver node should start"),
+        )
+        .expect("receiver runtime should start");
+        let envelope = sender_runtime
+            .materialize_record_envelope(&record)
+            .expect("record envelope");
         let event = SubstrateRuntimeEvent::Gossip {
-            propagation_source: PeerId::random(),
+            propagation_source: sender_runtime.local_peer_id(),
             message: RawGossipMessage {
                 scope: SwarmScope::Global,
                 kind: TopicKind::Rules,
-                payload: ServiceNetworkMessage::PublishedAgentRecordPublished(record.clone())
+                payload: ServiceNetworkMessage::PublishedAgentRecordPublished(envelope)
                     .encode_json()
                     .expect("encode should work"),
             },
         };
 
-        match ServiceNetworkRuntime::map_runtime_event(event)
+        match receiver_runtime
+            .map_runtime_event(event)
             .expect("mapping should work")
             .expect("event should map")
         {
@@ -513,8 +807,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ignores_unrelated_feed_key() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ignores_unrelated_feed_key() {
+        let mut runtime = ServiceNetworkRuntime::new(
+            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
+                state_dir: temp_state_dir("ignore-feed"),
+                ..ServiceNetworkP2pConfig::default()
+            })
+            .expect("node should start"),
+        )
+        .expect("runtime should start");
         let event = SubstrateRuntimeEvent::Gossip {
             propagation_source: PeerId::random(),
             message: RawGossipMessage {
@@ -523,15 +825,20 @@ mod tests {
                 payload: b"ignored".to_vec(),
             },
         };
-        let mapped = ServiceNetworkRuntime::map_runtime_event(event).expect("mapping should work");
+        let mapped = runtime
+            .map_runtime_event(event)
+            .expect("mapping should work");
         assert!(mapped.is_none());
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exported_contact_material_advertises_iroh_direct_capability() {
         let runtime = ServiceNetworkRuntime::new(
-            ServiceNetworkNode::generate(ServiceNetworkP2pConfig::default())
-                .expect("node should start"),
+            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
+                state_dir: temp_state_dir("contact-material"),
+                ..ServiceNetworkP2pConfig::default()
+            })
+            .expect("node should start"),
         )
         .expect("runtime should start");
 
@@ -550,11 +857,14 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transport_router_prefers_iroh_for_large_backfill_when_remote_supports_it() {
         let runtime = ServiceNetworkRuntime::new(
-            ServiceNetworkNode::generate(ServiceNetworkP2pConfig::default())
-                .expect("node should start"),
+            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
+                state_dir: temp_state_dir("backfill-route"),
+                ..ServiceNetworkP2pConfig::default()
+            })
+            .expect("node should start"),
         )
         .expect("runtime should start");
 
@@ -570,11 +880,14 @@ mod tests {
         assert_eq!(route, TransportRoute::IrohDirect);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transport_router_keeps_control_messages_on_libp2p() {
         let runtime = ServiceNetworkRuntime::new(
-            ServiceNetworkNode::generate(ServiceNetworkP2pConfig::default())
-                .expect("node should start"),
+            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
+                state_dir: temp_state_dir("control-route"),
+                ..ServiceNetworkP2pConfig::default()
+            })
+            .expect("node should start"),
         )
         .expect("runtime should start");
 

@@ -1,4 +1,5 @@
 use std::time::{Duration, Instant};
+use std::{env, fs, path::PathBuf};
 
 use chrono::Utc;
 use tokio::time::sleep;
@@ -73,10 +74,17 @@ fn published_agent() -> PublishedAgentRecord {
 
 fn test_config() -> ServiceNetworkP2pConfig {
     ServiceNetworkP2pConfig {
+        state_dir: temp_state_dir("postgres-convergence"),
         listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
         enable_mdns: false,
         ..ServiceNetworkP2pConfig::default()
     }
+}
+
+fn temp_state_dir(prefix: &str) -> PathBuf {
+    let dir = env::temp_dir().join(format!("servicenet-{prefix}-{}", Uuid::new_v4().simple()));
+    fs::create_dir_all(&dir).expect("create temp state dir");
+    dir
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

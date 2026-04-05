@@ -1,7 +1,9 @@
 use std::time::{Duration, Instant};
+use std::{env, fs, path::PathBuf};
 
 use chrono::Utc;
 use tokio::time::sleep;
+use uuid::Uuid;
 use watt_servicenet_p2p::{
     Multiaddr, ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime,
     ServiceNetworkRuntimeEvent,
@@ -32,10 +34,17 @@ fn revoked_provider() -> ProviderRecord {
 
 fn test_config() -> ServiceNetworkP2pConfig {
     ServiceNetworkP2pConfig {
+        state_dir: temp_state_dir("provider-backfill"),
         listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
         enable_mdns: false,
         ..ServiceNetworkP2pConfig::default()
     }
+}
+
+fn temp_state_dir(prefix: &str) -> PathBuf {
+    let dir = env::temp_dir().join(format!("servicenet-{prefix}-{}", Uuid::new_v4().simple()));
+    fs::create_dir_all(&dir).expect("create temp state dir");
+    dir
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

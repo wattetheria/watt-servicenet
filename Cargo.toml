@@ -16,6 +16,8 @@ base64 = "0.22"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hex = "0.4"
+libp2p-identity = { version = "0.2.13", features = ["ed25519", "rand"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -26,6 +28,7 @@ tokio = { version = "1.42", features = ["full"] }
 tower = "0.5"
 tempfile = "3.14"
 uuid = { version = "1.11", features = ["v4", "serde"] }
+wattswarm-artifact-store = { path = "../wattswarm/crates/artifact-store" }
 wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }
 wattswarm-network-transport-core = { path = "../wattswarm/crates/network-transport-core" }
 wattswarm-network-transport-iroh = { path = "../wattswarm/crates/network-transport-iroh" }
