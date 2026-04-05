@@ -27,6 +27,8 @@ tower = "0.5"
 tempfile = "3.14"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }
+wattswarm-network-transport-core = { path = "../wattswarm/crates/network-transport-core" }
+wattswarm-network-transport-iroh = { path = "../wattswarm/crates/network-transport-iroh" }
 
 [workspace.package]
 edition = "2024"

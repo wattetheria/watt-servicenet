@@ -9,6 +9,8 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 wattswarm-network-substrate.workspace = true
+wattswarm-network-transport-core.workspace = true
+wattswarm-network-transport-iroh.workspace = true
 watt-servicenet-protocol = { path = "../service-protocol" }
 
 [dev-dependencies]

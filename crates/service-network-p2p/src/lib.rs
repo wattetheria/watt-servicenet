@@ -6,8 +6,19 @@ use wattswarm_network_substrate::{
     RawBackfillRequest, RawBackfillResponse, RawGossipMessage, SubstrateConfig, SubstrateNode,
     SubstrateRuntime, SubstrateRuntimeEvent, SwarmScope, TopicKind, TopicNamespace,
 };
+use wattswarm_network_transport_core::{
+    DirectDataTransportAdapter, PeerTransportCapabilities, TransferIntent,
+    TransportContactMaterial, TransportRoute, TransportRouter,
+};
+use wattswarm_network_transport_iroh::IrohTransportAdapter;
 
 pub use wattswarm_network_substrate::{Multiaddr, PeerHandshakeMetadata, PeerId};
+pub use wattswarm_network_transport_core::{
+    PeerTransportCapabilities as ServiceNetworkTransportCapabilities,
+    TransferIntent as ServiceNetworkTransferIntent, TransferKind as ServiceNetworkTransferKind,
+    TransportContactMaterial as ServiceNetworkTransportContactMaterial,
+    TransportRoute as ServiceNetworkTransportRoute,
+};
 
 pub const SERVICENET_IDENTIFY_AGENT_PREFIX: &str = "wattswarm-servicenet-p2p";
 pub const PROVIDER_FEED_KEY: &str = "provider_record";
@@ -161,12 +172,15 @@ pub enum ServiceNetworkRuntimeEvent {
 
 pub struct ServiceNetworkRuntime {
     inner: SubstrateRuntime,
+    iroh_adapter: IrohTransportAdapter,
 }
 
 impl ServiceNetworkRuntime {
     pub fn new(node: ServiceNetworkNode) -> Result<Self> {
+        let local_peer_id = node.inner.local_peer_id();
         Ok(Self {
             inner: SubstrateRuntime::new(node.inner)?,
+            iroh_adapter: IrohTransportAdapter::from_local_peer_id(&local_peer_id)?,
         })
     }
 
@@ -184,6 +198,32 @@ impl ServiceNetworkRuntime {
 
     pub fn listen_addrs(&self) -> &[Multiaddr] {
         self.inner.listen_addrs()
+    }
+
+    pub fn transport_capabilities(&self) -> PeerTransportCapabilities {
+        self.iroh_adapter.capabilities().clone()
+    }
+
+    pub fn export_transport_contact_material(
+        &self,
+        generated_at: u64,
+    ) -> Result<TransportContactMaterial> {
+        let listen_addrs = self
+            .listen_addrs()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        Ok(self
+            .iroh_adapter
+            .export_contact_material(&listen_addrs, generated_at)?)
+    }
+
+    pub fn recommended_transfer_route(
+        &self,
+        remote_capabilities: Option<&PeerTransportCapabilities>,
+        intent: &TransferIntent,
+    ) -> TransportRoute {
+        TransportRouter::select(intent, remote_capabilities)
     }
 
     pub fn publish_provider(&mut self, provider: &ProviderRecord) -> Result<()> {
@@ -303,7 +343,7 @@ impl ServiceNetworkRuntime {
             SubstrateRuntimeEvent::NewListenAddr { address } => {
                 Some(ServiceNetworkRuntimeEvent::NewListenAddr { address })
             }
-            SubstrateRuntimeEvent::ConnectionEstablished { peer } => {
+            SubstrateRuntimeEvent::ConnectionEstablished { peer, .. } => {
                 Some(ServiceNetworkRuntimeEvent::ConnectionEstablished { peer })
             }
             SubstrateRuntimeEvent::Gossip {
@@ -403,6 +443,7 @@ mod tests {
         AgentDeployment, AgentDeploymentEndpoint, AgentReviewProfile, ProviderStatus,
         PublishedAgentStatus, RiskLevel, SERVICE_PROTOCOL_SCHEMA_VERSION,
     };
+    use wattswarm_network_transport_core::{TransferKind, TransportRoute};
 
     fn demo_provider() -> ProviderRecord {
         ProviderRecord {
@@ -484,6 +525,69 @@ mod tests {
         };
         let mapped = ServiceNetworkRuntime::map_runtime_event(event).expect("mapping should work");
         assert!(mapped.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exported_contact_material_advertises_iroh_direct_capability() {
+        let runtime = ServiceNetworkRuntime::new(
+            ServiceNetworkNode::generate(ServiceNetworkP2pConfig::default())
+                .expect("node should start"),
+        )
+        .expect("runtime should start");
+
+        let contact = runtime
+            .export_transport_contact_material(1_764_292_800)
+            .expect("contact material");
+
+        assert_eq!(contact.transport, TransportRoute::IrohDirect.as_str());
+        assert_eq!(
+            contact.metadata.capabilities,
+            PeerTransportCapabilities::iroh_direct_default()
+        );
+        assert_eq!(
+            contact.metadata.endpoint_id.as_deref(),
+            Some(contact.extra["endpoint_id"].as_str().expect("endpoint id"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_router_prefers_iroh_for_large_backfill_when_remote_supports_it() {
+        let runtime = ServiceNetworkRuntime::new(
+            ServiceNetworkNode::generate(ServiceNetworkP2pConfig::default())
+                .expect("node should start"),
+        )
+        .expect("runtime should start");
+
+        let route = runtime.recommended_transfer_route(
+            Some(&PeerTransportCapabilities::iroh_direct_default()),
+            &TransferIntent {
+                kind: TransferKind::BackfillChunk,
+                payload_bytes: 128 * 1024,
+                requires_streaming: false,
+            },
+        );
+
+        assert_eq!(route, TransportRoute::IrohDirect);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_router_keeps_control_messages_on_libp2p() {
+        let runtime = ServiceNetworkRuntime::new(
+            ServiceNetworkNode::generate(ServiceNetworkP2pConfig::default())
+                .expect("node should start"),
+        )
+        .expect("runtime should start");
+
+        let route = runtime.recommended_transfer_route(
+            Some(&PeerTransportCapabilities::iroh_direct_default()),
+            &TransferIntent {
+                kind: TransferKind::ControlMessage,
+                payload_bytes: 512,
+                requires_streaming: false,
+            },
+        );
+
+        assert_eq!(route, TransportRoute::Libp2pControl);
     }
 
     fn demo_published_agent() -> PublishedAgentRecord {
