@@ -10,6 +10,10 @@ fn default_schema_version() -> u32 {
     SERVICE_PROTOCOL_SCHEMA_VERSION
 }
 
+fn default_agent_interaction_protocol() -> AgentInteractionProtocol {
+    AgentInteractionProtocol::GoogleA2a
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum AuthModel {
@@ -374,17 +378,59 @@ pub enum PublishedAgentStatus {
     Revoked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInteractionProtocol {
+    #[default]
+    GoogleA2a,
+}
+
+impl AgentInteractionProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GoogleA2a => "google_a2a",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentDeploymentEndpoint {
     pub url: String,
     pub protocol_binding: String,
     pub protocol_version: String,
+    #[serde(default = "default_agent_interaction_protocol")]
+    pub interaction_protocol: AgentInteractionProtocol,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentDeployment {
     pub runtime: String,
     pub endpoint: AgentDeploymentEndpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementLayer {
+    Web2,
+    #[default]
+    Web3,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettlementRequest {
+    #[serde(default)]
+    pub layer: SettlementLayer,
+    pub rail: String,
+    #[serde(default)]
+    pub request: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NormalizedSettlementRequest {
+    pub layer: SettlementLayer,
+    pub rail: String,
+    #[serde(default)]
+    pub request: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -528,6 +574,8 @@ pub struct InvokeAgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<SettlementRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_context_id: Option<Uuid>,
@@ -561,6 +609,10 @@ pub struct InvokeAgentResponse {
     pub context_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<NormalizedSettlementRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_receipt: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
     pub raw: Value,
@@ -632,7 +684,8 @@ mod tests {
                 "endpoint": {
                     "url": "https://example.com/a2a",
                     "protocol_binding": "JSONRPC",
-                    "protocol_version": "1.0"
+                    "protocol_version": "1.0",
+                    "interaction_protocol": "google_a2a"
                 }
             },
             "review": {
@@ -654,6 +707,10 @@ mod tests {
         .expect("submit agent request should parse");
         assert_eq!(request.agent_id, "stripe-agent");
         assert_eq!(request.review.cost_per_call_units, Some(10));
+        assert_eq!(
+            request.deployment.endpoint.interaction_protocol,
+            AgentInteractionProtocol::GoogleA2a
+        );
     }
 
     #[test]
@@ -664,6 +721,47 @@ mod tests {
         .expect("invoke agent request should parse");
         assert_eq!(request.input, Value::Null);
         assert!(!request.confirm_risky);
+    }
+
+    #[test]
+    fn deployment_endpoint_defaults_interaction_protocol_to_google_a2a() {
+        let endpoint: AgentDeploymentEndpoint = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com/a2a",
+            "protocol_binding": "JSONRPC",
+            "protocol_version": "1.0"
+        }))
+        .expect("deployment endpoint should parse");
+        assert_eq!(
+            endpoint.interaction_protocol,
+            AgentInteractionProtocol::GoogleA2a
+        );
+    }
+
+    #[test]
+    fn invoke_agent_request_round_trips_settlement() {
+        let request: InvokeAgentRequest = serde_json::from_value(serde_json::json!({
+            "task_id": "task-x402-1",
+            "context_id": "ctx-x402-1",
+            "message": "Pay for this service",
+            "input": {
+                "quote_id": "quote-1"
+            },
+            "settlement": {
+                "layer": "web3",
+                "rail": "x402",
+                "request": {
+                    "pay_to": "0xabc123"
+                }
+            },
+            "region": "AU",
+            "confirm_risky": true
+        }))
+        .expect("invoke agent request should parse");
+        assert_eq!(request.message.as_deref(), Some("Pay for this service"));
+        assert_eq!(
+            request.settlement.as_ref().map(|value| value.rail.as_str()),
+            Some("x402")
+        );
     }
 
     #[test]

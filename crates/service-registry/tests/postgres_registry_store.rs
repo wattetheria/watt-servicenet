@@ -6,9 +6,9 @@ use serde_json::json;
 use uuid::Uuid;
 use watt_servicenet_protocol::{
     AgentArtifacts, AgentAttestations, AgentDeployment, AgentDeploymentEndpoint,
-    AgentReviewProfile, ApproveAgentSubmissionRequest, ExecutionReceipt, ReceiptQuery,
-    ReceiptStatus, RegisterProviderRequest, RiskLevel, RotateProviderKeyRequest, StoredReceipt,
-    SubmitAgentRequest, VerificationVerdict, build_agent_attestation_payload,
+    AgentInteractionProtocol, AgentReviewProfile, ApproveAgentSubmissionRequest, ExecutionReceipt,
+    ReceiptQuery, ReceiptStatus, RegisterProviderRequest, RiskLevel, RotateProviderKeyRequest,
+    StoredReceipt, SubmitAgentRequest, VerificationVerdict, build_agent_attestation_payload,
 };
 use watt_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
 
@@ -75,6 +75,7 @@ fn agent_submission() -> SubmitAgentRequest {
                 url: "https://stripe-agent.example.com/a2a".to_owned(),
                 protocol_binding: "JSONRPC".to_owned(),
                 protocol_version: "1.0".to_owned(),
+                interaction_protocol: AgentInteractionProtocol::GoogleA2a,
             },
         },
         review: AgentReviewProfile {

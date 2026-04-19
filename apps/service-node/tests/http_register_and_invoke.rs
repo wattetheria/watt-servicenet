@@ -1,10 +1,10 @@
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
-use axum::{Json, Router, routing::post};
+use axum::{Json, Router, extract::State, routing::post};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer, SigningKey};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use watt_servicenet_node::build_local_app;
 use watt_servicenet_protocol::build_agent_attestation_payload;
@@ -66,7 +66,8 @@ fn valid_agent_submission_payload(url_base: &str, endpoint_url: &str) -> serde_j
             "endpoint": {
                 "url": endpoint_url,
                 "protocol_binding": "JSONRPC",
-                "protocol_version": "1.0"
+                "protocol_version": "1.0",
+                "interaction_protocol": "google_a2a"
             }
         },
         "review": {
@@ -174,6 +175,60 @@ async fn start_mock_a2a_server() -> String {
             .expect("mock a2a server should run");
     });
     format!("http://{addr}/a2a")
+}
+
+async fn start_mock_a2a_server_with_capture() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+
+    async fn handle(
+        State(captured): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+        Json(request): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        captured.lock().expect("capture lock").push(request.clone());
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": {
+                "task": {
+                    "id": "task-ap2-1",
+                    "contextId": "ctx-ap2-1",
+                    "status": {
+                        "state": "TASK_STATE_COMPLETED"
+                    },
+                    "artifacts": [
+                        {
+                            "artifactId": "artifact-1",
+                            "parts": [
+                                {
+                                    "data": {
+                                        "payment_receipt": {
+                                            "status": "authorized"
+                                        },
+                                        "provider": "mock-a2a"
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+        Json(response)
+    }
+
+    let app = Router::new()
+        .route("/a2a", post(handle))
+        .with_state(Arc::clone(&captured));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("local addr should exist");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("mock a2a server should run");
+    });
+    (format!("http://{addr}/a2a"), captured)
 }
 
 async fn register_provider_and_approve_agent(
@@ -489,6 +544,67 @@ async fn approved_agent_can_be_invoked_over_a2a_and_polled() {
     assert_eq!(poll_json["status"], "TASK_STATE_COMPLETED");
     assert_eq!(poll_json["output"]["ok"], true);
     assert_eq!(poll_json["output"]["provider"], "mock-a2a");
+}
+
+#[tokio::test]
+async fn approved_agent_can_be_invoked_over_a2a_with_x402_settlement() {
+    let app = build_local_app(Arc::new(ServiceRegistry::in_memory()));
+    let (a2a_url, captured) = start_mock_a2a_server_with_capture().await;
+    let card_url = a2a_url.trim_end_matches("/a2a").to_owned();
+
+    let _submission_id = register_provider_and_approve_agent(&app, &a2a_url, &card_url).await;
+
+    let invoke = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/agents/stripe-agent/invoke")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "task_id": "task-ap2-1",
+                        "context_id": "ctx-ap2-1",
+                        "message": "Book a flight",
+                        "input": {
+                            "quote_id": "quote-1"
+                        },
+                        "settlement": {
+                            "layer": "web3",
+                            "rail": "x402",
+                            "request": {
+                                "pay_to": "0xabc123"
+                            }
+                        },
+                        "auth_token": "test-token",
+                        "region": "AU",
+                        "confirm_risky": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("invoke should succeed");
+    assert_eq!(invoke.status(), StatusCode::OK);
+    let invoke_json = response_json(invoke).await;
+    assert_eq!(invoke_json["status"], "TASK_STATE_COMPLETED");
+    assert_eq!(invoke_json["settlement"]["rail"], "x402");
+    assert_eq!(
+        invoke_json["payment_receipt"]["status"],
+        serde_json::json!("authorized")
+    );
+
+    let captured = captured.lock().expect("capture lock");
+    let request = captured.last().expect("captured request");
+    assert_eq!(request["method"], "SendMessage");
+    assert_eq!(
+        request["params"]["extensions"]["settlement"]["rail"],
+        "x402"
+    );
+    assert_eq!(
+        request["params"]["extensions"]["settlement"]["request"]["protocol"],
+        "x402"
+    );
 }
 
 #[tokio::test]

@@ -21,14 +21,14 @@ use watt_did::{
     ProofEnvelope, UcanCapability,
 };
 use watt_servicenet_protocol::{
-    AgentDeployment, AgentHealthRecord, AgentReviewProfile, AgentSubmissionQuery,
-    AgentSubmissionRecord, AgentSubmissionStatus, AgentTrustRecord, ApproveAgentSubmissionRequest,
-    AuthContextQuery, AuthContextRecord, BlockEntityRequest, CreateModerationCaseRequest,
-    CreateProviderOwnershipChallengeRequest, ExecutionReceipt, HealthStatus, ModerationAction,
-    ModerationCase, ModerationCaseQuery, ModerationStatus, ModerationTargetKind,
-    ProviderAuditEvent, ProviderAuditKind, ProviderHealthRecord, ProviderOwnershipChallenge,
-    ProviderOwnershipOperation, ProviderRecord, ProviderStatus, ProviderTrustRecord,
-    PublishedAgentRecord, PublishedAgentStatus, ReceiptQuery, ReceiptStatus,
+    AgentDeployment, AgentHealthRecord, AgentInteractionProtocol, AgentReviewProfile,
+    AgentSubmissionQuery, AgentSubmissionRecord, AgentSubmissionStatus, AgentTrustRecord,
+    ApproveAgentSubmissionRequest, AuthContextQuery, AuthContextRecord, BlockEntityRequest,
+    CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest, ExecutionReceipt,
+    HealthStatus, ModerationAction, ModerationCase, ModerationCaseQuery, ModerationStatus,
+    ModerationTargetKind, ProviderAuditEvent, ProviderAuditKind, ProviderHealthRecord,
+    ProviderOwnershipChallenge, ProviderOwnershipOperation, ProviderRecord, ProviderStatus,
+    ProviderTrustRecord, PublishedAgentRecord, PublishedAgentStatus, ReceiptQuery, ReceiptStatus,
     RegisterAuthContextRequest, RegisterProviderRequest, RejectAgentSubmissionRequest,
     ResolveModerationCaseRequest, RevokeProviderRequest, RiskLevel, RotateProviderKeyRequest,
     RunVerifierSweepRequest, SERVICE_PROTOCOL_SCHEMA_VERSION, StoredReceipt, SubmitAgentRequest,
@@ -2366,6 +2366,11 @@ fn validate_agent_deployment(deployment: &AgentDeployment) -> Result<(), Registr
             "deployment.endpoint.protocol_version must not be empty".to_owned(),
         ));
     }
+    if deployment.endpoint.interaction_protocol != AgentInteractionProtocol::GoogleA2a {
+        return Err(RegistryError::InvalidAgent(
+            "only google_a2a interaction_protocol is supported".to_owned(),
+        ));
+    }
     if !is_secure_or_loopback_url(&deployment.endpoint.url) {
         return Err(RegistryError::InvalidAgent(
             "deployment.endpoint.url must be https or localhost http".to_owned(),
@@ -2810,6 +2815,7 @@ mod tests {
                     url: "https://stripe-agent.example.com/a2a".to_owned(),
                     protocol_binding: "JSONRPC".to_owned(),
                     protocol_version: "1.0".to_owned(),
+                    interaction_protocol: AgentInteractionProtocol::GoogleA2a,
                 },
             },
             review: AgentReviewProfile {

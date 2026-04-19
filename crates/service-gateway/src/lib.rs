@@ -6,8 +6,9 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 use watt_servicenet_protocol::{
-    AuthContextRecord, ExecutionReceipt, GetAgentTaskRequest, InvokeAgentRequest,
-    InvokeAgentResponse, PublishedAgentRecord, ReceiptStatus, RiskLevel, StoredReceipt,
+    AgentInteractionProtocol, AuthContextRecord, ExecutionReceipt, GetAgentTaskRequest,
+    InvokeAgentRequest, InvokeAgentResponse, NormalizedSettlementRequest, PublishedAgentRecord,
+    ReceiptStatus, RiskLevel, SettlementLayer, SettlementRequest, StoredReceipt,
     VerificationVerdict,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry};
@@ -32,6 +33,158 @@ pub struct GatewayService {
     registry: Arc<ServiceRegistry>,
     http_client: reqwest::Client,
     policy: GatewayPolicyConfig,
+}
+
+trait A2aAdapter: Send + Sync {
+    fn send_message_method(&self) -> &'static str;
+
+    fn get_task_method(&self) -> &'static str;
+
+    fn version_header_name(&self) -> &'static str;
+
+    fn build_send_message_payload(
+        &self,
+        request: &InvokeAgentRequest,
+        settlement: Option<&NormalizedSettlementRequest>,
+    ) -> Value;
+
+    fn build_get_task_payload(&self, task_id: &str, request: &GetAgentTaskRequest) -> Value;
+}
+
+trait SettlementRailAdapter: Send + Sync {
+    fn rail_id(&self) -> &'static str;
+
+    fn layer(&self) -> SettlementLayer;
+
+    fn normalize_request(&self, request: &Value) -> Result<Value, GatewayError>;
+}
+
+#[derive(Debug, Default)]
+struct GoogleA2aAdapter;
+
+impl A2aAdapter for GoogleA2aAdapter {
+    fn send_message_method(&self) -> &'static str {
+        "SendMessage"
+    }
+
+    fn get_task_method(&self) -> &'static str {
+        "GetTask"
+    }
+
+    fn version_header_name(&self) -> &'static str {
+        "A2A-Version"
+    }
+
+    fn build_send_message_payload(
+        &self,
+        request: &InvokeAgentRequest,
+        settlement: Option<&NormalizedSettlementRequest>,
+    ) -> Value {
+        let parts = match (&request.message, &request.input) {
+            (Some(message), Value::Null) => vec![serde_json::json!({
+                "kind": "text",
+                "text": message,
+            })],
+            (Some(message), input) => vec![
+                serde_json::json!({
+                    "kind": "text",
+                    "text": message,
+                }),
+                serde_json::json!({
+                    "kind": "data",
+                    "data": input,
+                }),
+            ],
+            (None, input) => vec![serde_json::json!({
+                "kind": "data",
+                "data": input,
+            })],
+        };
+
+        let mut map = serde_json::Map::new();
+        if let Some(task_id) = &request.task_id {
+            map.insert("taskId".to_owned(), Value::String(task_id.clone()));
+        }
+        if let Some(context_id) = &request.context_id {
+            map.insert("contextId".to_owned(), Value::String(context_id.clone()));
+        }
+        if let Some(skill_id) = &request.skill_id {
+            map.insert("skillId".to_owned(), Value::String(skill_id.clone()));
+        }
+        map.insert(
+            "message".to_owned(),
+            serde_json::json!({
+                "role": "user",
+                "parts": parts,
+            }),
+        );
+        if let Some(settlement) = settlement {
+            map.insert(
+                "extensions".to_owned(),
+                serde_json::json!({ "settlement": settlement }),
+            );
+        }
+        Value::Object(map)
+    }
+
+    fn build_get_task_payload(&self, task_id: &str, request: &GetAgentTaskRequest) -> Value {
+        serde_json::json!({
+            "id": task_id,
+            "historyLength": request.history_length.unwrap_or(10),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct X402SettlementRailAdapter;
+
+impl SettlementRailAdapter for X402SettlementRailAdapter {
+    fn rail_id(&self) -> &'static str {
+        "x402"
+    }
+
+    fn layer(&self) -> SettlementLayer {
+        SettlementLayer::Web3
+    }
+
+    fn normalize_request(&self, request: &Value) -> Result<Value, GatewayError> {
+        let mut normalized = match request {
+            Value::Object(map) => Value::Object(map.clone()),
+            Value::Null => serde_json::json!({}),
+            _ => {
+                return Err(GatewayError::Rejected(
+                    "x402 settlement request must be a JSON object".to_owned(),
+                ));
+            }
+        };
+        if normalized.get("protocol").is_none() {
+            normalized["protocol"] = Value::String("x402".to_owned());
+        }
+        Ok(normalized)
+    }
+}
+
+fn a2a_adapter(protocol: AgentInteractionProtocol) -> Box<dyn A2aAdapter + Send + Sync> {
+    match protocol {
+        AgentInteractionProtocol::GoogleA2a => Box::<GoogleA2aAdapter>::default(),
+    }
+}
+
+fn settlement_rail_adapter(
+    settlement: &SettlementRequest,
+) -> Result<Box<dyn SettlementRailAdapter + Send + Sync>, GatewayError> {
+    match (
+        settlement.layer,
+        settlement.rail.trim().to_ascii_lowercase().as_str(),
+    ) {
+        (SettlementLayer::Web3, "x402") => Ok(Box::<X402SettlementRailAdapter>::default()),
+        (SettlementLayer::Web3, rail) => Err(GatewayError::Rejected(format!(
+            "unsupported web3 settlement rail: {rail}"
+        ))),
+        (SettlementLayer::Web2, rail) => Err(GatewayError::Rejected(format!(
+            "web2 settlement rail is not implemented yet: {rail}"
+        ))),
+    }
 }
 
 impl GatewayService {
@@ -63,13 +216,16 @@ impl GatewayService {
             .or(request.auth_token.clone());
         self.enforce_agent_preflight(&record, &request, auth_token.as_deref())
             .await?;
+        let adapter = a2a_adapter(record.deployment.endpoint.interaction_protocol);
+        let normalized_settlement = normalize_settlement_request(request.settlement.as_ref())?;
 
         let started_at = Utc::now();
         let response = self
             .a2a_jsonrpc_call(
                 &record,
-                "SendMessage",
-                build_a2a_send_message_payload(&request),
+                adapter.as_ref(),
+                adapter.send_message_method(),
+                adapter.build_send_message_payload(&request, normalized_settlement.as_ref()),
                 auth_token.as_deref(),
             )
             .await?;
@@ -87,7 +243,8 @@ impl GatewayService {
                     "context_id": request.context_id,
                     "message": request.message,
                     "input": request.input,
-                    "skill_id": request.skill_id
+                    "skill_id": request.skill_id,
+                    "settlement": normalized_settlement
                 }))
                 .map_err(|err| GatewayError::Execution(err.to_string()))?,
                 result_digest: extract_task_output(&response)
@@ -113,6 +270,7 @@ impl GatewayService {
         Ok(build_invoke_agent_response(
             agent_id,
             Some(stored.receipt.receipt_id),
+            normalized_settlement,
             response,
         ))
     }
@@ -134,18 +292,17 @@ impl GatewayService {
             .or(request.auth_token.clone());
         self.enforce_agent_task_access(&record, auth_token.as_deref())
             .await?;
+        let adapter = a2a_adapter(record.deployment.endpoint.interaction_protocol);
         let response = self
             .a2a_jsonrpc_call(
                 &record,
-                "GetTask",
-                serde_json::json!({
-                    "id": task_id,
-                    "historyLength": request.history_length.unwrap_or(10),
-                }),
+                adapter.as_ref(),
+                adapter.get_task_method(),
+                adapter.build_get_task_payload(task_id, &request),
                 auth_token.as_deref(),
             )
             .await?;
-        Ok(build_invoke_agent_response(agent_id, None, response))
+        Ok(build_invoke_agent_response(agent_id, None, None, response))
     }
 
     async fn resolve_agent_auth_context(
@@ -275,6 +432,7 @@ impl GatewayService {
     async fn a2a_jsonrpc_call(
         &self,
         record: &PublishedAgentRecord,
+        adapter: &(dyn A2aAdapter + Send + Sync),
         method: &str,
         params: Value,
         auth_token: Option<&str>,
@@ -282,7 +440,10 @@ impl GatewayService {
         let mut builder = self
             .http_client
             .post(&record.deployment.endpoint.url)
-            .header("A2A-Version", &record.deployment.endpoint.protocol_version);
+            .header(
+                adapter.version_header_name(),
+                &record.deployment.endpoint.protocol_version,
+            );
         if let Some(token) = auth_token {
             builder = builder.bearer_auth(token);
         }
@@ -332,51 +493,25 @@ fn agent_requires_auth(agent_card: &Value) -> bool {
     }
 }
 
-fn build_a2a_send_message_payload(request: &InvokeAgentRequest) -> Value {
-    let parts = match (&request.message, &request.input) {
-        (Some(message), Value::Null) => vec![serde_json::json!({
-            "kind": "text",
-            "text": message,
-        })],
-        (Some(message), input) => vec![
-            serde_json::json!({
-                "kind": "text",
-                "text": message,
-            }),
-            serde_json::json!({
-                "kind": "data",
-                "data": input,
-            }),
-        ],
-        (None, input) => vec![serde_json::json!({
-            "kind": "data",
-            "data": input,
-        })],
-    };
-
-    let mut map = serde_json::Map::new();
-    if let Some(task_id) = &request.task_id {
-        map.insert("taskId".to_owned(), Value::String(task_id.clone()));
-    }
-    if let Some(context_id) = &request.context_id {
-        map.insert("contextId".to_owned(), Value::String(context_id.clone()));
-    }
-    if let Some(skill_id) = &request.skill_id {
-        map.insert("skillId".to_owned(), Value::String(skill_id.clone()));
-    }
-    map.insert(
-        "message".to_owned(),
-        serde_json::json!({
-            "role": "user",
-            "parts": parts,
-        }),
-    );
-    Value::Object(map)
+fn normalize_settlement_request(
+    settlement: Option<&SettlementRequest>,
+) -> Result<Option<NormalizedSettlementRequest>, GatewayError> {
+    settlement
+        .map(|settlement| {
+            let rail = settlement_rail_adapter(settlement)?;
+            Ok(NormalizedSettlementRequest {
+                layer: rail.layer(),
+                rail: rail.rail_id().to_owned(),
+                request: rail.normalize_request(&settlement.request)?,
+            })
+        })
+        .transpose()
 }
 
 fn build_invoke_agent_response(
     agent_id: &str,
     receipt_id: Option<Uuid>,
+    settlement: Option<NormalizedSettlementRequest>,
     response: Value,
 ) -> InvokeAgentResponse {
     let task = response
@@ -403,6 +538,8 @@ fn build_invoke_agent_response(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         message,
+        settlement,
+        payment_receipt: extract_payment_receipt(&response),
         output,
         raw: response,
     }
@@ -441,6 +578,15 @@ fn extract_message_value(part: &Value) -> Option<Value> {
         .or_else(|| part.get("text").cloned())
 }
 
+fn extract_payment_receipt(response: &Value) -> Option<Value> {
+    extract_task_output(response).and_then(|value| {
+        value
+            .get("payment_receipt")
+            .cloned()
+            .or_else(|| value.get("receipt").cloned())
+    })
+}
+
 fn digest_value(value: &Value) -> Result<String> {
     let bytes = serde_json::to_vec(value)?;
     let mut hasher = Sha256::new();
@@ -464,15 +610,16 @@ fn map_registry_error(error: RegistryError) -> GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, routing::post};
+    use axum::{Json, Router, extract::State, routing::post};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use ed25519_dalek::{Signer, SigningKey};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use watt_servicenet_protocol::{
         AgentArtifacts, AgentAttestations, AgentDeployment, AgentDeploymentEndpoint,
-        AgentReviewProfile, ApproveAgentSubmissionRequest, AuthModel, RegisterAuthContextRequest,
-        RegisterProviderRequest, RiskLevel, SubmitAgentRequest, build_agent_attestation_payload,
+        AgentInteractionProtocol, AgentReviewProfile, ApproveAgentSubmissionRequest, AuthModel,
+        RegisterAuthContextRequest, RegisterProviderRequest, RiskLevel, SettlementLayer,
+        SettlementRequest, SubmitAgentRequest, build_agent_attestation_payload,
     };
 
     fn provider_signing_key() -> SigningKey {
@@ -530,6 +677,7 @@ mod tests {
                     url: endpoint_url.to_owned(),
                     protocol_binding: "JSONRPC".to_owned(),
                     protocol_version: "1.0".to_owned(),
+                    interaction_protocol: AgentInteractionProtocol::GoogleA2a,
                 },
             },
             review: AgentReviewProfile {
@@ -609,6 +757,58 @@ mod tests {
         format!("http://{addr}/a2a")
     }
 
+    async fn start_mock_a2a_server_with_capture() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+
+        async fn handle(
+            State(captured): State<Arc<Mutex<Vec<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            captured.lock().expect("capture lock").push(request.clone());
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": {
+                    "task": {
+                        "id": "task-ap2-1",
+                        "contextId": "ctx-ap2-1",
+                        "status": { "state": "TASK_STATE_COMPLETED" },
+                        "artifacts": [
+                            {
+                                "artifactId": "artifact-1",
+                                "parts": [
+                                    {
+                                        "data": {
+                                            "payment_receipt": {
+                                                "status": "authorized"
+                                            },
+                                            "provider": "mock-a2a"
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            });
+            Json(response)
+        }
+
+        let app = Router::new()
+            .route("/a2a", post(handle))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock server should run");
+        });
+        (format!("http://{addr}/a2a"), captured)
+    }
+
     async fn approved_gateway() -> (Arc<ServiceRegistry>, GatewayService) {
         let registry = Arc::new(ServiceRegistry::in_memory());
         registry
@@ -652,6 +852,7 @@ mod tests {
                         message: None,
                         input: Value::Null,
                         skill_id: None,
+                        settlement: None,
                         auth_token: Some("secret-token".to_owned()),
                         auth_context_id: None,
                         region: None,
@@ -697,6 +898,7 @@ mod tests {
                         message: Some("Create payment link".to_owned()),
                         input: Value::Null,
                         skill_id: None,
+                        settlement: None,
                         auth_token: Some("secret-token".to_owned()),
                         auth_context_id: None,
                         region: None,
@@ -732,6 +934,7 @@ mod tests {
                     message: Some("Create payment link".to_owned()),
                     input: Value::Null,
                     skill_id: None,
+                    settlement: None,
                     auth_token: None,
                     auth_context_id: Some(auth_context.auth_context_id),
                     region: Some("AU".to_owned()),
@@ -744,6 +947,120 @@ mod tests {
         assert_eq!(
             response.output,
             Some(serde_json::json!({ "authorized": true }))
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_agent_normalizes_x402_settlement_and_records_receipt() {
+        let registry = Arc::new(ServiceRegistry::in_memory());
+        registry
+            .register_provider(provider_request())
+            .await
+            .expect("provider should register");
+        let (a2a_url, captured) = start_mock_a2a_server_with_capture().await;
+        let card_url = a2a_url.trim_end_matches("/a2a").to_owned();
+        let submission = registry
+            .submit_agent(agent_submission(&card_url, &a2a_url))
+            .await
+            .expect("agent should submit");
+        registry
+            .approve_agent_submission(
+                submission.submission_id,
+                ApproveAgentSubmissionRequest {
+                    reviewed_by: "moderator-a".to_owned(),
+                    review_notes: Some("approved".to_owned()),
+                },
+            )
+            .await
+            .expect("agent should approve");
+        let gateway = GatewayService::new(registry.clone());
+
+        let response = gateway
+            .invoke_agent(
+                "stripe-agent",
+                InvokeAgentRequest {
+                    task_id: Some("task-ap2-1".to_owned()),
+                    context_id: Some("ctx-ap2-1".to_owned()),
+                    message: Some("Book the best flight".to_owned()),
+                    input: serde_json::json!({
+                        "quote_id": "quote-1"
+                    }),
+                    skill_id: None,
+                    settlement: Some(SettlementRequest {
+                        layer: SettlementLayer::Web3,
+                        rail: "X402".to_owned(),
+                        request: serde_json::json!({
+                            "pay_to": "0xabc123"
+                        }),
+                    }),
+                    auth_token: Some("secret-token".to_owned()),
+                    auth_context_id: None,
+                    region: Some("AU".to_owned()),
+                    confirm_risky: true,
+                    max_cost_units: Some(10),
+                },
+            )
+            .await
+            .expect("invoke should succeed");
+        assert_eq!(response.status, "TASK_STATE_COMPLETED");
+        assert_eq!(
+            response
+                .settlement
+                .as_ref()
+                .map(|value| value.rail.as_str()),
+            Some("x402")
+        );
+        assert_eq!(
+            response
+                .payment_receipt
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("authorized")
+        );
+
+        let captured = captured.lock().expect("capture lock");
+        let request = captured.last().expect("captured request");
+        assert_eq!(request["method"].as_str(), Some("SendMessage"));
+        assert_eq!(
+            request["params"]["extensions"]["settlement"]["rail"].as_str(),
+            Some("x402")
+        );
+        assert_eq!(
+            request["params"]["extensions"]["settlement"]["request"]["protocol"].as_str(),
+            Some("x402")
+        );
+    }
+
+    #[test]
+    fn google_a2a_adapter_builds_existing_send_message_shape() {
+        let adapter = GoogleA2aAdapter;
+        let payload = adapter.build_send_message_payload(&InvokeAgentRequest {
+            task_id: Some("task-1".to_owned()),
+            context_id: Some("ctx-1".to_owned()),
+            message: Some("Create payment link".to_owned()),
+            input: serde_json::json!({"amount": 42}),
+            skill_id: Some("payments.create_link".to_owned()),
+            settlement: None,
+            auth_token: None,
+            auth_context_id: None,
+            region: None,
+            confirm_risky: false,
+            max_cost_units: None,
+        }, None);
+        assert_eq!(adapter.send_message_method(), "SendMessage");
+        assert_eq!(adapter.get_task_method(), "GetTask");
+        assert_eq!(adapter.version_header_name(), "A2A-Version");
+        assert_eq!(payload["taskId"].as_str(), Some("task-1"));
+        assert_eq!(payload["contextId"].as_str(), Some("ctx-1"));
+        assert_eq!(payload["skillId"].as_str(), Some("payments.create_link"));
+        assert_eq!(
+            payload["message"]["parts"][0]["text"].as_str(),
+            Some("Create payment link")
+        );
+        assert_eq!(
+            payload["message"]["parts"][1]["data"]["amount"].as_i64(),
+            Some(42)
         );
     }
 }

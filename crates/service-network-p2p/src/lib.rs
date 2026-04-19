@@ -697,8 +697,8 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
     use watt_servicenet_protocol::{
-        AgentDeployment, AgentDeploymentEndpoint, AgentReviewProfile, PublishedAgentStatus,
-        RiskLevel,
+        AgentDeployment, AgentDeploymentEndpoint, AgentInteractionProtocol, AgentReviewProfile,
+        PublishedAgentStatus, RiskLevel,
     };
     use wattswarm_network_transport_core::{TransferKind, TransportRoute};
 
@@ -925,6 +925,7 @@ mod tests {
                     url: "https://stripe-agent.example.com/a2a".to_owned(),
                     protocol_binding: "JSONRPC".to_owned(),
                     protocol_version: "1.0".to_owned(),
+                    interaction_protocol: AgentInteractionProtocol::GoogleA2a,
                 },
             },
             review: AgentReviewProfile {

@@ -9,9 +9,9 @@ use watt_servicenet_p2p::{
     ServiceNetworkRuntimeEvent,
 };
 use watt_servicenet_protocol::{
-    AgentDeployment, AgentDeploymentEndpoint, AgentReviewProfile, ProviderRecord, ProviderStatus,
-    PublishedAgentRecord, PublishedAgentStatus, RegisterProviderRequest, RevokeProviderRequest,
-    RiskLevel,
+    AgentDeployment, AgentDeploymentEndpoint, AgentInteractionProtocol, AgentReviewProfile,
+    ProviderRecord, ProviderStatus, PublishedAgentRecord, PublishedAgentStatus,
+    RegisterProviderRequest, RevokeProviderRequest, RiskLevel,
 };
 use watt_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
 
@@ -55,6 +55,7 @@ fn published_agent() -> PublishedAgentRecord {
                 url: "https://stripe-agent.example.com/a2a".to_owned(),
                 protocol_binding: "JSONRPC".to_owned(),
                 protocol_version: "1.0".to_owned(),
+                interaction_protocol: AgentInteractionProtocol::GoogleA2a,
             },
         },
         review: AgentReviewProfile {

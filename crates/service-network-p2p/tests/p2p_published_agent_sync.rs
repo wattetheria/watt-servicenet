@@ -7,7 +7,9 @@ use uuid::Uuid;
 use watt_servicenet_p2p::{
     ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime, ServiceNetworkRuntimeEvent,
 };
-use watt_servicenet_protocol::{PublishedAgentRecord, PublishedAgentStatus, RiskLevel};
+use watt_servicenet_protocol::{
+    AgentInteractionProtocol, PublishedAgentRecord, PublishedAgentStatus, RiskLevel,
+};
 
 fn demo_published_agent() -> PublishedAgentRecord {
     PublishedAgentRecord {
@@ -31,6 +33,7 @@ fn demo_published_agent() -> PublishedAgentRecord {
                 url: "https://stripe-agent.example.com/a2a".to_owned(),
                 protocol_binding: "JSONRPC".to_owned(),
                 protocol_version: "1.0".to_owned(),
+                interaction_protocol: AgentInteractionProtocol::GoogleA2a,
             },
         },
         review: watt_servicenet_protocol::AgentReviewProfile {
