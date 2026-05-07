@@ -5,7 +5,7 @@ use chrono::Utc;
 use tokio::time::sleep;
 use uuid::Uuid;
 use watt_servicenet_p2p::{
-    Multiaddr, ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime,
+    NetworkAddress, ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime,
     ServiceNetworkRuntimeEvent,
 };
 use watt_servicenet_protocol::{
@@ -52,13 +52,18 @@ fn demo_published_agent() -> PublishedAgentRecord {
     }
 }
 
-fn test_config() -> ServiceNetworkP2pConfig {
-    ServiceNetworkP2pConfig {
+fn test_config(network_id: &str) -> ServiceNetworkP2pConfig {
+    let mut config = ServiceNetworkP2pConfig {
         state_dir: temp_state_dir("published-agent-backfill"),
         listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-        enable_mdns: false,
         ..ServiceNetworkP2pConfig::default()
-    }
+    };
+    config.namespace.network_id = network_id.to_owned();
+    config
+}
+
+fn test_network_id(prefix: &str) -> String {
+    format!("{prefix}-{}", Uuid::new_v4().simple())
 }
 
 fn temp_state_dir(prefix: &str) -> PathBuf {
@@ -69,8 +74,9 @@ fn temp_state_dir(prefix: &str) -> PathBuf {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_joiner_receives_published_agent_over_backfill() {
+    let network_id = test_network_id("published-agent-backfill");
     let mut runtime_a = ServiceNetworkRuntime::new(
-        ServiceNetworkNode::generate(test_config()).expect("node a should start"),
+        ServiceNetworkNode::generate(test_config(&network_id)).expect("node a should start"),
     )
     .expect("runtime a should start");
     runtime_a
@@ -84,8 +90,8 @@ async fn late_joiner_receives_published_agent_over_backfill() {
 
     let record = demo_published_agent();
 
-    let mut config_b = test_config();
-    config_b.bootstrap_peers = vec![format!("{listen_addr}/p2p/{peer_a}")];
+    let mut config_b = test_config(&network_id);
+    config_b.bootstrap_peers = vec![format!("{peer_a}@{listen_addr}")];
     let mut runtime_b = ServiceNetworkRuntime::new(
         ServiceNetworkNode::generate(config_b).expect("node b should start"),
     )
@@ -115,7 +121,12 @@ async fn late_joiner_receives_published_agent_over_backfill() {
     assert_eq!(records[0].agent_id, record.agent_id);
 }
 
-async fn wait_for_listen_addr(runtime: &mut ServiceNetworkRuntime) -> anyhow::Result<Multiaddr> {
+async fn wait_for_listen_addr(
+    runtime: &mut ServiceNetworkRuntime,
+) -> anyhow::Result<NetworkAddress> {
+    if let Some(address) = runtime.listen_addrs().first().cloned() {
+        return Ok(address);
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if Instant::now() >= deadline {

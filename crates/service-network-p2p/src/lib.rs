@@ -7,19 +7,21 @@ use std::path::{Path, PathBuf};
 use watt_servicenet_protocol::{ProviderRecord, PublishedAgentRecord};
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_substrate::{
-    BackfillRequestId, BackfillResponseChannel, NetworkRuntimeObservabilitySnapshot,
-    RawBackfillRequest, RawBackfillResponse, RawGossipMessage, SubstrateConfig, SubstrateNode,
-    SubstrateRuntime, SubstrateRuntimeEvent, SwarmScope, TopicKind, TopicNamespace,
+    BackfillRequestId, BackfillResponseChannel, GossipKind, NetworkNodeId,
+    NetworkRuntimeObservabilitySnapshot, RawBackfillRequest, RawBackfillResponse, RawGossipMessage,
+    SubstrateConfig, SubstrateNode, SubstrateRuntime, SubstrateRuntimeEvent, SwarmScope,
+    TopicNamespace,
 };
 use wattswarm_network_transport_core::{
     DirectDataFetchRequest, DirectDataObjectKind, PeerTransportCapabilities, TransferIntent,
     TransportContactMaterial, TransportRoute, TransportRouter,
 };
 use wattswarm_network_transport_iroh::{
-    export_local_contact_material, fetch_direct_data, shutdown_local_iroh_data_plane,
+    export_local_contact_material_for_network_peer_id, fetch_direct_data_for_network_peer_id,
+    shutdown_local_iroh_data_plane,
 };
 
-pub use wattswarm_network_substrate::{Multiaddr, PeerHandshakeMetadata, PeerId};
+pub use wattswarm_network_substrate::NetworkAddress;
 pub use wattswarm_network_transport_core::{
     PeerTransportCapabilities as ServiceNetworkTransportCapabilities,
     TransferIntent as ServiceNetworkTransferIntent, TransferKind as ServiceNetworkTransferKind,
@@ -27,16 +29,11 @@ pub use wattswarm_network_transport_core::{
     TransportRoute as ServiceNetworkTransportRoute,
 };
 
-pub const SERVICENET_IDENTIFY_AGENT_PREFIX: &str = "wattswarm-servicenet-p2p";
 pub const PROVIDER_FEED_KEY: &str = "provider_record";
 pub const PUBLISHED_AGENT_FEED_KEY: &str = "published_agent_record";
 const NODE_SEED_FILE: &str = "node_seed.hex";
 const CONTACT_MATERIAL_FILE: &str = "peer_transport_contacts.json";
 const STATE_LOCK_FILE: &str = ".servicenet-p2p.lock";
-
-pub fn encode_servicenet_agent_version(metadata: &PeerHandshakeMetadata) -> String {
-    metadata.encode_agent_version_with_prefix(SERVICENET_IDENTIFY_AGENT_PREFIX)
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceNetworkContentRef {
@@ -78,16 +75,8 @@ pub struct ServiceNetworkP2pConfig {
     pub state_dir: PathBuf,
     pub namespace: TopicNamespace,
     pub protocol_version: String,
-    pub identify_agent_version: String,
     pub listen_addrs: Vec<String>,
     pub bootstrap_peers: Vec<String>,
-    pub enable_mdns: bool,
-    pub max_established_per_peer: u32,
-    pub gossipsub_d: usize,
-    pub gossipsub_d_low: usize,
-    pub gossipsub_d_high: usize,
-    pub gossipsub_heartbeat_ms: u64,
-    pub gossipsub_max_transmit_size: usize,
     pub max_backfill_events: usize,
     pub max_backfill_events_hard_limit: usize,
 }
@@ -97,8 +86,6 @@ impl Default for ServiceNetworkP2pConfig {
         let mut config = Self::from_substrate(SubstrateConfig::default());
         config.namespace.network = "wattswarm-servicenet".to_owned();
         config.protocol_version = "/wattswarm-servicenet/0.1.0".to_owned();
-        config.identify_agent_version =
-            encode_servicenet_agent_version(&PeerHandshakeMetadata::default());
         config
     }
 }
@@ -109,16 +96,8 @@ impl ServiceNetworkP2pConfig {
             state_dir: PathBuf::from(".servicenet-p2p-state"),
             namespace: config.namespace,
             protocol_version: config.protocol_version,
-            identify_agent_version: config.identify_agent_version,
             listen_addrs: config.listen_addrs,
             bootstrap_peers: config.bootstrap_peers,
-            enable_mdns: config.enable_mdns,
-            max_established_per_peer: config.max_established_per_peer,
-            gossipsub_d: config.gossipsub_d,
-            gossipsub_d_low: config.gossipsub_d_low,
-            gossipsub_d_high: config.gossipsub_d_high,
-            gossipsub_heartbeat_ms: config.gossipsub_heartbeat_ms,
-            gossipsub_max_transmit_size: config.gossipsub_max_transmit_size,
             max_backfill_events: config.max_backfill_events,
             max_backfill_events_hard_limit: config.max_backfill_events_hard_limit,
         }
@@ -128,18 +107,11 @@ impl ServiceNetworkP2pConfig {
         SubstrateConfig {
             namespace: self.namespace.clone(),
             protocol_version: self.protocol_version.clone(),
-            identify_agent_version: self.identify_agent_version.clone(),
             listen_addrs: self.listen_addrs.clone(),
             bootstrap_peers: self.bootstrap_peers.clone(),
-            enable_mdns: self.enable_mdns,
-            max_established_per_peer: self.max_established_per_peer,
-            gossipsub_d: self.gossipsub_d,
-            gossipsub_d_low: self.gossipsub_d_low,
-            gossipsub_d_high: self.gossipsub_d_high,
-            gossipsub_heartbeat_ms: self.gossipsub_heartbeat_ms,
-            gossipsub_max_transmit_size: self.gossipsub_max_transmit_size,
             max_backfill_events: self.max_backfill_events,
             max_backfill_events_hard_limit: self.max_backfill_events_hard_limit,
+            control_request_timeout_ms: SubstrateConfig::default().control_request_timeout_ms,
         }
     }
 
@@ -159,9 +131,13 @@ impl ServiceNetworkNode {
     pub fn generate(config: ServiceNetworkP2pConfig) -> Result<Self> {
         initialize_state_dir(&config.state_dir)?;
         let (lock_path, lock_file) = acquire_state_dir_lock(&config.state_dir)?;
-        let local_key = load_or_create_identity_keypair(&config.state_dir.join(NODE_SEED_FILE))?;
+        let local_seed = load_or_create_identity_seed(&config.state_dir.join(NODE_SEED_FILE))?;
         Ok(Self {
-            inner: SubstrateNode::new(config.as_substrate(), local_key)?,
+            inner: SubstrateNode::from_seed_bytes(
+                config.as_substrate(),
+                config.state_dir.clone(),
+                local_seed,
+            )?,
             state_dir: config.state_dir,
             lock_path,
             lock_file,
@@ -173,36 +149,36 @@ impl ServiceNetworkNode {
 #[derive(Debug)]
 pub enum ServiceNetworkRuntimeEvent {
     NewListenAddr {
-        address: Multiaddr,
+        address: NetworkAddress,
     },
     ConnectionEstablished {
-        peer: PeerId,
+        peer: NetworkNodeId,
     },
     ProviderPublished {
-        peer: PeerId,
+        peer: NetworkNodeId,
         provider: ProviderRecord,
     },
     PublishedAgentRecordPublished {
-        peer: PeerId,
+        peer: NetworkNodeId,
         record: PublishedAgentRecord,
     },
     ProviderSyncRequest {
-        peer: PeerId,
+        peer: NetworkNodeId,
         limit: usize,
         channel: BackfillResponseChannel,
     },
     ProviderSyncResponse {
-        peer: PeerId,
+        peer: NetworkNodeId,
         request_id: BackfillRequestId,
         providers: Vec<ProviderRecord>,
     },
     PublishedAgentSyncRequest {
-        peer: PeerId,
+        peer: NetworkNodeId,
         limit: usize,
         channel: BackfillResponseChannel,
     },
     PublishedAgentSyncResponse {
-        peer: PeerId,
+        peer: NetworkNodeId,
         request_id: BackfillRequestId,
         records: Vec<PublishedAgentRecord>,
     },
@@ -233,11 +209,11 @@ impl ServiceNetworkRuntime {
         self.inner.observability_snapshot()
     }
 
-    pub fn local_peer_id(&self) -> PeerId {
+    pub fn local_peer_id(&self) -> NetworkNodeId {
         self.inner.local_peer_id()
     }
 
-    pub fn listen_addrs(&self) -> &[Multiaddr] {
+    pub fn listen_addrs(&self) -> &[NetworkAddress] {
         self.inner.listen_addrs()
     }
 
@@ -249,7 +225,11 @@ impl ServiceNetworkRuntime {
         &self,
         generated_at: u64,
     ) -> Result<TransportContactMaterial> {
-        export_local_contact_material(&self.state_dir, &self.local_peer_id(), generated_at)
+        export_local_contact_material_for_network_peer_id(
+            &self.state_dir,
+            self.local_peer_id().as_str(),
+            generated_at,
+        )
     }
 
     pub fn recommended_transfer_route(
@@ -265,7 +245,7 @@ impl ServiceNetworkRuntime {
         let message = ServiceNetworkMessage::ProviderPublished(envelope);
         self.inner.publish(
             &SwarmScope::Global,
-            TopicKind::Rules,
+            GossipKind::Rules,
             &message.encode_json()?,
         )
     }
@@ -275,18 +255,18 @@ impl ServiceNetworkRuntime {
         let message = ServiceNetworkMessage::PublishedAgentRecordPublished(envelope);
         self.inner.publish(
             &SwarmScope::Global,
-            TopicKind::Rules,
+            GossipKind::Rules,
             &message.encode_json()?,
         )
     }
 
-    pub fn allows_outbound_backfill_to(&self, peer: &PeerId) -> bool {
+    pub fn allows_outbound_backfill_to(&self, peer: &NetworkNodeId) -> bool {
         self.inner.allows_outbound_backfill_to(peer)
     }
 
     pub fn send_provider_sync_request(
         &mut self,
-        peer: &PeerId,
+        peer: &NetworkNodeId,
         limit: usize,
     ) -> Result<BackfillRequestId> {
         self.inner.send_backfill_request(
@@ -296,6 +276,7 @@ impl ServiceNetworkRuntime {
                 from_event_seq: 0,
                 limit,
                 feed_key: Some(PROVIDER_FEED_KEY.to_owned()),
+                known_event_ids: Vec::new(),
             },
         )
     }
@@ -318,6 +299,7 @@ impl ServiceNetworkRuntime {
                 scope: SwarmScope::Global,
                 next_from_event_seq: providers.len() as u64,
                 feed_key: Some(PROVIDER_FEED_KEY.to_owned()),
+                head_event_ids: Vec::new(),
                 items,
             },
         )
@@ -325,7 +307,7 @@ impl ServiceNetworkRuntime {
 
     pub fn send_published_agent_sync_request(
         &mut self,
-        peer: &PeerId,
+        peer: &NetworkNodeId,
         limit: usize,
     ) -> Result<BackfillRequestId> {
         self.inner.send_backfill_request(
@@ -335,6 +317,7 @@ impl ServiceNetworkRuntime {
                 from_event_seq: 0,
                 limit,
                 feed_key: Some(PUBLISHED_AGENT_FEED_KEY.to_owned()),
+                known_event_ids: Vec::new(),
             },
         )
     }
@@ -357,6 +340,7 @@ impl ServiceNetworkRuntime {
                 scope: SwarmScope::Global,
                 next_from_event_seq: records.len() as u64,
                 feed_key: Some(PUBLISHED_AGENT_FEED_KEY.to_owned()),
+                head_event_ids: Vec::new(),
                 items,
             },
         )
@@ -394,7 +378,7 @@ impl ServiceNetworkRuntime {
                 propagation_source,
                 message:
                     RawGossipMessage {
-                        kind: TopicKind::Rules,
+                        kind: GossipKind::Rules,
                         payload,
                         ..
                     },
@@ -509,7 +493,7 @@ impl ServiceNetworkRuntime {
 
     fn hydrate_remote_record<T>(
         &mut self,
-        remote_peer: &PeerId,
+        remote_peer: &NetworkNodeId,
         envelope: ServiceNetworkContentEnvelope,
     ) -> Result<T>
     where
@@ -517,9 +501,9 @@ impl ServiceNetworkRuntime {
     {
         let contact =
             self.resolve_remote_contact(remote_peer, envelope.transport_contact_material)?;
-        let bytes = fetch_direct_data(
+        let bytes = fetch_direct_data_for_network_peer_id(
             &self.state_dir,
-            &self.local_peer_id(),
+            self.local_peer_id().as_str(),
             &contact,
             &DirectDataFetchRequest {
                 object_kind: DirectDataObjectKind::ReferenceArtifact,
@@ -545,7 +529,7 @@ impl ServiceNetworkRuntime {
 
     fn resolve_remote_contact(
         &mut self,
-        remote_peer: &PeerId,
+        remote_peer: &NetworkNodeId,
         inline_contact: Option<TransportContactMaterial>,
     ) -> Result<TransportContactMaterial> {
         let remote_peer_id = remote_peer.to_string();
@@ -589,13 +573,15 @@ fn acquire_state_dir_lock(state_dir: &Path) -> Result<(PathBuf, File)> {
     Ok((lock_path, lock_file))
 }
 
-fn load_or_create_identity_keypair(seed_file: &Path) -> Result<libp2p_identity::Keypair> {
+fn load_or_create_identity_seed(seed_file: &Path) -> Result<[u8; 32]> {
     if seed_file.exists() {
-        let mut bytes = hex::decode(fs::read_to_string(seed_file)?.trim())?;
+        let bytes = hex::decode(fs::read_to_string(seed_file)?.trim())?;
         if bytes.len() != 32 {
             bail!("seed must be 32 bytes");
         }
-        return Ok(libp2p_identity::Keypair::ed25519_from_bytes(&mut bytes)?);
+        let mut seed = [0_u8; 32];
+        seed.copy_from_slice(&bytes);
+        return Ok(seed);
     }
 
     let seed: [u8; 32] = rand::random();
@@ -603,7 +589,7 @@ fn load_or_create_identity_keypair(seed_file: &Path) -> Result<libp2p_identity::
         fs::create_dir_all(parent)?;
     }
     fs::write(seed_file, hex::encode(seed))?;
-    Ok(libp2p_identity::Keypair::ed25519_from_bytes(seed.to_vec())?)
+    Ok(seed)
 }
 
 fn artifact_store_path(state_dir: &Path) -> PathBuf {
@@ -711,6 +697,11 @@ mod tests {
         dir
     }
 
+    fn random_network_node_id() -> NetworkNodeId {
+        NetworkNodeId::new(format!("test-node-{}", Uuid::new_v4().simple()))
+            .expect("valid test network node id")
+    }
+
     #[test]
     fn provider_message_round_trip() {
         let message = ServiceNetworkMessage::ProviderPublished(ServiceNetworkContentEnvelope {
@@ -752,11 +743,7 @@ mod tests {
     fn default_config_uses_servicenet_identity() {
         let config = ServiceNetworkP2pConfig::default();
         assert_eq!(config.namespace.network, "wattswarm-servicenet");
-        assert!(
-            config
-                .identify_agent_version
-                .starts_with(SERVICENET_IDENTIFY_AGENT_PREFIX)
-        );
+        assert_eq!(config.protocol_version, "/wattswarm-servicenet/0.1.0");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -785,7 +772,7 @@ mod tests {
             propagation_source: sender_runtime.local_peer_id(),
             message: RawGossipMessage {
                 scope: SwarmScope::Global,
-                kind: TopicKind::Rules,
+                kind: GossipKind::Rules,
                 payload: ServiceNetworkMessage::PublishedAgentRecordPublished(envelope)
                     .encode_json()
                     .expect("encode should work"),
@@ -818,10 +805,10 @@ mod tests {
         )
         .expect("runtime should start");
         let event = SubstrateRuntimeEvent::Gossip {
-            propagation_source: PeerId::random(),
+            propagation_source: random_network_node_id(),
             message: RawGossipMessage {
                 scope: SwarmScope::Global,
-                kind: TopicKind::Messages,
+                kind: GossipKind::Messages,
                 payload: b"ignored".to_vec(),
             },
         };
@@ -881,7 +868,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn transport_router_keeps_control_messages_on_libp2p() {
+    async fn transport_router_keeps_control_messages_on_iroh_control() {
         let runtime = ServiceNetworkRuntime::new(
             ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
                 state_dir: temp_state_dir("control-route"),
@@ -900,7 +887,7 @@ mod tests {
             },
         );
 
-        assert_eq!(route, TransportRoute::Libp2pControl);
+        assert_eq!(route, TransportRoute::IrohControl);
     }
 
     fn demo_published_agent() -> PublishedAgentRecord {

@@ -1,5 +1,8 @@
-use std::time::{Duration, Instant};
 use std::{env, fs, path::PathBuf};
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
 use tokio::time::sleep;
@@ -31,13 +34,24 @@ fn revoked_provider() -> ProviderRecord {
     }
 }
 
-fn test_config() -> ServiceNetworkP2pConfig {
-    ServiceNetworkP2pConfig {
+fn test_config(network_id: &str) -> ServiceNetworkP2pConfig {
+    let mut config = ServiceNetworkP2pConfig {
         state_dir: temp_state_dir("provider-sync"),
         listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-        enable_mdns: false,
         ..ServiceNetworkP2pConfig::default()
-    }
+    };
+    config.namespace.network_id = network_id.to_owned();
+    config
+}
+
+fn test_network_id(prefix: &str) -> String {
+    format!("{prefix}-{}", Uuid::new_v4().simple())
+}
+
+static P2P_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn p2p_test_lock() -> &'static tokio::sync::Mutex<()> {
+    P2P_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn temp_state_dir(prefix: &str) -> PathBuf {
@@ -48,8 +62,10 @@ fn temp_state_dir(prefix: &str) -> PathBuf {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_gossip_syncs_between_two_nodes() {
+    let _guard = p2p_test_lock().lock().await;
+    let network_id = test_network_id("provider-gossip");
     let mut runtime_a = ServiceNetworkRuntime::new(
-        ServiceNetworkNode::generate(test_config()).expect("node a should start"),
+        ServiceNetworkNode::generate(test_config(&network_id)).expect("node a should start"),
     )
     .expect("runtime a should start");
     runtime_a
@@ -61,8 +77,8 @@ async fn provider_gossip_syncs_between_two_nodes() {
         .expect("runtime a should listen");
     let peer_a = runtime_a.local_peer_id();
 
-    let mut config_b = test_config();
-    config_b.bootstrap_peers = vec![format!("{listen_addr}/p2p/{peer_a}")];
+    let mut config_b = test_config(&network_id);
+    config_b.bootstrap_peers = vec![format!("{peer_a}@{listen_addr}")];
     let mut runtime_b = ServiceNetworkRuntime::new(
         ServiceNetworkNode::generate(config_b).expect("node b should start"),
     )
@@ -88,8 +104,10 @@ async fn provider_gossip_syncs_between_two_nodes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_revocation_update_syncs_between_two_nodes() {
+    let _guard = p2p_test_lock().lock().await;
+    let network_id = test_network_id("provider-revocation");
     let mut runtime_a = ServiceNetworkRuntime::new(
-        ServiceNetworkNode::generate(test_config()).expect("node a should start"),
+        ServiceNetworkNode::generate(test_config(&network_id)).expect("node a should start"),
     )
     .expect("runtime a should start");
     runtime_a
@@ -101,8 +119,8 @@ async fn provider_revocation_update_syncs_between_two_nodes() {
         .expect("runtime a should listen");
     let peer_a = runtime_a.local_peer_id();
 
-    let mut config_b = test_config();
-    config_b.bootstrap_peers = vec![format!("{listen_addr}/p2p/{peer_a}")];
+    let mut config_b = test_config(&network_id);
+    config_b.bootstrap_peers = vec![format!("{peer_a}@{listen_addr}")];
     let mut runtime_b = ServiceNetworkRuntime::new(
         ServiceNetworkNode::generate(config_b).expect("node b should start"),
     )
@@ -138,7 +156,10 @@ async fn provider_revocation_update_syncs_between_two_nodes() {
 
 async fn wait_for_listen_addr(
     runtime: &mut ServiceNetworkRuntime,
-) -> anyhow::Result<watt_servicenet_p2p::Multiaddr> {
+) -> anyhow::Result<watt_servicenet_p2p::NetworkAddress> {
+    if let Some(address) = runtime.listen_addrs().first().cloned() {
+        return Ok(address);
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if Instant::now() >= deadline {

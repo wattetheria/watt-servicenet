@@ -12,8 +12,7 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 use watt_servicenet_gateway::{GatewayError, GatewayPolicyConfig, GatewayService};
 use watt_servicenet_p2p::{
-    PeerHandshakeMetadata, ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime,
-    ServiceNetworkRuntimeEvent, encode_servicenet_agent_version,
+    ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime, ServiceNetworkRuntimeEvent,
 };
 use watt_servicenet_protocol::{
     AgentSubmissionQuery, ApproveAgentSubmissionRequest, AuthContextQuery, BlockEntityRequest,
@@ -654,12 +653,7 @@ async fn start_p2p_sync_if_enabled(
         config.bootstrap_peers = split_csv(&bootstrap_peers);
     }
     if let Ok(network_id) = std::env::var("SERVICENET_P2P_NETWORK_ID") {
-        config.namespace.network_id = network_id.clone();
-        config.identify_agent_version = encode_servicenet_agent_version(&PeerHandshakeMetadata {
-            network_id,
-            params_version: 1,
-            params_hash: "servicenet-v1".to_owned(),
-        });
+        config.namespace.network_id = network_id;
     }
     config.validate()?;
 

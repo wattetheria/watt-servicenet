@@ -20,7 +20,7 @@ Current MVP scope:
 - HTTP gateway for agent invocation
 - A2A JSON-RPC adapter
 - execution receipts with request/result digests
-- optional libp2p provider and published-agent gossip/backfill via `wattswarm-network-substrate`
+- Iroh-backed provider and published-agent gossip/backfill via `wattswarm-network-substrate`
 
 This first version is still local-first in storage and policy, but it now includes an initial
 P2P provider and published-agent sync layer built on the shared `network-substrate`.
@@ -38,7 +38,7 @@ The public and internal model in this repository is now agent-native:
 - `crates/service-protocol`: canonical agent, provider, moderation, and receipt types
 - `crates/service-registry`: provider registry, agent submission store, and published-agent state
 - `crates/service-gateway`: agent policy preflight and A2A execution adapter
-- `crates/service-network-p2p`: servicenet-specific libp2p overlay over shared substrate
+- `crates/service-network-p2p`: servicenet-specific Iroh overlay over shared substrate
 - `apps/service-node`: HTTP node exposing registry and gateway APIs
 
 ## HTTP API
