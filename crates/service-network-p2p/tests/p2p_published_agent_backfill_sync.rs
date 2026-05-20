@@ -55,7 +55,7 @@ fn demo_published_agent() -> PublishedAgentRecord {
 fn test_config(network_id: &str) -> ServiceNetworkP2pConfig {
     let mut config = ServiceNetworkP2pConfig {
         state_dir: temp_state_dir("published-agent-backfill"),
-        listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+        listen_addrs: vec!["127.0.0.1:0".to_owned()],
         ..ServiceNetworkP2pConfig::default()
     };
     config.namespace.network_id = network_id.to_owned();

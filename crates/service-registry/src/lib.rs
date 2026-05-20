@@ -92,6 +92,30 @@ pub struct RegistryState {
     pub moderation_cases: HashMap<Uuid, ModerationCase>,
     pub agent_submissions: HashMap<Uuid, AgentSubmissionRecord>,
     pub published_agents: HashMap<String, PublishedAgentRecord>,
+    /// Attestation nonces that have been consumed by a successful submission,
+    /// keyed by `(attester_did, nonce)`. Used to reject replay of the same
+    /// signed submission. Entries can be evicted once
+    /// `expires_at_ms < now - ATTESTATION_MAX_CLOCK_SKEW_MS`; the registry
+    /// does that lazily inside `submit_agent`.
+    pub consumed_attestation_nonces: HashMap<String, ConsumedAttestationNonce>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ConsumedAttestationNonce {
+    pub attester_did: String,
+    pub nonce: String,
+    pub provider_id: String,
+    pub agent_id: String,
+    pub consumed_at_ms: u64,
+    /// Defaults to `consumed_at_ms + ATTESTATION_MAX_AGE_MS` when the
+    /// submitter did not supply an explicit expiry.
+    pub expires_at_ms: u64,
+}
+
+impl ConsumedAttestationNonce {
+    pub fn key(attester_did: &str, nonce: &str) -> String {
+        format!("{attester_did}|{nonce}")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -376,6 +400,17 @@ impl PostgresRegistryStore {
                     record_json JSONB NOT NULL
                 )"#
             ),
+            format!(
+                r#"CREATE TABLE IF NOT EXISTS "{schema}"."consumed_attestation_nonces" (
+                    key TEXT PRIMARY KEY,
+                    attester_did TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    provider_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    expires_at_ms BIGINT NOT NULL,
+                    record_json JSONB NOT NULL
+                )"#
+            ),
         ];
         for statement in statements {
             sqlx::query(&statement)
@@ -563,12 +598,28 @@ impl RegistryStore for PostgresRegistryStore {
                 .insert(record.agent_id.clone(), record);
         }
 
+        for row in sqlx::query(&format!(
+            r#"SELECT record_json FROM "{}"."consumed_attestation_nonces""#,
+            self.schema
+        ))
+        .fetch_all(&self.pool)
+        .await?
+        {
+            let record: ConsumedAttestationNonce =
+                serde_json::from_value(row.try_get("record_json")?)?;
+            state.consumed_attestation_nonces.insert(
+                ConsumedAttestationNonce::key(&record.attester_did, &record.nonce),
+                record,
+            );
+        }
+
         Ok(state)
     }
 
     async fn save_state(&self, state: &RegistryState) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for table in [
+            "consumed_attestation_nonces",
             "published_agents",
             "agent_submissions",
             "moderation_cases",
@@ -761,6 +812,22 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(&record.agent_id)
             .bind(&record.provider_id)
             .bind(format!("{:?}", record.status))
+            .bind(serde_json::to_value(record)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for record in state.consumed_attestation_nonces.values() {
+            sqlx::query(&format!(
+                r#"INSERT INTO "{}"."consumed_attestation_nonces" (key, attester_did, nonce, provider_id, agent_id, expires_at_ms, record_json) VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+                self.schema
+            ))
+            .bind(ConsumedAttestationNonce::key(&record.attester_did, &record.nonce))
+            .bind(&record.attester_did)
+            .bind(&record.nonce)
+            .bind(&record.provider_id)
+            .bind(&record.agent_id)
+            .bind(i64::try_from(record.expires_at_ms).unwrap_or(i64::MAX))
             .bind(serde_json::to_value(record)?)
             .execute(&mut *tx)
             .await?;
@@ -1667,6 +1734,8 @@ impl ServiceRegistry {
     ) -> Result<AgentSubmissionRecord, RegistryError> {
         let mut state = self.load_state().await?;
         validate_submit_agent_request(&request, &state)?;
+        evict_expired_attestation_nonces(&mut state);
+        check_attestation_nonce_not_replayed(&request, &state)?;
         if state
             .published_agents
             .get(&request.agent_id)
@@ -1676,13 +1745,28 @@ impl ServiceRegistry {
                 "agent_id is already owned by another provider".to_owned(),
             ));
         }
+        if smoke_test_enabled() {
+            smoke_test_agent_endpoint(&request.deployment.endpoint.url, &request.agent_card)
+                .await?;
+        }
+        record_attestation_nonce(&request, &mut state);
         let now = Utc::now();
+        let auto_approve = auto_approve_submissions_enabled();
+        let (status, reviewed_by, review_notes) = if auto_approve {
+            (
+                AgentSubmissionStatus::Approved,
+                Some(AUTO_APPROVE_REVIEWER.to_owned()),
+                Some(AUTO_APPROVE_NOTE.to_owned()),
+            )
+        } else {
+            (AgentSubmissionStatus::Submitted, None, None)
+        };
         let record = AgentSubmissionRecord {
             submission_id: Uuid::new_v4(),
             provider_id: request.provider_id,
             agent_id: request.agent_id,
             version: request.version,
-            status: AgentSubmissionStatus::Submitted,
+            status,
             agent_card: request.agent_card,
             deployment: request.deployment,
             review: request.review,
@@ -1690,10 +1774,46 @@ impl ServiceRegistry {
             attestations: request.attestations,
             submitted_at: now,
             updated_at: now,
-            reviewed_by: None,
-            review_notes: None,
+            reviewed_by,
+            review_notes,
             rejection_reason: None,
         };
+        if auto_approve {
+            validate_published_agent(
+                &record.provider_id,
+                &record.agent_id,
+                &record.agent_card,
+                &record.deployment,
+                &record.review,
+                &state,
+            )?;
+            let published = PublishedAgentRecord {
+                agent_id: record.agent_id.clone(),
+                provider_id: record.provider_id.clone(),
+                version: record.version.clone(),
+                status: PublishedAgentStatus::Approved,
+                agent_card: record.agent_card.clone(),
+                deployment: record.deployment.clone(),
+                review: record.review.clone(),
+                approved_at: now,
+                updated_at: now,
+                reviewed_by: AUTO_APPROVE_REVIEWER.to_owned(),
+                review_notes: Some(AUTO_APPROVE_NOTE.to_owned()),
+            };
+            state
+                .agent_health
+                .entry(published.agent_id.clone())
+                .or_insert_with(|| {
+                    default_agent_health(&published.agent_id, &published.provider_id)
+                });
+            state
+                .agent_trust
+                .entry(published.agent_id.clone())
+                .or_insert_with(|| default_agent_trust(&published.agent_id));
+            state
+                .published_agents
+                .insert(published.agent_id.clone(), published);
+        }
         state
             .agent_submissions
             .insert(record.submission_id, record.clone());
@@ -1764,9 +1884,12 @@ impl ServiceRegistry {
                 .ok_or(RegistryError::AgentSubmissionNotFound(submission_id))?;
             match submission.status {
                 AgentSubmissionStatus::Approved => {
-                    return Err(RegistryError::InvalidAgent(
-                        "agent submission is already approved".to_owned(),
-                    ));
+                    // Submission was already approved (e.g. by the auto-approve
+                    // path). Treat this admin call as idempotent and return the
+                    // existing published record instead of failing.
+                    if let Some(existing) = state.published_agents.get(&submission.agent_id) {
+                        return Ok(existing.clone());
+                    }
                 }
                 AgentSubmissionStatus::Rejected | AgentSubmissionStatus::Revoked => {
                     return Err(RegistryError::InvalidAgent(
@@ -2134,8 +2257,126 @@ fn validate_agent_attestations(
         )?;
     }
 
+    verify_attestation_freshness(&request.attestations)?;
+    if let Some(binding) = request.attestations.payment_account_binding.as_ref() {
+        verify_payment_binding_against_attester(binding, attester_did)?;
+    }
     verify_agent_attestation_signature(attester_did, request)?;
     Ok(())
+}
+
+const ATTESTATION_MAX_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
+const ATTESTATION_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn verify_attestation_freshness(
+    attestations: &watt_servicenet_protocol::AgentAttestations,
+) -> Result<(), RegistryError> {
+    let now_ms = Utc::now().timestamp_millis();
+    if let Some(issued_at_ms) = attestations.issued_at_ms {
+        let issued_at = issued_at_ms as i64;
+        if issued_at - now_ms > ATTESTATION_MAX_CLOCK_SKEW_MS {
+            return Err(RegistryError::InvalidAgent(
+                "attestations.issued_at_ms is too far in the future".to_owned(),
+            ));
+        }
+        if now_ms - issued_at > ATTESTATION_MAX_AGE_MS {
+            return Err(RegistryError::InvalidAgent(
+                "attestations.issued_at_ms is older than the maximum allowed age".to_owned(),
+            ));
+        }
+    }
+    if let Some(expires_at_ms) = attestations.expires_at_ms {
+        let expires_at = expires_at_ms as i64;
+        if expires_at + ATTESTATION_MAX_CLOCK_SKEW_MS < now_ms {
+            return Err(RegistryError::InvalidAgent(
+                "attestations.expires_at_ms has already passed".to_owned(),
+            ));
+        }
+        if let Some(issued_at_ms) = attestations.issued_at_ms
+            && expires_at_ms <= issued_at_ms
+        {
+            return Err(RegistryError::InvalidAgent(
+                "attestations.expires_at_ms must be greater than issued_at_ms".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_attestation_nonce_not_replayed(
+    request: &SubmitAgentRequest,
+    state: &RegistryState,
+) -> Result<(), RegistryError> {
+    let Some(nonce) = request.attestations.nonce.as_deref() else {
+        return Ok(());
+    };
+    let attester_did = request
+        .attestations
+        .provider_attester_did
+        .as_deref()
+        .unwrap_or(&request.provider_id);
+    let key = ConsumedAttestationNonce::key(attester_did, nonce);
+    if state.consumed_attestation_nonces.contains_key(&key) {
+        return Err(RegistryError::InvalidAgent(
+            "attestation nonce has already been used; refusing to replay".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn record_attestation_nonce(request: &SubmitAgentRequest, state: &mut RegistryState) {
+    let Some(nonce) = request.attestations.nonce.as_deref() else {
+        return;
+    };
+    let attester_did = request
+        .attestations
+        .provider_attester_did
+        .as_deref()
+        .unwrap_or(&request.provider_id);
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let expires_at_ms = request
+        .attestations
+        .expires_at_ms
+        .unwrap_or_else(|| now_ms.saturating_add(ATTESTATION_MAX_AGE_MS as u64));
+    let record = ConsumedAttestationNonce {
+        attester_did: attester_did.to_owned(),
+        nonce: nonce.to_owned(),
+        provider_id: request.provider_id.clone(),
+        agent_id: request.agent_id.clone(),
+        consumed_at_ms: now_ms,
+        expires_at_ms,
+    };
+    state
+        .consumed_attestation_nonces
+        .insert(ConsumedAttestationNonce::key(attester_did, nonce), record);
+}
+
+fn evict_expired_attestation_nonces(state: &mut RegistryState) {
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let skew = ATTESTATION_MAX_CLOCK_SKEW_MS as u64;
+    let cutoff = now_ms.saturating_sub(skew);
+    state
+        .consumed_attestation_nonces
+        .retain(|_, record| record.expires_at_ms >= cutoff);
+}
+
+fn verify_payment_binding_against_attester(
+    binding: &watt_did::PaymentAccountBindingProof,
+    attester_did: &str,
+) -> Result<(), RegistryError> {
+    let attester = Did::parse(attester_did).map_err(|error| {
+        RegistryError::InvalidAgent(format!("invalid provider_attester_did: {error}"))
+    })?;
+    if binding.agent_did != attester {
+        return Err(RegistryError::InvalidAgent(
+            "payment_account_binding.agent_did does not match the attestation signer".to_owned(),
+        ));
+    }
+    watt_wallet::verify_payment_account_binding_proof(binding).map_err(|error| {
+        RegistryError::InvalidAgent(format!(
+            "payment_account_binding verification failed: {error}"
+        ))
+    })
 }
 
 fn verify_provider_attestation_delegation(
@@ -2241,6 +2482,95 @@ fn extract_capabilities_from_token(
     let claims: DelegationClaims = serde_json::from_slice(&payload_json)
         .map_err(|_| RegistryError::InvalidAgent("invalid delegation_token payload".to_owned()))?;
     Ok(claims.capabilities)
+}
+
+const SMOKE_TEST_ENV: &str = "SERVICENET_SMOKE_TEST_ENDPOINT";
+const REQUIRE_ADMIN_APPROVE_ENV: &str = "SERVICENET_REQUIRE_ADMIN_APPROVE";
+const AUTO_APPROVE_REVIEWER: &str = "auto-approve";
+const AUTO_APPROVE_NOTE: &str =
+    "Auto-approved: signature, binding, and schema validated; no admin gating.";
+
+fn smoke_test_enabled() -> bool {
+    matches!(
+        std::env::var(SMOKE_TEST_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+/// Whether admin review is required before a submission becomes a
+/// published agent. Default is **off**: every submission whose signatures
+/// and binding-proof validate is auto-approved. Set
+/// `SERVICENET_REQUIRE_ADMIN_APPROVE=1` to fall back to the old behaviour
+/// (admin must POST to `/v1/admin/agent-submissions/{id}/approve`).
+fn auto_approve_submissions_enabled() -> bool {
+    !matches!(
+        std::env::var(REQUIRE_ADMIN_APPROVE_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+async fn smoke_test_agent_endpoint(
+    endpoint_url: &str,
+    submitted_card: &serde_json::Value,
+) -> Result<(), RegistryError> {
+    let well_known_url = format!(
+        "{}/.well-known/agent-card.json",
+        endpoint_url.trim_end_matches('/')
+    );
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| {
+            RegistryError::InvalidAgent(format!("smoke-test client build failed: {error}"))
+        })?
+        .get(&well_known_url)
+        .send()
+        .await
+        .map_err(|error| {
+            RegistryError::InvalidAgent(format!(
+                "smoke-test request to {well_known_url} failed: {error}"
+            ))
+        })?;
+    if !response.status().is_success() {
+        return Err(RegistryError::InvalidAgent(format!(
+            "smoke-test {well_known_url} returned status {}",
+            response.status()
+        )));
+    }
+    let body = response.text().await.map_err(|error| {
+        RegistryError::InvalidAgent(format!("smoke-test response read failed: {error}"))
+    })?;
+    let fetched_card: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+        RegistryError::InvalidAgent(format!(
+            "smoke-test {well_known_url} returned non-JSON body: {error}"
+        ))
+    })?;
+    let submitted_hash = canonical_card_hash(submitted_card)?;
+    let fetched_hash = canonical_card_hash(&fetched_card)?;
+    if submitted_hash != fetched_hash {
+        return Err(RegistryError::InvalidAgent(format!(
+            "smoke-test card hash mismatch: submitted={submitted_hash}, endpoint={fetched_hash}"
+        )));
+    }
+    Ok(())
+}
+
+fn canonical_card_hash(card: &serde_json::Value) -> Result<String, RegistryError> {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_jcs::to_vec(card).map_err(|error| {
+        RegistryError::InvalidAgent(format!("canonicalize agent card failed: {error}"))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(&canonical);
+    Ok(format!("sha256:{}", hex_encode(&hasher.finalize())))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn validate_submit_agent_request(
@@ -2833,6 +3163,10 @@ mod tests {
                 delegation_token: None,
                 source_commit: None,
                 build_digest: None,
+                payment_account_binding: None,
+                nonce: None,
+                issued_at_ms: None,
+                expires_at_ms: None,
             },
         };
         let provider_key = provider_signing_key();
@@ -2881,6 +3215,82 @@ mod tests {
             .await
             .expect("agent should approve");
         assert_eq!(record.agent_id, "stripe-agent");
+    }
+
+    #[tokio::test]
+    async fn submit_agent_auto_approves_into_published_agents_by_default() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let submission = registry
+            .submit_agent(demo_agent_submission("alice-helper"))
+            .await
+            .expect("submission should auto-approve");
+
+        assert_eq!(submission.status, AgentSubmissionStatus::Approved);
+        assert_eq!(submission.reviewed_by.as_deref(), Some("auto-approve"));
+
+        let published = registry
+            .get_published_agent("alice-helper")
+            .await
+            .expect("published agent should exist");
+        assert_eq!(published.status, PublishedAgentStatus::Approved);
+        assert_eq!(published.reviewed_by, "auto-approve");
+    }
+
+    #[tokio::test]
+    async fn submit_agent_rejects_replayed_attestation_nonce() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+
+        let mut first = demo_agent_submission("nonce-replay-agent");
+        first.attestations.nonce = Some("nonce-fixed-value".to_owned());
+        let provider_key = provider_signing_key();
+        sign_submission_attestation(&mut first, &provider_key, None, None);
+        registry
+            .submit_agent(first.clone())
+            .await
+            .expect("first submission should succeed");
+
+        // Replay the exact same signed request — same nonce, same attester DID.
+        let err = registry
+            .submit_agent(first)
+            .await
+            .expect_err("replayed submission must be rejected");
+        assert!(
+            matches!(&err, RegistryError::InvalidAgent(message) if message.contains("nonce")),
+            "expected nonce-replay InvalidAgent error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_approve_is_idempotent_after_auto_approve() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let submission = registry
+            .submit_agent(demo_agent_submission("bob-helper"))
+            .await
+            .expect("submission should auto-approve");
+
+        let record = registry
+            .approve_agent_submission(
+                submission.submission_id,
+                ApproveAgentSubmissionRequest {
+                    reviewed_by: "moderator-a".to_owned(),
+                    review_notes: Some("manual re-approve".to_owned()),
+                },
+            )
+            .await
+            .expect("admin approve after auto-approve is a no-op success");
+        assert_eq!(record.agent_id, "bob-helper");
     }
 
     #[tokio::test]

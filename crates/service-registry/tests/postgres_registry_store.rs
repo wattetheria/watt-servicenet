@@ -93,6 +93,10 @@ fn agent_submission() -> SubmitAgentRequest {
             delegation_token: None,
             source_commit: Some("abc123".to_owned()),
             build_digest: Some("sha256:demo".to_owned()),
+            payment_account_binding: None,
+            nonce: None,
+            issued_at_ms: None,
+            expires_at_ms: None,
         },
     };
     let provider_key = provider_signing_key();

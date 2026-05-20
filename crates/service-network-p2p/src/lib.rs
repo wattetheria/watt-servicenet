@@ -697,9 +697,19 @@ mod tests {
         dir
     }
 
+    /// Produce a NetworkNodeId for tests by deriving a real iroh endpoint id
+    /// from a deterministic seed. Plain strings no longer parse: substrate
+    /// requires a valid base32 iroh endpoint id (see `parse_iroh_endpoint_id_string`).
     fn random_network_node_id() -> NetworkNodeId {
-        NetworkNodeId::new(format!("test-node-{}", Uuid::new_v4().simple()))
-            .expect("valid test network node id")
+        let runtime = ServiceNetworkRuntime::new(
+            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
+                state_dir: temp_state_dir("random-node-id"),
+                ..ServiceNetworkP2pConfig::default()
+            })
+            .expect("node should start"),
+        )
+        .expect("runtime should start");
+        runtime.local_peer_id()
     }
 
     #[test]

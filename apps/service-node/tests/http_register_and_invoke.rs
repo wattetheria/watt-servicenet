@@ -398,7 +398,9 @@ async fn agent_submission_can_be_approved_and_published() {
     let submission_id = submit_json["submission_id"]
         .as_str()
         .expect("submission id should exist");
-    assert_eq!(submit_json["status"], "submitted");
+    // Submissions are auto-approved by default; the admin approve POST below
+    // is now idempotent but kept here to exercise the legacy flow.
+    assert_eq!(submit_json["status"], "approved");
 
     let approve = app
         .clone()

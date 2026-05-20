@@ -695,6 +695,10 @@ mod tests {
                 delegation_token: None,
                 source_commit: None,
                 build_digest: None,
+                payment_account_binding: None,
+                nonce: None,
+                issued_at_ms: None,
+                expires_at_ms: None,
             },
         };
         let provider_key = provider_signing_key();
@@ -1035,19 +1039,22 @@ mod tests {
     #[test]
     fn google_a2a_adapter_builds_existing_send_message_shape() {
         let adapter = GoogleA2aAdapter;
-        let payload = adapter.build_send_message_payload(&InvokeAgentRequest {
-            task_id: Some("task-1".to_owned()),
-            context_id: Some("ctx-1".to_owned()),
-            message: Some("Create payment link".to_owned()),
-            input: serde_json::json!({"amount": 42}),
-            skill_id: Some("payments.create_link".to_owned()),
-            settlement: None,
-            auth_token: None,
-            auth_context_id: None,
-            region: None,
-            confirm_risky: false,
-            max_cost_units: None,
-        }, None);
+        let payload = adapter.build_send_message_payload(
+            &InvokeAgentRequest {
+                task_id: Some("task-1".to_owned()),
+                context_id: Some("ctx-1".to_owned()),
+                message: Some("Create payment link".to_owned()),
+                input: serde_json::json!({"amount": 42}),
+                skill_id: Some("payments.create_link".to_owned()),
+                settlement: None,
+                auth_token: None,
+                auth_context_id: None,
+                region: None,
+                confirm_risky: false,
+                max_cost_units: None,
+            },
+            None,
+        );
         assert_eq!(adapter.send_message_method(), "SendMessage");
         assert_eq!(adapter.get_task_method(), "GetTask");
         assert_eq!(adapter.version_header_name(), "A2A-Version");

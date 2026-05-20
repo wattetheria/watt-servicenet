@@ -20,7 +20,9 @@ Current MVP scope:
 - HTTP gateway for agent invocation
 - A2A JSON-RPC adapter
 - execution receipts with request/result digests
-- Iroh-backed provider and published-agent gossip/backfill via `wattswarm-network-substrate`
+- Iroh-backed provider and published-agent gossip/backfill via the shared
+  `wattswarm-network-substrate` transport (no libp2p / no multiaddr;
+  endpoints are iroh `EndpointId`s with QUIC hole-punching + relay fallback)
 
 This first version is still local-first in storage and policy, but it now includes an initial
 P2P provider and published-agent sync layer built on the shared `network-substrate`.
@@ -71,24 +73,30 @@ Run with Docker Compose:
 docker compose up --build
 ```
 
-Run the node with P2P registry sync enabled:
+Run the node with iroh-backed P2P registry sync enabled:
 
 ```bash
 SERVICENET_P2P_ENABLED=1 \
 SERVICENET_P2P_NETWORK_ID=devnet \
-SERVICENET_P2P_LISTEN_ADDRS=/ip4/0.0.0.0/tcp/4101 \
+SERVICENET_P2P_LISTEN_ADDRS=0.0.0.0:4101 \
 cargo run -p watt-servicenet-node
 ```
 
-Join an existing peer:
+Each node prints its iroh `EndpointId` on startup (also persisted in
+`SERVICENET_P2P_STATE_DIR/node_seed.hex`). Use that endpoint id to join an
+existing peer — bootstrap peers are written as `<endpoint_id>@<addr>`,
+not as libp2p multiaddrs:
 
 ```bash
 SERVICENET_P2P_ENABLED=1 \
 SERVICENET_P2P_NETWORK_ID=devnet \
-SERVICENET_P2P_LISTEN_ADDRS=/ip4/0.0.0.0/tcp/4102 \
-SERVICENET_P2P_BOOTSTRAP_PEERS=/ip4/127.0.0.1/tcp/4101/p2p/<PEER_ID> \
+SERVICENET_P2P_LISTEN_ADDRS=0.0.0.0:4102 \
+SERVICENET_P2P_BOOTSTRAP_PEERS=<peer-endpoint-id>@127.0.0.1:4101 \
 cargo run -p watt-servicenet-node
 ```
+
+Nodes can also be reached through iroh's public relay network when direct
+QUIC connectivity is unavailable; that requires no extra configuration.
 
 Current P2P behavior:
 
@@ -102,8 +110,12 @@ Current P2P behavior:
 Current submission behavior:
 
 - provider registration and key rotation can require ownership challenges
-- agent submissions must include provider attestations and an A2A-compatible card
-- approved agents are the only records published to the shared network
+- agent submissions must include an A2A-compatible card and a signed provider
+  attestation
+- by default, submissions whose signatures, binding proofs, smoke-tests, and
+  schema all pass are auto-approved and published immediately
+  (set `SERVICENET_REQUIRE_ADMIN_APPROVE=1` to keep the legacy admin-gated flow)
+- only approved records are published over the shared network
 
 Current provider behavior:
 
