@@ -19,8 +19,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      additional_contexts:
-        wattswarm_root: ../wattswarm
+      args:
+        WATTSWARM_REPO: ${WATTSWARM_REPO:-https://github.com/wattetheria/wattswarm.git}
+        WATTSWARM_REF: ${WATTSWARM_REF:-main}
+        WATT_DID_REPO: ${WATT_DID_REPO:-https://github.com/wattetheria/watt-did.git}
+        WATT_DID_REF: ${WATT_DID_REF:-main}
+        WATT_WALLET_REPO: ${WATT_WALLET_REPO:-https://github.com/wattetheria/watt-wallet.git}
+        WATT_WALLET_REF: ${WATT_WALLET_REF:-main}
+      secrets:
+        - github_token
     depends_on:
       postgres:
         condition: service_healthy
@@ -35,3 +42,7 @@ services:
       - "8042:8042"
     volumes:
       - ./.data:/data
+
+secrets:
+  github_token:
+    environment: GITHUB_TOKEN
