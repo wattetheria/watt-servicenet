@@ -24,11 +24,20 @@ use watt_servicenet_protocol::{
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry, ServiceRegistryConfig};
 
+const DEFAULT_AGENT_LIST_LIMIT: usize = 50;
+const MAX_AGENT_LIST_LIMIT: usize = 100;
+
 #[derive(Clone)]
 struct AppState {
     registry: Arc<ServiceRegistry>,
     gateway: GatewayService,
     p2p_commands: Option<mpsc::Sender<P2pCommand>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AgentListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 pub async fn build_default_app() -> anyhow::Result<Router> {
@@ -280,13 +289,31 @@ async fn revoke_provider(
     Ok(Json(serde_json::json!(provider)))
 }
 
-async fn list_agents(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
-    let items = state
+async fn list_agents(
+    State(state): State<AppState>,
+    Query(query): Query<AgentListQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_AGENT_LIST_LIMIT)
+        .clamp(1, MAX_AGENT_LIST_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let (items, known_count) = state
         .registry
-        .list_published_agents()
+        .list_published_agents_page(limit, offset)
         .await
         .map_err(AppError::from)?;
-    Ok(Json(serde_json::json!({ "items": items })))
+    let next_offset = offset.saturating_add(items.len());
+    let has_more = next_offset < known_count;
+    Ok(Json(serde_json::json!({
+        "items": items,
+        "count": items.len(),
+        "limit": limit,
+        "offset": offset,
+        "next_offset": if has_more { Some(next_offset) } else { None },
+        "has_more": has_more,
+        "known_count": known_count,
+    })))
 }
 
 async fn get_agent(

@@ -128,6 +128,23 @@ pub struct EncryptedSecretEnvelope {
 pub trait RegistryStore: Send + Sync {
     async fn load_state(&self) -> Result<RegistryState>;
     async fn save_state(&self, state: &RegistryState) -> Result<()>;
+
+    async fn list_published_agents_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PublishedAgentRecord>, usize)> {
+        let mut items = self
+            .load_state()
+            .await?
+            .published_agents
+            .into_values()
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        let known_count = items.len();
+        let page = items.into_iter().skip(offset).take(limit).collect();
+        Ok((page, known_count))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -614,6 +631,32 @@ impl RegistryStore for PostgresRegistryStore {
         }
 
         Ok(state)
+    }
+
+    async fn list_published_agents_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PublishedAgentRecord>, usize)> {
+        let known_count = sqlx::query_scalar::<_, i64>(&format!(
+            r#"SELECT COUNT(*) FROM "{}"."published_agents""#,
+            self.schema
+        ))
+        .fetch_one(&self.pool)
+        .await?;
+        let rows = sqlx::query(&format!(
+            r#"SELECT record_json FROM "{}"."published_agents" ORDER BY agent_id ASC LIMIT $1 OFFSET $2"#,
+            self.schema
+        ))
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .bind(i64::try_from(offset).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(serde_json::from_value(row.try_get("record_json")?)?);
+        }
+        Ok((items, usize::try_from(known_count).unwrap_or(usize::MAX)))
     }
 
     async fn save_state(&self, state: &RegistryState) -> Result<()> {
@@ -1994,6 +2037,17 @@ impl ServiceRegistry {
             .collect::<Vec<_>>();
         items.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
         Ok(items)
+    }
+
+    pub async fn list_published_agents_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PublishedAgentRecord>, usize), RegistryError> {
+        self.store
+            .list_published_agents_page(limit, offset)
+            .await
+            .map_err(|error| RegistryError::Storage(format!("{error:#}")))
     }
 
     pub async fn get_published_agent(

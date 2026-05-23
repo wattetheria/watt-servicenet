@@ -36,10 +36,14 @@ fn provider_payload() -> serde_json::Value {
     })
 }
 
-fn valid_agent_submission_payload(url_base: &str, endpoint_url: &str) -> serde_json::Value {
+fn valid_agent_submission_payload_for_agent(
+    agent_id: &str,
+    url_base: &str,
+    endpoint_url: &str,
+) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "provider_id": "provider-local",
-        "agent_id": "stripe-agent",
+        "agent_id": agent_id,
         "version": "0.1.0",
         "agent_card": {
             "name": "Stripe Agent",
@@ -100,6 +104,10 @@ fn valid_agent_submission_payload(url_base: &str, endpoint_url: &str) -> serde_j
     );
     payload["attestations"]["attestation_signature"] = serde_json::Value::String(signature);
     payload
+}
+
+fn valid_agent_submission_payload(url_base: &str, endpoint_url: &str) -> serde_json::Value {
+    valid_agent_submission_payload_for_agent("stripe-agent", url_base, endpoint_url)
 }
 
 async fn response_json(response: axum::response::Response) -> serde_json::Value {
@@ -453,6 +461,68 @@ async fn agent_submission_can_be_approved_and_published() {
     assert_eq!(submission.status(), StatusCode::OK);
     let submission_json = response_json(submission).await;
     assert_eq!(submission_json["status"], "approved");
+}
+
+#[tokio::test]
+async fn agents_list_supports_limit_offset_pagination() {
+    let app = build_local_app(Arc::new(ServiceRegistry::in_memory()));
+
+    let register_provider = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/providers/register")
+                .header("content-type", "application/json")
+                .body(Body::from(provider_payload().to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("provider register should succeed");
+    assert_eq!(register_provider.status(), StatusCode::CREATED);
+
+    for agent_id in ["agent-a", "agent-b", "agent-c"] {
+        let submit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/agent-submissions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        valid_agent_submission_payload_for_agent(
+                            agent_id,
+                            &format!("https://{agent_id}.example.com"),
+                            &format!("https://{agent_id}.example.com/a2a"),
+                        )
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("submission should succeed");
+        assert_eq!(submit.status(), StatusCode::CREATED);
+    }
+
+    let agents = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/agents?limit=2&offset=1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("agent list should succeed");
+    assert_eq!(agents.status(), StatusCode::OK);
+    let agents_json = response_json(agents).await;
+    assert_eq!(agents_json["count"], 2);
+    assert_eq!(agents_json["limit"], 2);
+    assert_eq!(agents_json["offset"], 1);
+    assert_eq!(agents_json["next_offset"], serde_json::Value::Null);
+    assert_eq!(agents_json["has_more"], false);
+    assert_eq!(agents_json["known_count"], 3);
+    assert_eq!(agents_json["items"][0]["agent_id"], "agent-b");
+    assert_eq!(agents_json["items"][1]["agent_id"], "agent-c");
 }
 
 #[tokio::test]

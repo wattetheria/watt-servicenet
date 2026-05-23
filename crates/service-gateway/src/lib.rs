@@ -231,6 +231,7 @@ impl GatewayService {
             .await?;
         let completed_at = Utc::now();
 
+        let agent_cost_units = agent_cost_units(&record.agent_card);
         let receipt = StoredReceipt {
             receipt: ExecutionReceipt {
                 receipt_id: Uuid::new_v4(),
@@ -256,8 +257,8 @@ impl GatewayService {
                 completed_at,
                 cost_units: request
                     .max_cost_units
-                    .and(record.review.cost_per_call_units)
-                    .or(record.review.cost_per_call_units),
+                    .and(agent_cost_units)
+                    .or(agent_cost_units),
             },
             output: extract_task_output(&response),
             stderr: None,
@@ -375,10 +376,7 @@ impl GatewayService {
         if let Some(max_cost_units) = request
             .max_cost_units
             .or(self.policy.default_max_cost_units)
-            && record
-                .review
-                .cost_per_call_units
-                .is_some_and(|cost| cost > max_cost_units)
+            && agent_cost_units(&record.agent_card).is_some_and(|cost| cost > max_cost_units)
         {
             return Err(GatewayError::Rejected(
                 "agent cost exceeds caller budget".to_owned(),
@@ -491,6 +489,13 @@ fn agent_requires_auth(agent_card: &Value) -> bool {
         Value::Null => false,
         _ => true,
     }
+}
+
+fn agent_cost_units(agent_card: &Value) -> Option<u32> {
+    agent_card
+        .get("cost")
+        .and_then(Value::as_u64)
+        .and_then(|cost| u32::try_from(cost).ok())
 }
 
 fn normalize_settlement_request(
@@ -667,6 +672,7 @@ mod tests {
                 "url": url_base,
                 "preferredTransport": "JSONRPC",
                 "protocolVersion": "1.0",
+                "cost": 5,
                 "skills": [{"id": "payments.create_link"}],
                 "securitySchemes": {"oauth2": {"type": "oauth2"}},
                 "security": [{"oauth2": ["payments:write"]}]
@@ -686,7 +692,7 @@ mod tests {
                 destructive_actions: vec!["payments.refund".to_owned()],
                 human_approval_required: true,
                 allowed_regions: vec!["AU".to_owned()],
-                cost_per_call_units: Some(5),
+                cost_per_call_units: None,
             },
             artifacts: AgentArtifacts::default(),
             attestations: AgentAttestations {
