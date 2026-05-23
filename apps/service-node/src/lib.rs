@@ -15,12 +15,12 @@ use watt_servicenet_p2p::{
     ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime, ServiceNetworkRuntimeEvent,
 };
 use watt_servicenet_protocol::{
-    AgentSubmissionQuery, ApproveAgentSubmissionRequest, AuthContextQuery, BlockEntityRequest,
-    CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest, GetAgentTaskRequest,
-    InvokeAgentRequest, ModerationCaseQuery, ReceiptQuery, RegisterAuthContextRequest,
-    RegisterProviderRequest, RejectAgentSubmissionRequest, ResolveModerationCaseRequest,
-    RevokeProviderRequest, RotateProviderKeyRequest, RunVerifierSweepRequest, SubmitAgentRequest,
-    VerifyReceiptRequest,
+    AgentSubmissionQuery, AgentSubmissionStatus, ApproveAgentSubmissionRequest, AuthContextQuery,
+    BlockEntityRequest, CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest,
+    GetAgentTaskRequest, InvokeAgentRequest, ModerationCaseQuery, PublishedAgentRecord,
+    ReceiptQuery, RegisterAuthContextRequest, RegisterProviderRequest,
+    RejectAgentSubmissionRequest, ResolveModerationCaseRequest, RevokeProviderRequest,
+    RotateProviderKeyRequest, RunVerifierSweepRequest, SubmitAgentRequest, VerifyReceiptRequest,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry, ServiceRegistryConfig};
 
@@ -310,6 +310,7 @@ async fn submit_agent(
         .submit_agent(request)
         .await
         .map_err(AppError::from)?;
+    publish_auto_approved_agent(&state, &record.agent_id, &record.status).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(record))))
 }
 
@@ -347,9 +348,7 @@ async fn approve_agent_submission(
         .approve_agent_submission(submission_id, request)
         .await
         .map_err(AppError::from)?;
-    if let Some(sender) = &state.p2p_commands {
-        let _ = sender.try_send(P2pCommand::PublishAgent(Box::new(item.clone())));
-    }
+    queue_published_agent(&state.p2p_commands, item.clone());
     Ok(Json(serde_json::json!(item)))
 }
 
@@ -631,6 +630,32 @@ enum P2pCommand {
     PublishAgent(Box<watt_servicenet_protocol::PublishedAgentRecord>),
 }
 
+async fn publish_auto_approved_agent(
+    state: &AppState,
+    agent_id: &str,
+    status: &AgentSubmissionStatus,
+) -> Result<(), AppError> {
+    if status != &AgentSubmissionStatus::Approved || state.p2p_commands.is_none() {
+        return Ok(());
+    }
+    let record = state
+        .registry
+        .get_published_agent(agent_id)
+        .await
+        .map_err(AppError::from)?;
+    queue_published_agent(&state.p2p_commands, record);
+    Ok(())
+}
+
+fn queue_published_agent(
+    p2p_commands: &Option<mpsc::Sender<P2pCommand>>,
+    record: PublishedAgentRecord,
+) {
+    if let Some(sender) = p2p_commands {
+        let _ = sender.try_send(P2pCommand::PublishAgent(Box::new(record)));
+    }
+}
+
 async fn start_p2p_sync_if_enabled(
     registry: Arc<ServiceRegistry>,
 ) -> anyhow::Result<Option<mpsc::Sender<P2pCommand>>> {
@@ -871,7 +896,15 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_env_flag, split_csv};
+    use super::{AppState, P2pCommand, parse_env_flag, publish_auto_approved_agent, split_csv};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use watt_servicenet_gateway::{GatewayPolicyConfig, GatewayService};
+    use watt_servicenet_protocol::{
+        AgentSubmissionStatus, PublishedAgentRecord, RegisterProviderRequest,
+    };
+    use watt_servicenet_registry::ServiceRegistry;
 
     #[test]
     fn split_csv_discards_empty_entries() {
@@ -887,5 +920,92 @@ mod tests {
         assert!(parse_env_flag(Some("YES")));
         assert!(!parse_env_flag(Some("0")));
         assert!(!parse_env_flag(None));
+    }
+
+    #[tokio::test]
+    async fn auto_approved_submission_queues_published_agent_for_p2p() {
+        let registry = Arc::new(ServiceRegistry::in_memory());
+        registry
+            .register_provider(RegisterProviderRequest {
+                provider_id: "provider-local".to_owned(),
+                provider_did: "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp".to_owned(),
+                display_name: Some("Provider Local".to_owned()),
+                ownership_challenge_id: None,
+                ownership_signature: None,
+            })
+            .await
+            .expect("provider should register");
+        let published: PublishedAgentRecord = serde_json::from_value(serde_json::json!({
+            "agent_id": "agent-auto-approved",
+            "provider_id": "provider-local",
+            "version": "0.1.0",
+            "status": "approved",
+            "agent_card": {
+                "name": "Auto Approved Agent",
+                "description": "Test agent",
+                "url": "https://agent.example.com",
+                "preferredTransport": "JSONRPC",
+                "protocolVersion": "1.0",
+                "skills": [{ "id": "demo.run", "name": "Run Demo" }],
+                "securitySchemes": { "none": { "type": "none" } },
+                "security": [{ "none": [] }]
+            },
+            "deployment": {
+                "runtime": "remote_http",
+                "endpoint": {
+                    "url": "https://agent.example.com/a2a",
+                    "protocol_binding": "JSONRPC",
+                    "protocol_version": "1.0",
+                    "interaction_protocol": "google_a2a"
+                }
+            },
+            "review": {
+                "risk_level": "low",
+                "data_classes": [],
+                "destructive_actions": [],
+                "human_approval_required": false,
+                "allowed_regions": []
+            },
+            "approved_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "reviewed_by": "auto-approve",
+            "review_notes": "auto-approved for test"
+        }))
+        .expect("published agent fixture should parse");
+        registry
+            .upsert_published_agent(published)
+            .await
+            .expect("published agent should persist");
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AppState {
+            registry,
+            gateway: GatewayService::with_policy(
+                Arc::new(ServiceRegistry::in_memory()),
+                GatewayPolicyConfig::default(),
+            ),
+            p2p_commands: Some(tx),
+        };
+
+        assert!(
+            publish_auto_approved_agent(
+                &state,
+                "agent-auto-approved",
+                &AgentSubmissionStatus::Approved,
+            )
+            .await
+            .is_ok()
+        );
+
+        let command = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("p2p command should be queued")
+            .expect("p2p channel should contain command");
+        match command {
+            P2pCommand::PublishAgent(record) => {
+                assert_eq!(record.agent_id, "agent-auto-approved");
+                assert_eq!(record.provider_id, "provider-local");
+            }
+            P2pCommand::PublishProvider(_) => panic!("expected published agent command"),
+        }
     }
 }
