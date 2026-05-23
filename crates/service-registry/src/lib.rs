@@ -920,23 +920,30 @@ impl ServiceRegistry {
         &self,
         request: CreateProviderOwnershipChallengeRequest,
     ) -> Result<ProviderOwnershipChallenge, RegistryError> {
-        if request.provider_id.trim().is_empty() {
-            return Err(RegistryError::InvalidOwnershipChallenge(
-                "provider_id must not be empty".to_owned(),
-            ));
-        }
         if request.provider_did.trim().is_empty() {
             return Err(RegistryError::InvalidOwnershipChallenge(
                 "provider_did must not be empty".to_owned(),
             ));
         }
         validate_provider_did(&request.provider_did)?;
+        let mut state = self.load_state().await?;
+        let provider_id = match request.provider_id {
+            Some(provider_id) => {
+                if provider_id.trim().is_empty() {
+                    return Err(RegistryError::InvalidOwnershipChallenge(
+                        "provider_id must not be empty".to_owned(),
+                    ));
+                }
+                provider_id
+            }
+            None => generate_unique_provider_id(&state),
+        };
         let mut nonce = [0u8; 32];
         OsRng.fill_bytes(&mut nonce);
         let now = Utc::now();
         let challenge = ProviderOwnershipChallenge {
             challenge_id: Uuid::new_v4(),
-            provider_id: request.provider_id,
+            provider_id,
             provider_did: request.provider_did,
             operation: request.operation,
             challenge: STANDARD.encode(nonce),
@@ -944,7 +951,6 @@ impl ServiceRegistry {
             expires_at: now + chrono::Duration::seconds(self.provider_challenge_ttl_secs),
             completed_at: None,
         };
-        let mut state = self.load_state().await?;
         state
             .provider_ownership_challenges
             .insert(challenge.challenge_id, challenge.clone());
@@ -2177,6 +2183,19 @@ impl ServiceRegistry {
     }
 }
 
+fn generate_unique_provider_id(state: &RegistryState) -> String {
+    loop {
+        let candidate = format!("prv_{}", Uuid::new_v4().simple());
+        let pending = state
+            .provider_ownership_challenges
+            .values()
+            .any(|challenge| challenge.provider_id == candidate);
+        if !state.providers.contains_key(&candidate) && !pending {
+            return candidate;
+        }
+    }
+}
+
 fn validate_provider_record(provider: &ProviderRecord) -> Result<(), RegistryError> {
     if provider.schema_version != SERVICE_PROTOCOL_SCHEMA_VERSION {
         return Err(RegistryError::UnsupportedSchemaVersion {
@@ -3391,7 +3410,7 @@ mod tests {
         });
         let challenge = registry
             .create_provider_ownership_challenge(CreateProviderOwnershipChallengeRequest {
-                provider_id: "provider-challenge".to_owned(),
+                provider_id: Some("provider-challenge".to_owned()),
                 provider_did: format!(
                     "did:key:z{}",
                     bs58::encode(
@@ -3424,6 +3443,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_ownership_challenge_generates_provider_id_when_missing() {
+        let signing_key = SigningKey::from_bytes(&[33u8; 32]);
+        let provider_did = format!(
+            "did:key:z{}",
+            bs58::encode(
+                [
+                    &[0xed, 0x01][..],
+                    &signing_key.verifying_key().to_bytes()[..]
+                ]
+                .concat()
+            )
+            .into_string()
+        );
+        let registry = ServiceRegistry::in_memory_with_config(ServiceRegistryConfig {
+            require_provider_ownership_challenges: true,
+            ..Default::default()
+        });
+        let challenge = registry
+            .create_provider_ownership_challenge(CreateProviderOwnershipChallengeRequest {
+                provider_id: None,
+                provider_did: provider_did.clone(),
+                operation: ProviderOwnershipOperation::Register,
+            })
+            .await
+            .expect("challenge should issue");
+        assert!(challenge.provider_id.starts_with("prv_"));
+
+        let signature =
+            STANDARD.encode(signing_key.sign(challenge.challenge.as_bytes()).to_bytes());
+        let provider = registry
+            .register_provider(RegisterProviderRequest {
+                provider_id: challenge.provider_id.clone(),
+                provider_did,
+                display_name: Some("Generated Provider".to_owned()),
+                ownership_challenge_id: Some(challenge.challenge_id),
+                ownership_signature: Some(signature),
+            })
+            .await
+            .expect("provider should register");
+        assert_eq!(provider.provider_id, challenge.provider_id);
+    }
+
+    #[tokio::test]
     async fn provider_ownership_challenge_accepts_did_key_reference() {
         let signing_key = SigningKey::from_bytes(&[32u8; 32]);
         let public_key_bytes = signing_key.verifying_key().to_bytes();
@@ -3437,7 +3499,7 @@ mod tests {
         });
         let challenge = registry
             .create_provider_ownership_challenge(CreateProviderOwnershipChallengeRequest {
-                provider_id: "provider-did".to_owned(),
+                provider_id: Some("provider-did".to_owned()),
                 provider_did: provider_did.clone(),
                 operation: ProviderOwnershipOperation::Register,
             })

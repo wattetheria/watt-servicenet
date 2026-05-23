@@ -160,8 +160,7 @@ Register a provider:
 curl -X POST http://127.0.0.1:8042/v1/providers/ownership-challenges \
   -H 'content-type: application/json' \
   -d '{
-    "provider_id": "provider-local",
-    "public_key": "cHJvdmlkZXItbG9jYWwtZGV2a2V5",
+    "provider_did": "did:key:z6MkhaXgBZDvotD1X9gRrYkM5Xq9jYQqK6d8r8bQdE1mV2Xa",
     "operation": "register"
   }'
 ```
@@ -172,7 +171,7 @@ Register a provider after signing the challenge:
 curl -X POST http://127.0.0.1:8042/v1/providers/register \
   -H 'content-type: application/json' \
   -d '{
-    "provider_id": "provider-local",
+    "provider_id": "<PROVIDER_ID_FROM_CHALLENGE>",
     "provider_did": "did:key:z6MkhaXgBZDvotD1X9gRrYkM5Xq9jYQqK6d8r8bQdE1mV2Xa",
     "display_name": "Provider Local",
     "ownership_challenge_id": "<CHALLENGE_ID>",

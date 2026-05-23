@@ -193,7 +193,8 @@ pub struct ProviderOwnershipChallenge {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateProviderOwnershipChallengeRequest {
-    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     #[serde(alias = "public_key")]
     pub provider_did: String,
     pub operation: ProviderOwnershipOperation,
