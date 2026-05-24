@@ -66,6 +66,7 @@ pub enum HealthStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptStatus {
+    Running,
     Succeeded,
     Failed,
     Rejected,
@@ -91,7 +92,8 @@ pub struct ExecutionReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_digest: Option<String>,
     pub started_at: DateTime<Utc>,
-    pub completed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_units: Option<u32>,
 }
@@ -701,6 +703,7 @@ mod tests {
                 "url": "https://example.com",
                 "preferredTransport": "JSONRPC",
                 "protocolVersion": "1.0",
+                "supportsTask": false,
                 "skills": [{"id": "payments.create_link"}],
                 "securitySchemes": {"oauth2": {"type": "oauth2"}},
                 "security": [{"oauth2": ["payments:write"]}]

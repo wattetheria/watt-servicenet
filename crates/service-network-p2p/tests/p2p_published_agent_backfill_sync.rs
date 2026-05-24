@@ -24,6 +24,7 @@ fn demo_published_agent() -> PublishedAgentRecord {
             "url": "https://twilio-agent.example.com",
             "preferredTransport": "JSONRPC",
             "protocolVersion": "1.0",
+            "supportsTask": false,
             "skills": [{ "id": "messaging.send_sms" }],
             "securitySchemes": { "oauth2": { "type": "oauth2" } },
             "security": [{ "oauth2": ["messaging:write"] }]

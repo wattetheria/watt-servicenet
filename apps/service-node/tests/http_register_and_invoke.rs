@@ -51,6 +51,7 @@ fn valid_agent_submission_payload_for_agent(
             "url": url_base,
             "preferredTransport": "JSONRPC",
             "protocolVersion": "1.0",
+            "supportsTask": false,
             "skills": [
                 {
                     "id": "payments.create_link",
@@ -616,6 +617,68 @@ async fn approved_agent_can_be_invoked_over_a2a_and_polled() {
     assert_eq!(poll_json["status"], "TASK_STATE_COMPLETED");
     assert_eq!(poll_json["output"]["ok"], true);
     assert_eq!(poll_json["output"]["provider"], "mock-a2a");
+}
+
+#[tokio::test]
+async fn approved_agent_can_be_invoked_async_and_polled_by_receipt() {
+    let app = build_local_app(Arc::new(ServiceRegistry::in_memory()));
+    let a2a_url = start_mock_a2a_server().await;
+    let card_url = a2a_url.trim_end_matches("/a2a").to_owned();
+
+    let _submission_id = register_provider_and_approve_agent(&app, &a2a_url, &card_url).await;
+
+    let invoke = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/agents/stripe-agent/invoke-async")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "message": "Create a payment link",
+                        "input": { "amount": 42, "currency": "AUD" },
+                        "auth_token": "test-token",
+                        "region": "AU"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("async invoke should succeed");
+    assert_eq!(invoke.status(), StatusCode::OK);
+    let invoke_json = response_json(invoke).await;
+    assert_eq!(invoke_json["status"], "running");
+    let receipt_id = invoke_json["receipt_id"]
+        .as_str()
+        .expect("receipt id should be returned")
+        .to_owned();
+
+    let mut receipt_json = serde_json::Value::Null;
+    for _ in 0..20 {
+        let receipt = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/receipts/{receipt_id}"))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("receipt poll should succeed");
+        assert_eq!(receipt.status(), StatusCode::OK);
+        receipt_json = response_json(receipt).await;
+        if receipt_json["receipt"]["status"] == "succeeded" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(receipt_json["receipt"]["status"], "succeeded");
+    assert!(receipt_json["receipt"]["completed_at"].is_string());
+    assert_eq!(receipt_json["output"]["task_id"], "task-1");
+    assert_eq!(receipt_json["output"]["status"], "TASK_STATE_WORKING");
 }
 
 #[tokio::test]

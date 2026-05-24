@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -33,6 +33,15 @@ pub struct GatewayService {
     registry: Arc<ServiceRegistry>,
     http_client: reqwest::Client,
     policy: GatewayPolicyConfig,
+}
+
+struct PreparedInvocation {
+    record: PublishedAgentRecord,
+    auth_token: Option<String>,
+    adapter: Box<dyn A2aAdapter + Send + Sync>,
+    normalized_settlement: Option<NormalizedSettlementRequest>,
+    cost_units: Option<u32>,
+    request_digest: String,
 }
 
 trait A2aAdapter: Send + Sync {
@@ -209,6 +218,81 @@ impl GatewayService {
         agent_id: &str,
         request: InvokeAgentRequest,
     ) -> Result<InvokeAgentResponse, GatewayError> {
+        let prepared = self.prepare_invocation(agent_id, &request).await?;
+        self.execute_prepared_invocation(agent_id, request, prepared, Uuid::new_v4(), Utc::now())
+            .await
+    }
+
+    pub async fn invoke_agent_async(
+        &self,
+        agent_id: &str,
+        request: InvokeAgentRequest,
+    ) -> Result<InvokeAgentResponse, GatewayError> {
+        let prepared = self.prepare_invocation(agent_id, &request).await?;
+        let receipt_id = Uuid::new_v4();
+        let started_at = Utc::now();
+        let running = StoredReceipt {
+            receipt: ExecutionReceipt {
+                receipt_id,
+                agent_id: prepared.record.agent_id.clone(),
+                provider_id: prepared.record.provider_id.clone(),
+                status: ReceiptStatus::Running,
+                verification: VerificationVerdict::NotRequired,
+                request_digest: prepared.request_digest.clone(),
+                result_digest: None,
+                started_at,
+                completed_at: None,
+                cost_units: prepared.cost_units,
+            },
+            output: None,
+            stderr: None,
+        };
+        let stored = self
+            .registry
+            .record_receipt(&running)
+            .await
+            .map_err(map_registry_error)?;
+        let service = self.clone();
+        let agent_id_owned = agent_id.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = service
+                .execute_prepared_invocation(
+                    &agent_id_owned,
+                    request,
+                    prepared,
+                    receipt_id,
+                    started_at,
+                )
+                .await
+            {
+                let _ = service
+                    .record_failed_invocation(receipt_id, error.to_string())
+                    .await;
+            }
+        });
+        Ok(InvokeAgentResponse {
+            agent_id: agent_id.to_owned(),
+            status: "running".to_owned(),
+            receipt_id: Some(stored.receipt.receipt_id),
+            task_id: None,
+            context_id: None,
+            message: Some("ServiceNet invocation accepted".to_owned()),
+            settlement: None,
+            payment_receipt: None,
+            output: None,
+            raw: serde_json::json!({
+                "agent_id": agent_id,
+                "status": "running",
+                "receipt_id": stored.receipt.receipt_id
+            }),
+        })
+    }
+
+    async fn prepare_invocation(
+        &self,
+        agent_id: &str,
+        request: &InvokeAgentRequest,
+    ) -> Result<PreparedInvocation, GatewayError> {
         let record = self
             .registry
             .get_published_agent(agent_id)
@@ -218,53 +302,66 @@ impl GatewayService {
             .resolve_agent_auth_context(&record, request.auth_context_id)
             .await?
             .or(request.auth_token.clone());
-        self.enforce_agent_preflight(&record, &request, auth_token.as_deref())
+        self.enforce_agent_preflight(&record, request, auth_token.as_deref())
             .await?;
         let adapter = a2a_adapter(record.deployment.endpoint.interaction_protocol);
         let normalized_settlement = normalize_settlement_request(request.settlement.as_ref())?;
+        let agent_cost_units = agent_cost_units(&record.agent_card);
+        let cost_units = request
+            .max_cost_units
+            .and(agent_cost_units)
+            .or(agent_cost_units);
+        let request_digest = invocation_request_digest(request, normalized_settlement.as_ref())?;
+        Ok(PreparedInvocation {
+            record,
+            auth_token,
+            adapter,
+            normalized_settlement,
+            cost_units,
+            request_digest,
+        })
+    }
 
-        let started_at = Utc::now();
+    async fn execute_prepared_invocation(
+        &self,
+        agent_id: &str,
+        request: InvokeAgentRequest,
+        prepared: PreparedInvocation,
+        receipt_id: Uuid,
+        started_at: DateTime<Utc>,
+    ) -> Result<InvokeAgentResponse, GatewayError> {
         let response = self
             .a2a_jsonrpc_call(
-                &record,
-                adapter.as_ref(),
-                adapter.send_message_method(),
-                adapter.build_send_message_payload(&request, normalized_settlement.as_ref()),
-                auth_token.as_deref(),
+                &prepared.record,
+                prepared.adapter.as_ref(),
+                prepared.adapter.send_message_method(),
+                prepared
+                    .adapter
+                    .build_send_message_payload(&request, prepared.normalized_settlement.as_ref()),
+                prepared.auth_token.as_deref(),
             )
             .await?;
         let completed_at = Utc::now();
+        let receipt_output = stored_invocation_output(&response);
 
-        let agent_cost_units = agent_cost_units(&record.agent_card);
         let receipt = StoredReceipt {
             receipt: ExecutionReceipt {
-                receipt_id: Uuid::new_v4(),
-                agent_id: record.agent_id.clone(),
-                provider_id: record.provider_id.clone(),
+                receipt_id,
+                agent_id: prepared.record.agent_id.clone(),
+                provider_id: prepared.record.provider_id.clone(),
                 status: ReceiptStatus::Succeeded,
-                verification: verification_for_risk(&record.review.risk_level),
-                request_digest: digest_value(&serde_json::json!({
-                    "task_id": request.task_id,
-                    "context_id": request.context_id,
-                    "message": request.message,
-                    "input": request.input,
-                    "skill_id": request.skill_id,
-                    "settlement": normalized_settlement
-                }))
-                .map_err(|err| GatewayError::Execution(err.to_string()))?,
-                result_digest: extract_task_output(&response)
+                verification: verification_for_risk(&prepared.record.review.risk_level),
+                request_digest: prepared.request_digest,
+                result_digest: receipt_output
                     .as_ref()
                     .map(digest_value)
                     .transpose()
                     .map_err(|err| GatewayError::Execution(err.to_string()))?,
                 started_at,
-                completed_at,
-                cost_units: request
-                    .max_cost_units
-                    .and(agent_cost_units)
-                    .or(agent_cost_units),
+                completed_at: Some(completed_at),
+                cost_units: prepared.cost_units,
             },
-            output: extract_task_output(&response),
+            output: receipt_output,
             stderr: None,
         };
         let stored = self
@@ -275,9 +372,29 @@ impl GatewayService {
         Ok(build_invoke_agent_response(
             agent_id,
             Some(stored.receipt.receipt_id),
-            normalized_settlement,
+            prepared.normalized_settlement,
             response,
         ))
+    }
+
+    async fn record_failed_invocation(
+        &self,
+        receipt_id: Uuid,
+        error: String,
+    ) -> Result<(), GatewayError> {
+        let mut stored = self
+            .registry
+            .get_receipt(receipt_id)
+            .await
+            .map_err(map_registry_error)?;
+        stored.receipt.status = ReceiptStatus::Failed;
+        stored.receipt.completed_at = Some(Utc::now());
+        stored.stderr = Some(error);
+        self.registry
+            .record_receipt(&stored)
+            .await
+            .map_err(map_registry_error)?;
+        Ok(())
     }
 
     pub async fn get_agent_task(
@@ -524,6 +641,21 @@ fn agent_cost_units(agent_card: &Value) -> Option<u32> {
         .and_then(|cost| u32::try_from(cost).ok())
 }
 
+fn invocation_request_digest(
+    request: &InvokeAgentRequest,
+    normalized_settlement: Option<&NormalizedSettlementRequest>,
+) -> Result<String, GatewayError> {
+    digest_value(&serde_json::json!({
+        "task_id": request.task_id,
+        "context_id": request.context_id,
+        "message": request.message,
+        "input": request.input,
+        "skill_id": request.skill_id,
+        "settlement": normalized_settlement
+    }))
+    .map_err(|err| GatewayError::Execution(err.to_string()))
+}
+
 fn normalize_settlement_request(
     settlement: Option<&SettlementRequest>,
 ) -> Result<Option<NormalizedSettlementRequest>, GatewayError> {
@@ -585,6 +717,20 @@ fn extract_task_output(response: &Value) -> Option<Value> {
         .and_then(Value::as_array)
         .and_then(|parts| parts.first())
         .and_then(extract_message_value)
+}
+
+fn stored_invocation_output(response: &Value) -> Option<Value> {
+    response
+        .pointer("/result/task")
+        .map(|task| {
+            serde_json::json!({
+                "task_id": task.get("id").cloned().unwrap_or(Value::Null),
+                "context_id": task.get("contextId").cloned().unwrap_or(Value::Null),
+                "status": task.pointer("/status/state").cloned().unwrap_or(Value::Null),
+                "output": extract_task_output(response).unwrap_or(Value::Null),
+            })
+        })
+        .or_else(|| response.pointer("/result/message").cloned())
 }
 
 fn extract_message_text(response: &Value) -> Option<String> {
@@ -698,6 +844,7 @@ mod tests {
                 "url": url_base,
                 "preferredTransport": "JSONRPC",
                 "protocolVersion": "1.0",
+                "supportsTask": false,
                 "cost": 5,
                 "skills": [{"id": "payments.create_link"}],
                 "securitySchemes": {"oauth2": {"type": "oauth2"}},
@@ -909,6 +1056,58 @@ mod tests {
             .await
             .expect("receipts should load");
         assert_eq!(receipts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invoke_agent_async_returns_receipt_and_records_result() {
+        let (registry, gateway) = approved_gateway().await;
+        let response = gateway
+            .invoke_agent_async(
+                "stripe-agent",
+                InvokeAgentRequest {
+                    task_id: None,
+                    context_id: None,
+                    message: Some("Create payment link".to_owned()),
+                    input: Value::Null,
+                    skill_id: None,
+                    settlement: None,
+                    auth_token: Some("secret-token".to_owned()),
+                    auth_context_id: None,
+                    region: Some("AU".to_owned()),
+                    confirm_risky: true,
+                    max_cost_units: Some(10),
+                    agent_envelope: None,
+                },
+            )
+            .await
+            .expect("async invoke should be accepted");
+        assert_eq!(response.status, "running");
+        let receipt_id = response.receipt_id.expect("receipt id should be returned");
+
+        let mut stored = registry
+            .get_receipt(receipt_id)
+            .await
+            .expect("running receipt should exist");
+        for _ in 0..20 {
+            if stored.receipt.status == ReceiptStatus::Succeeded {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            stored = registry
+                .get_receipt(receipt_id)
+                .await
+                .expect("receipt should remain queryable");
+        }
+
+        assert_eq!(stored.receipt.status, ReceiptStatus::Succeeded);
+        assert!(stored.receipt.completed_at.is_some());
+        assert_eq!(
+            stored
+                .output
+                .as_ref()
+                .and_then(|output| output["task_id"].as_str()),
+            Some("task-1")
+        );
     }
 
     #[tokio::test]

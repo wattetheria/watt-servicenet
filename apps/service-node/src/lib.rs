@@ -134,6 +134,10 @@ fn build_app(state: RouterState) -> Router {
         .route("/v1/agents/:agent_id", get(get_agent))
         .route("/v1/agents/:agent_id/invoke", post(invoke_agent))
         .route(
+            "/v1/agents/:agent_id/invoke-async",
+            post(invoke_agent_async),
+        )
+        .route(
             "/v1/agents/:agent_id/tasks/:task_id/get",
             post(get_agent_task),
         )
@@ -400,6 +404,19 @@ async fn invoke_agent(
     let response = state
         .gateway
         .invoke_agent(&agent_id, request)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!(response)))
+}
+
+async fn invoke_agent_async(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(request): Json<InvokeAgentRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let response = state
+        .gateway
+        .invoke_agent_async(&agent_id, request)
         .await
         .map_err(AppError::from)?;
     Ok(Json(serde_json::json!(response)))
@@ -694,10 +711,12 @@ async fn start_p2p_sync_if_enabled(
         return Ok(None);
     }
 
-    let mut config = ServiceNetworkP2pConfig::default();
-    config.state_dir = std::env::var("SERVICENET_P2P_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| default_p2p_state_dir());
+    let mut config = ServiceNetworkP2pConfig {
+        state_dir: std::env::var("SERVICENET_P2P_STATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_p2p_state_dir()),
+        ..ServiceNetworkP2pConfig::default()
+    };
     if let Ok(listen_addrs) = std::env::var("SERVICENET_P2P_LISTEN_ADDRS") {
         config.listen_addrs = split_csv(&listen_addrs);
     }
@@ -973,6 +992,7 @@ mod tests {
                 "url": "https://agent.example.com",
                 "preferredTransport": "JSONRPC",
                 "protocolVersion": "1.0",
+                "supportsTask": false,
                 "skills": [{ "id": "demo.run", "name": "Run Demo" }],
                 "securitySchemes": { "none": { "type": "none" } },
                 "security": [{ "none": [] }]

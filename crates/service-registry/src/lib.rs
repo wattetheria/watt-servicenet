@@ -1208,7 +1208,14 @@ impl ServiceRegistry {
                     .is_none_or(|verification| &stored.receipt.verification == verification)
             })
             .collect::<Vec<_>>();
-        receipts.sort_by(|left, right| right.receipt.completed_at.cmp(&left.receipt.completed_at));
+        receipts.sort_by(|left, right| {
+            let left_at = left.receipt.completed_at.unwrap_or(left.receipt.started_at);
+            let right_at = right
+                .receipt
+                .completed_at
+                .unwrap_or(right.receipt.started_at);
+            right_at.cmp(&left_at)
+        });
         if let Some(limit) = query.limit {
             receipts.truncate(limit);
         }
@@ -1240,8 +1247,10 @@ impl ServiceRegistry {
         state
             .receipts
             .insert(stored.receipt.receipt_id, stored.clone());
-        update_health_for_receipt(&mut state, &stored.receipt);
-        update_trust_for_receipt(&mut state, &stored.receipt);
+        if stored.receipt.status != watt_servicenet_protocol::ReceiptStatus::Running {
+            update_health_for_receipt(&mut state, &stored.receipt);
+            update_trust_for_receipt(&mut state, &stored.receipt);
+        }
         if stored.receipt.verification == VerificationVerdict::Pending {
             state.verifications.insert(
                 stored.receipt.receipt_id,
@@ -2799,6 +2808,15 @@ fn validate_agent_card(agent_card: &serde_json::Value) -> Result<(), RegistryErr
     }
     require_card_string_field(agent_card, "protocolVersion")?;
     if agent_card
+        .get("supportsTask")
+        .and_then(serde_json::Value::as_bool)
+        .is_none()
+    {
+        return Err(RegistryError::InvalidAgent(
+            "agent_card.supportsTask must be a boolean".to_owned(),
+        ));
+    }
+    if agent_card
         .get("skills")
         .and_then(serde_json::Value::as_array)
         .is_none_or(|skills| skills.is_empty())
@@ -2976,7 +2994,8 @@ fn mark_provider_agents_offline(state: &mut RegistryState, provider_id: &str) {
 }
 
 fn update_health_for_receipt(state: &mut RegistryState, receipt: &ExecutionReceipt) {
-    let latency_ms = (receipt.completed_at - receipt.started_at)
+    let completed_at = receipt.completed_at.unwrap_or_else(Utc::now);
+    let latency_ms = (completed_at - receipt.started_at)
         .num_milliseconds()
         .max(0) as u64;
 
@@ -3031,6 +3050,7 @@ fn update_health_record(
 ) {
     let now = Utc::now();
     match receipt.status {
+        watt_servicenet_protocol::ReceiptStatus::Running => {}
         watt_servicenet_protocol::ReceiptStatus::Succeeded => {
             *success_count += 1;
             *status = HealthStatus::Online;
@@ -3050,6 +3070,7 @@ fn update_health_record(
 
 fn update_trust_for_receipt(state: &mut RegistryState, receipt: &ExecutionReceipt) {
     let delta = match receipt.status {
+        watt_servicenet_protocol::ReceiptStatus::Running => 0.0,
         watt_servicenet_protocol::ReceiptStatus::Succeeded => 0.02,
         watt_servicenet_protocol::ReceiptStatus::Rejected => -0.05,
         watt_servicenet_protocol::ReceiptStatus::Failed => -0.1,
@@ -3208,6 +3229,7 @@ mod tests {
                 "url": "https://stripe-agent.example.com",
                 "preferredTransport": "JSONRPC",
                 "protocolVersion": "1.0",
+                "supportsTask": false,
                 "skills": [{ "id": "payments.create_link" }],
                 "securitySchemes": { "oauth2": { "type": "oauth2" } },
                 "security": [{ "oauth2": ["payments:write"] }]
@@ -3258,7 +3280,7 @@ mod tests {
                 request_digest: "req".to_owned(),
                 result_digest: Some("res".to_owned()),
                 started_at: Utc::now(),
-                completed_at: Utc::now(),
+                completed_at: Some(Utc::now()),
                 cost_units: Some(5),
             },
             output: Some(json!({ "ok": true })),
@@ -3380,6 +3402,30 @@ mod tests {
             .await
             .expect_err("submission should fail");
         assert!(matches!(err, RegistryError::InvalidAgent(_)));
+    }
+
+    #[tokio::test]
+    async fn agent_card_requires_supports_task_flag() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let mut request = demo_agent_submission("stripe-agent");
+        request
+            .agent_card
+            .as_object_mut()
+            .expect("agent card object")
+            .remove("supportsTask");
+        let err = registry
+            .submit_agent(request)
+            .await
+            .expect_err("submission should fail");
+        assert!(matches!(
+            err,
+            RegistryError::InvalidAgent(message)
+                if message == "agent_card.supportsTask must be a boolean"
+        ));
     }
 
     #[tokio::test]
@@ -3672,7 +3718,7 @@ mod tests {
                 request_digest: "req".to_owned(),
                 result_digest: Some("res".to_owned()),
                 started_at: Utc::now(),
-                completed_at: Utc::now(),
+                completed_at: Some(Utc::now()),
                 cost_units: Some(1),
             },
             output: Some(json!({ "ok": true })),

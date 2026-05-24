@@ -194,6 +194,7 @@ curl -X POST http://127.0.0.1:8042/v1/agent-submissions \
       "url": "https://stripe-agent.example.com",
       "preferredTransport": "JSONRPC",
       "protocolVersion": "1.0",
+      "supportsTask": false,
       "skills": [
         {
           "id": "payments.create_link",
@@ -262,6 +263,18 @@ curl -X POST http://127.0.0.1:8042/v1/agents/stripe-agent/invoke \
   }'
 ```
 
+Submit an invocation for ServiceNet receipt polling:
+
+```bash
+curl -X POST http://127.0.0.1:8042/v1/agents/stripe-agent/invoke-async \
+  -H 'content-type: application/json' \
+  -d '{
+    "message": "Create a payment link for 15 AUD",
+    "auth_token": "secret-token",
+    "region": "AU"
+  }'
+```
+
 Poll an A2A task:
 
 ```bash
@@ -306,6 +319,7 @@ Query receipts:
 
 ```bash
 curl http://127.0.0.1:8042/v1/receipts?provider_id=provider-local
+curl http://127.0.0.1:8042/v1/receipts/<RECEIPT_ID>
 ```
 
 Verify a receipt:

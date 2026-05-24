@@ -65,6 +65,7 @@ fn agent_submission() -> SubmitAgentRequest {
             "url": "https://stripe-agent.example.com",
             "preferredTransport": "JSONRPC",
             "protocolVersion": "1.0",
+            "supportsTask": false,
             "skills": [{ "id": "payments.create_link" }],
             "securitySchemes": { "oauth2": { "type": "oauth2" } },
             "security": [{ "oauth2": ["payments:write"] }]
@@ -115,7 +116,7 @@ fn stored_receipt() -> StoredReceipt {
             request_digest: "req".to_owned(),
             result_digest: Some("res".to_owned()),
             started_at: Utc::now(),
-            completed_at: Utc::now(),
+            completed_at: Some(Utc::now()),
             cost_units: Some(7),
         },
         output: Some(json!({ "ok": true })),

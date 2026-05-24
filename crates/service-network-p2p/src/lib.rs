@@ -912,6 +912,7 @@ mod tests {
                 "url": "https://stripe-agent.example.com",
                 "preferredTransport": "JSONRPC",
                 "protocolVersion": "1.0",
+                "supportsTask": false,
                 "skills": [{ "id": "payments.create_link" }],
                 "securitySchemes": { "oauth2": { "type": "oauth2" } },
                 "security": [{ "oauth2": ["payments:write"] }]
