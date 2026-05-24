@@ -720,19 +720,7 @@ fn extract_task_output(response: &Value) -> Option<Value> {
 }
 
 fn stored_invocation_output(response: &Value) -> Option<Value> {
-    let Some(result) = response.get("result") else {
-        return Some(response.clone());
-    };
-    let Some(task) = result.get("task") else {
-        return Some(result.clone());
-    };
-    Some(serde_json::json!({
-        "task_id": task.get("id").cloned().unwrap_or(Value::Null),
-        "context_id": task.get("contextId").cloned().unwrap_or(Value::Null),
-        "status": task.pointer("/status/state").cloned().unwrap_or(Value::Null),
-        "output": extract_task_output(response).unwrap_or(Value::Null),
-        "raw": result,
-    }))
+    Some(response.clone())
 }
 
 fn extract_message_text(response: &Value) -> Option<String> {
@@ -1107,7 +1095,8 @@ mod tests {
             stored
                 .output
                 .as_ref()
-                .and_then(|output| output["task_id"].as_str()),
+                .and_then(|output| output.pointer("/result/task/id"))
+                .and_then(Value::as_str),
             Some("task-1")
         );
     }
@@ -1131,7 +1120,7 @@ mod tests {
 
         let output = stored_invocation_output(&response).expect("output should be stored");
 
-        assert_eq!(output, response["result"]);
+        assert_eq!(output, response);
     }
 
     #[test]
@@ -1144,7 +1133,7 @@ mod tests {
 
         let output = stored_invocation_output(&response).expect("output should be stored");
 
-        assert_eq!(output, response["result"]);
+        assert_eq!(output, response);
     }
 
     #[test]
