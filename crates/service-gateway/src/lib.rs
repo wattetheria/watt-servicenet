@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -575,19 +575,46 @@ impl GatewayService {
             }))
             .send()
             .await
-            .context("a2a request failed")
-            .map_err(|err| GatewayError::Execution(err.to_string()))?;
-        let body = response
-            .json::<Value>()
-            .await
-            .context("failed to parse a2a response")
-            .map_err(|err| GatewayError::Execution(err.to_string()))?;
+            .map_err(|err| {
+                GatewayError::Execution(classify_a2a_send_error(record, method, &err))
+            })?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let text = response.text().await.map_err(|err| {
+            GatewayError::Execution(format!(
+                "callee agent response body could not be read after ServiceNet sent `{method}` to agent `{}`: {}. The target may have closed the connection while responding; the caller may retry.",
+                record.agent_id, err
+            ))
+        })?;
+        if !status.is_success() {
+            return Err(GatewayError::Execution(format!(
+                "callee agent returned HTTP {status} after ServiceNet sent `{method}` to agent `{}`. content_type={}; body_preview={}. This is a target agent or upstream proxy response; the caller may retry later.",
+                record.agent_id,
+                content_type.as_deref().unwrap_or("unknown"),
+                body_preview(&text)
+            )));
+        }
+        let body = serde_json::from_str::<Value>(&text).map_err(|err| {
+            GatewayError::Execution(format!(
+                "callee agent returned a non-JSON or invalid A2A response after ServiceNet sent `{method}` to agent `{}`: {err}. content_type={}; body_preview={}. This means the target agent or its upstream proxy responded, but not with valid A2A JSON; the caller may retry later.",
+                record.agent_id,
+                content_type.as_deref().unwrap_or("unknown"),
+                body_preview(&text)
+            ))
+        })?;
         if let Some(error) = body.get("error") {
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("a2a request failed");
-            return Err(GatewayError::Execution(message.to_owned()));
+            return Err(GatewayError::Execution(format!(
+                "callee agent returned an A2A error after ServiceNet sent `{method}` to agent `{}`: {message}. The caller may retry later if this was transient.",
+                record.agent_id
+            )));
         }
         Ok(body)
     }
@@ -759,6 +786,50 @@ fn digest_value(value: &Value) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn classify_a2a_send_error(
+    record: &PublishedAgentRecord,
+    method: &str,
+    error: &reqwest::Error,
+) -> String {
+    if error.is_timeout() {
+        return format!(
+            "ServiceNet sent `{method}` to agent `{}` but did not receive a response before timeout: {error}. The target agent or network path may be unavailable; the caller may retry later.",
+            record.agent_id
+        );
+    }
+    if error.is_connect() {
+        return format!(
+            "ServiceNet could not connect to the target endpoint for agent `{}` while sending `{method}`: {error}. The request was not delivered to the callee agent; the caller may retry later.",
+            record.agent_id
+        );
+    }
+    if error.is_request() {
+        return format!(
+            "ServiceNet could not send `{method}` to agent `{}` because the outgoing request failed before delivery: {error}. The caller may retry later.",
+            record.agent_id
+        );
+    }
+    if error.is_body() {
+        return format!(
+            "ServiceNet started sending `{method}` to agent `{}` but the request body failed before delivery completed: {error}. The caller may retry later.",
+            record.agent_id
+        );
+    }
+    format!(
+        "ServiceNet failed while sending `{method}` to agent `{}` before a valid callee response was received: {error}. The caller may retry later.",
+        record.agent_id
+    )
+}
+
+fn body_preview(text: &str) -> String {
+    let preview: String = text.chars().take(500).collect();
+    if text.chars().count() > 500 {
+        format!("{preview}...")
+    } else {
+        preview
+    }
 }
 
 fn map_registry_error(error: RegistryError) -> GatewayError {
@@ -982,13 +1053,32 @@ mod tests {
         (format!("http://{addr}/a2a"), captured)
     }
 
-    async fn approved_gateway() -> (Arc<ServiceRegistry>, GatewayService) {
+    async fn start_invalid_a2a_server() -> String {
+        async fn handle() -> &'static str {
+            "callee returned a non-json response"
+        }
+
+        let app = Router::new().route("/a2a", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock server should run");
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    async fn approved_gateway_with_a2a_url(
+        a2a_url: String,
+    ) -> (Arc<ServiceRegistry>, GatewayService) {
         let registry = Arc::new(ServiceRegistry::in_memory());
         registry
             .register_provider(provider_request())
             .await
             .expect("provider should register");
-        let a2a_url = start_mock_a2a_server().await;
         let card_url = a2a_url.trim_end_matches("/a2a").to_owned();
         let submission = registry
             .submit_agent(agent_submission(&card_url, &a2a_url))
@@ -1006,6 +1096,10 @@ mod tests {
             .expect("agent should approve");
         let gateway = GatewayService::new(registry.clone());
         (registry, gateway)
+    }
+
+    async fn approved_gateway() -> (Arc<ServiceRegistry>, GatewayService) {
+        approved_gateway_with_a2a_url(start_mock_a2a_server().await).await
     }
 
     #[tokio::test]
@@ -1046,6 +1140,44 @@ mod tests {
             .await
             .expect("receipts should load");
         assert_eq!(receipts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invoke_agent_reports_invalid_callee_response() {
+        let (_registry, gateway) =
+            approved_gateway_with_a2a_url(start_invalid_a2a_server().await).await;
+        let err = gateway
+            .invoke_agent(
+                "stripe-agent",
+                InvokeAgentRequest {
+                    message: Some("Create payment link".to_owned()),
+                    input: Value::Null,
+                    region: Some("AU".to_owned()),
+                    confirm_risky: true,
+                    auth_token: Some("secret-token".to_owned()),
+                    ..InvokeAgentRequest {
+                        task_id: None,
+                        context_id: None,
+                        message: None,
+                        input: Value::Null,
+                        skill_id: None,
+                        settlement: None,
+                        auth_token: None,
+                        auth_context_id: None,
+                        region: None,
+                        confirm_risky: false,
+                        max_cost_units: None,
+                        agent_envelope: None,
+                    }
+                },
+            )
+            .await
+            .expect_err("invalid callee response should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("callee agent returned a non-JSON or invalid A2A response"));
+        assert!(message.contains("body_preview=callee returned a non-json response"));
+        assert!(message.contains("caller may retry later"));
     }
 
     #[tokio::test]
