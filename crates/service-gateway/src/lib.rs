@@ -720,17 +720,19 @@ fn extract_task_output(response: &Value) -> Option<Value> {
 }
 
 fn stored_invocation_output(response: &Value) -> Option<Value> {
-    response
-        .pointer("/result/task")
-        .map(|task| {
-            serde_json::json!({
-                "task_id": task.get("id").cloned().unwrap_or(Value::Null),
-                "context_id": task.get("contextId").cloned().unwrap_or(Value::Null),
-                "status": task.pointer("/status/state").cloned().unwrap_or(Value::Null),
-                "output": extract_task_output(response).unwrap_or(Value::Null),
-            })
-        })
-        .or_else(|| response.pointer("/result/message").cloned())
+    let Some(result) = response.get("result") else {
+        return Some(response.clone());
+    };
+    let Some(task) = result.get("task") else {
+        return Some(result.clone());
+    };
+    Some(serde_json::json!({
+        "task_id": task.get("id").cloned().unwrap_or(Value::Null),
+        "context_id": task.get("contextId").cloned().unwrap_or(Value::Null),
+        "status": task.pointer("/status/state").cloned().unwrap_or(Value::Null),
+        "output": extract_task_output(response).unwrap_or(Value::Null),
+        "raw": result,
+    }))
 }
 
 fn extract_message_text(response: &Value) -> Option<String> {
@@ -1108,6 +1110,52 @@ mod tests {
                 .and_then(|output| output["task_id"].as_str()),
             Some("task-1")
         );
+    }
+
+    #[test]
+    fn stored_invocation_output_preserves_message_result() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "response-1",
+            "result": {
+                "kind": "message",
+                "role": "agent",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "Tokyo is partly cloudy."
+                    }
+                ]
+            }
+        });
+
+        let output = stored_invocation_output(&response).expect("output should be stored");
+
+        assert_eq!(output, response["result"]);
+    }
+
+    #[test]
+    fn stored_invocation_output_preserves_plain_result() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "response-1",
+            "result": "Tokyo is partly cloudy."
+        });
+
+        let output = stored_invocation_output(&response).expect("output should be stored");
+
+        assert_eq!(output, response["result"]);
+    }
+
+    #[test]
+    fn stored_invocation_output_preserves_raw_body_without_result() {
+        let response = serde_json::json!({
+            "message": "Tokyo is partly cloudy."
+        });
+
+        let output = stored_invocation_output(&response).expect("output should be stored");
+
+        assert_eq!(output, response);
     }
 
     #[tokio::test]
