@@ -7,7 +7,7 @@ use chacha20poly1305::{
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -291,6 +291,24 @@ struct PostgresRegistryStore {
     schema: String,
 }
 
+const SERVICE_TABLES: &[&str] = &[
+    "providers",
+    "receipts",
+    "provider_health",
+    "agent_health",
+    "provider_trust",
+    "agent_trust",
+    "verifications",
+    "auth_contexts",
+    "auth_context_secrets",
+    "provider_ownership_challenges",
+    "provider_audit_events",
+    "moderation_cases",
+    "agent_submissions",
+    "published_agents",
+    "consumed_attestation_nonces",
+];
+
 impl PostgresRegistryStore {
     async fn connect_with_schema(database_url: &str, schema: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
@@ -314,6 +332,8 @@ impl PostgresRegistryStore {
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."providers" (
                     provider_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     record_json JSONB NOT NULL
                 )"#
             ),
@@ -323,12 +343,16 @@ impl PostgresRegistryStore {
                     agent_id TEXT NOT NULL,
                     provider_id TEXT NOT NULL,
                     verification TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     stored_json JSONB NOT NULL
                 )"#
             ),
             format!(
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."provider_health" (
                     provider_id TEXT PRIMARY KEY,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     record_json JSONB NOT NULL
                 )"#
             ),
@@ -336,6 +360,8 @@ impl PostgresRegistryStore {
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."agent_health" (
                     agent_id TEXT PRIMARY KEY,
                     provider_id TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     record_json JSONB NOT NULL
                 )"#
             ),
@@ -343,6 +369,8 @@ impl PostgresRegistryStore {
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."provider_trust" (
                     provider_id TEXT PRIMARY KEY,
                     blocked BOOLEAN NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     record_json JSONB NOT NULL
                 )"#
             ),
@@ -350,12 +378,16 @@ impl PostgresRegistryStore {
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."agent_trust" (
                     agent_id TEXT PRIMARY KEY,
                     blocked BOOLEAN NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     record_json JSONB NOT NULL
                 )"#
             ),
             format!(
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."verifications" (
                     receipt_id UUID PRIMARY KEY,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     record_json JSONB NOT NULL
                 )"#
             ),
@@ -365,12 +397,16 @@ impl PostgresRegistryStore {
                     provider_id TEXT NOT NULL,
                     subject_did TEXT NOT NULL,
                     expires_at TIMESTAMPTZ NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     record_json JSONB NOT NULL
                 )"#
             ),
             format!(
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."auth_context_secrets" (
                     auth_context_id UUID PRIMARY KEY,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     secret_json JSONB NOT NULL
                 )"#
             ),
@@ -380,6 +416,8 @@ impl PostgresRegistryStore {
                     provider_id TEXT NOT NULL,
                     operation TEXT NOT NULL,
                     expires_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     challenge_json JSONB NOT NULL
                 )"#
             ),
@@ -388,6 +426,7 @@ impl PostgresRegistryStore {
                     event_id UUID PRIMARY KEY,
                     provider_id TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     event_json JSONB NOT NULL
                 )"#
             ),
@@ -397,6 +436,8 @@ impl PostgresRegistryStore {
                     target_kind TEXT NOT NULL,
                     target_id TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     case_json JSONB NOT NULL
                 )"#
             ),
@@ -406,6 +447,8 @@ impl PostgresRegistryStore {
                     provider_id TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     record_json JSONB NOT NULL
                 )"#
             ),
@@ -414,6 +457,8 @@ impl PostgresRegistryStore {
                     agent_id TEXT PRIMARY KEY,
                     provider_id TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     record_json JSONB NOT NULL
                 )"#
             ),
@@ -425,11 +470,118 @@ impl PostgresRegistryStore {
                     provider_id TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
                     expires_at_ms BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     record_json JSONB NOT NULL
                 )"#
             ),
         ];
         for statement in statements {
+            sqlx::query(&statement)
+                .execute(&self.pool)
+                .await
+                .with_context(|| format!("failed to run migration: {statement}"))?;
+        }
+        for table in SERVICE_TABLES {
+            for column in ["created_at", "updated_at"] {
+                let statement = format!(
+                    r#"ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS {column} TIMESTAMPTZ NOT NULL DEFAULT NOW()"#
+                );
+                sqlx::query(&statement)
+                    .execute(&self.pool)
+                    .await
+                    .with_context(|| format!("failed to run migration: {statement}"))?;
+            }
+        }
+        let backfills = vec![
+            format!(
+                r#"UPDATE "{schema}"."providers"
+                   SET created_at = COALESCE((record_json->>'registered_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((record_json->>'revoked_at')::TIMESTAMPTZ, (record_json->>'registered_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."receipts"
+                   SET created_at = COALESCE((stored_json#>>'{{receipt,started_at}}')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((stored_json#>>'{{receipt,completed_at}}')::TIMESTAMPTZ, (stored_json#>>'{{receipt,started_at}}')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."provider_health"
+                   SET created_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."agent_health"
+                   SET created_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."provider_trust"
+                   SET created_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."agent_trust"
+                   SET created_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."verifications"
+                   SET created_at = COALESCE((record_json->0->>'verified_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((record_json->0->>'verified_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."auth_contexts"
+                   SET created_at = COALESCE((record_json->>'created_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((record_json->>'created_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."auth_context_secrets"
+                   SET updated_at = created_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."provider_ownership_challenges"
+                   SET created_at = COALESCE((challenge_json->>'issued_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((challenge_json->>'completed_at')::TIMESTAMPTZ, (challenge_json->>'issued_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."provider_audit_events"
+                   SET updated_at = created_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."moderation_cases"
+                   SET created_at = COALESCE((case_json->>'created_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((case_json->>'updated_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."agent_submissions"
+                   SET created_at = COALESCE((record_json->>'submitted_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."published_agents"
+                   SET created_at = COALESCE((record_json->>'approved_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."consumed_attestation_nonces"
+                   SET created_at = COALESCE(to_timestamp((record_json->>'consumed_at_ms')::DOUBLE PRECISION / 1000.0), created_at),
+                       updated_at = COALESCE(to_timestamp((record_json->>'consumed_at_ms')::DOUBLE PRECISION / 1000.0), updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+        ];
+        for statement in backfills {
             sqlx::query(&statement)
                 .execute(&self.pool)
                 .await
@@ -661,49 +813,46 @@ impl RegistryStore for PostgresRegistryStore {
 
     async fn save_state(&self, state: &RegistryState) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        for table in [
-            "consumed_attestation_nonces",
-            "published_agents",
-            "agent_submissions",
-            "moderation_cases",
-            "provider_audit_events",
-            "provider_ownership_challenges",
-            "auth_context_secrets",
-            "auth_contexts",
-            "verifications",
-            "agent_trust",
-            "provider_trust",
-            "agent_health",
-            "provider_health",
-            "receipts",
-            "providers",
-        ] {
-            sqlx::query(&format!(r#"DELETE FROM "{}"."{}""#, self.schema, table))
-                .execute(&mut *tx)
-                .await?;
-        }
 
         for provider in state.providers.values() {
+            let (created_at, updated_at) = provider_record_timestamps(provider);
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."providers" (provider_id, status, record_json) VALUES ($1, $2, $3)"#,
+                r#"INSERT INTO "{}"."providers" (provider_id, status, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (provider_id) DO UPDATE SET
+                     status = EXCLUDED.status,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
                 self.schema
             ))
             .bind(&provider.provider_id)
             .bind(format!("{:?}", provider.status))
+            .bind(created_at)
+            .bind(updated_at)
             .bind(serde_json::to_value(provider)?)
             .execute(&mut *tx)
             .await?;
         }
 
         for stored in state.receipts.values() {
+            let (created_at, updated_at) = receipt_timestamps(stored);
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."receipts" (receipt_id, agent_id, provider_id, verification, stored_json) VALUES ($1, $2, $3, $4, $5)"#,
+                r#"INSERT INTO "{}"."receipts" (receipt_id, agent_id, provider_id, verification, created_at, updated_at, stored_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   ON CONFLICT (receipt_id) DO UPDATE SET
+                     agent_id = EXCLUDED.agent_id,
+                     provider_id = EXCLUDED.provider_id,
+                     verification = EXCLUDED.verification,
+                     updated_at = EXCLUDED.updated_at,
+                     stored_json = EXCLUDED.stored_json"#,
                 self.schema
             ))
             .bind(stored.receipt.receipt_id)
             .bind(&stored.receipt.agent_id)
             .bind(&stored.receipt.provider_id)
             .bind(format!("{:?}", stored.receipt.verification))
+            .bind(created_at)
+            .bind(updated_at)
             .bind(serde_json::to_value(stored)?)
             .execute(&mut *tx)
             .await?;
@@ -711,10 +860,16 @@ impl RegistryStore for PostgresRegistryStore {
 
         for record in state.provider_health.values() {
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."provider_health" (provider_id, record_json) VALUES ($1, $2)"#,
+                r#"INSERT INTO "{}"."provider_health" (provider_id, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (provider_id) DO UPDATE SET
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
                 self.schema
             ))
             .bind(&record.provider_id)
+            .bind(record.updated_at)
+            .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
             .execute(&mut *tx)
             .await?;
@@ -722,11 +877,18 @@ impl RegistryStore for PostgresRegistryStore {
 
         for record in state.agent_health.values() {
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."agent_health" (agent_id, provider_id, record_json) VALUES ($1, $2, $3)"#,
+                r#"INSERT INTO "{}"."agent_health" (agent_id, provider_id, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (agent_id) DO UPDATE SET
+                     provider_id = EXCLUDED.provider_id,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
                 self.schema
             ))
             .bind(&record.agent_id)
             .bind(&record.provider_id)
+            .bind(record.updated_at)
+            .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
             .execute(&mut *tx)
             .await?;
@@ -734,11 +896,18 @@ impl RegistryStore for PostgresRegistryStore {
 
         for record in state.provider_trust.values() {
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."provider_trust" (provider_id, blocked, record_json) VALUES ($1, $2, $3)"#,
+                r#"INSERT INTO "{}"."provider_trust" (provider_id, blocked, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (provider_id) DO UPDATE SET
+                     blocked = EXCLUDED.blocked,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
                 self.schema
             ))
             .bind(&record.provider_id)
             .bind(record.blocked)
+            .bind(record.updated_at)
+            .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
             .execute(&mut *tx)
             .await?;
@@ -746,22 +915,38 @@ impl RegistryStore for PostgresRegistryStore {
 
         for record in state.agent_trust.values() {
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."agent_trust" (agent_id, blocked, record_json) VALUES ($1, $2, $3)"#,
+                r#"INSERT INTO "{}"."agent_trust" (agent_id, blocked, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (agent_id) DO UPDATE SET
+                     blocked = EXCLUDED.blocked,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
                 self.schema
             ))
             .bind(&record.agent_id)
             .bind(record.blocked)
+            .bind(record.updated_at)
+            .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
             .execute(&mut *tx)
             .await?;
         }
 
         for records in state.verifications.values() {
+            let Some((created_at, updated_at)) = verification_timestamps(records) else {
+                continue;
+            };
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."verifications" (receipt_id, record_json) VALUES ($1, $2)"#,
+                r#"INSERT INTO "{}"."verifications" (receipt_id, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (receipt_id) DO UPDATE SET
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
                 self.schema
             ))
             .bind(records[0].receipt_id)
+            .bind(created_at)
+            .bind(updated_at)
             .bind(serde_json::to_value(records)?)
             .execute(&mut *tx)
             .await?;
@@ -769,38 +954,68 @@ impl RegistryStore for PostgresRegistryStore {
 
         for record in state.auth_contexts.values() {
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."auth_contexts" (auth_context_id, provider_id, subject_did, expires_at, record_json) VALUES ($1, $2, $3, $4, $5)"#,
+                r#"INSERT INTO "{}"."auth_contexts" (auth_context_id, provider_id, subject_did, expires_at, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   ON CONFLICT (auth_context_id) DO UPDATE SET
+                     provider_id = EXCLUDED.provider_id,
+                     subject_did = EXCLUDED.subject_did,
+                     expires_at = EXCLUDED.expires_at,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
                 self.schema
             ))
             .bind(record.auth_context_id)
             .bind(&record.provider_id)
             .bind(&record.subject_did)
             .bind(record.expires_at)
+            .bind(record.created_at)
+            .bind(record.created_at)
             .bind(serde_json::to_value(record)?)
             .execute(&mut *tx)
             .await?;
         }
 
         for (auth_context_id, envelope) in &state.auth_context_secrets {
+            let created_at = state
+                .auth_contexts
+                .get(auth_context_id)
+                .map(|record| record.created_at)
+                .unwrap_or_else(Utc::now);
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."auth_context_secrets" (auth_context_id, secret_json) VALUES ($1, $2)"#,
+                r#"INSERT INTO "{}"."auth_context_secrets" (auth_context_id, created_at, updated_at, secret_json)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (auth_context_id) DO UPDATE SET
+                     updated_at = EXCLUDED.updated_at,
+                     secret_json = EXCLUDED.secret_json"#,
                 self.schema
             ))
             .bind(auth_context_id)
+            .bind(created_at)
+            .bind(created_at)
             .bind(serde_json::to_value(envelope)?)
             .execute(&mut *tx)
             .await?;
         }
 
         for challenge in state.provider_ownership_challenges.values() {
+            let updated_at = challenge.completed_at.unwrap_or(challenge.issued_at);
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."provider_ownership_challenges" (challenge_id, provider_id, operation, expires_at, challenge_json) VALUES ($1, $2, $3, $4, $5)"#,
+                r#"INSERT INTO "{}"."provider_ownership_challenges" (challenge_id, provider_id, operation, expires_at, created_at, updated_at, challenge_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   ON CONFLICT (challenge_id) DO UPDATE SET
+                     provider_id = EXCLUDED.provider_id,
+                     operation = EXCLUDED.operation,
+                     expires_at = EXCLUDED.expires_at,
+                     updated_at = EXCLUDED.updated_at,
+                     challenge_json = EXCLUDED.challenge_json"#,
                 self.schema
             ))
             .bind(challenge.challenge_id)
             .bind(&challenge.provider_id)
             .bind(format!("{:?}", challenge.operation))
             .bind(challenge.expires_at)
+            .bind(challenge.issued_at)
+            .bind(updated_at)
             .bind(serde_json::to_value(challenge)?)
             .execute(&mut *tx)
             .await?;
@@ -808,11 +1023,17 @@ impl RegistryStore for PostgresRegistryStore {
 
         for event in &state.provider_audit_events {
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."provider_audit_events" (event_id, provider_id, created_at, event_json) VALUES ($1, $2, $3, $4)"#,
+                r#"INSERT INTO "{}"."provider_audit_events" (event_id, provider_id, created_at, updated_at, event_json)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (event_id) DO UPDATE SET
+                     provider_id = EXCLUDED.provider_id,
+                     updated_at = EXCLUDED.updated_at,
+                     event_json = EXCLUDED.event_json"#,
                 self.schema
             ))
             .bind(event.event_id)
             .bind(&event.provider_id)
+            .bind(event.created_at)
             .bind(event.created_at)
             .bind(serde_json::to_value(event)?)
             .execute(&mut *tx)
@@ -821,13 +1042,22 @@ impl RegistryStore for PostgresRegistryStore {
 
         for case in state.moderation_cases.values() {
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."moderation_cases" (case_id, target_kind, target_id, status, case_json) VALUES ($1, $2, $3, $4, $5)"#,
+                r#"INSERT INTO "{}"."moderation_cases" (case_id, target_kind, target_id, status, created_at, updated_at, case_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   ON CONFLICT (case_id) DO UPDATE SET
+                     target_kind = EXCLUDED.target_kind,
+                     target_id = EXCLUDED.target_id,
+                     status = EXCLUDED.status,
+                     updated_at = EXCLUDED.updated_at,
+                     case_json = EXCLUDED.case_json"#,
                 self.schema
             ))
             .bind(case.case_id)
             .bind(format!("{:?}", case.target_kind))
             .bind(&case.target_id)
             .bind(format!("{:?}", case.status))
+            .bind(case.created_at)
+            .bind(case.updated_at)
             .bind(serde_json::to_value(case)?)
             .execute(&mut *tx)
             .await?;
@@ -835,13 +1065,22 @@ impl RegistryStore for PostgresRegistryStore {
 
         for record in state.agent_submissions.values() {
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."agent_submissions" (submission_id, provider_id, agent_id, status, record_json) VALUES ($1, $2, $3, $4, $5)"#,
+                r#"INSERT INTO "{}"."agent_submissions" (submission_id, provider_id, agent_id, status, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   ON CONFLICT (submission_id) DO UPDATE SET
+                     provider_id = EXCLUDED.provider_id,
+                     agent_id = EXCLUDED.agent_id,
+                     status = EXCLUDED.status,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
                 self.schema
             ))
             .bind(record.submission_id)
             .bind(&record.provider_id)
             .bind(&record.agent_id)
             .bind(format!("{:?}", record.status))
+            .bind(record.submitted_at)
+            .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
             .execute(&mut *tx)
             .await?;
@@ -849,36 +1088,254 @@ impl RegistryStore for PostgresRegistryStore {
 
         for record in state.published_agents.values() {
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."published_agents" (agent_id, provider_id, status, record_json) VALUES ($1, $2, $3, $4)"#,
+                r#"INSERT INTO "{}"."published_agents" (agent_id, provider_id, status, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   ON CONFLICT (agent_id) DO UPDATE SET
+                     provider_id = EXCLUDED.provider_id,
+                     status = EXCLUDED.status,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
                 self.schema
             ))
             .bind(&record.agent_id)
             .bind(&record.provider_id)
             .bind(format!("{:?}", record.status))
+            .bind(record.approved_at)
+            .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
             .execute(&mut *tx)
             .await?;
         }
 
         for record in state.consumed_attestation_nonces.values() {
+            let key = ConsumedAttestationNonce::key(&record.attester_did, &record.nonce);
+            let created_at = unix_ms_to_datetime(record.consumed_at_ms);
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."consumed_attestation_nonces" (key, attester_did, nonce, provider_id, agent_id, expires_at_ms, record_json) VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+                r#"INSERT INTO "{}"."consumed_attestation_nonces" (key, attester_did, nonce, provider_id, agent_id, expires_at_ms, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                   ON CONFLICT (key) DO UPDATE SET
+                     attester_did = EXCLUDED.attester_did,
+                     nonce = EXCLUDED.nonce,
+                     provider_id = EXCLUDED.provider_id,
+                     agent_id = EXCLUDED.agent_id,
+                     expires_at_ms = EXCLUDED.expires_at_ms,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
                 self.schema
             ))
-            .bind(ConsumedAttestationNonce::key(&record.attester_did, &record.nonce))
+            .bind(key)
             .bind(&record.attester_did)
             .bind(&record.nonce)
             .bind(&record.provider_id)
             .bind(&record.agent_id)
             .bind(i64::try_from(record.expires_at_ms).unwrap_or(i64::MAX))
+            .bind(created_at)
+            .bind(created_at)
             .bind(serde_json::to_value(record)?)
             .execute(&mut *tx)
             .await?;
         }
 
+        delete_stale_uuid_rows(
+            &mut tx,
+            &self.schema,
+            "receipts",
+            "receipt_id",
+            state.receipts.keys().copied().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_text_rows(
+            &mut tx,
+            &self.schema,
+            "providers",
+            "provider_id",
+            state.providers.keys().cloned().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_text_rows(
+            &mut tx,
+            &self.schema,
+            "provider_health",
+            "provider_id",
+            state.provider_health.keys().cloned().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_text_rows(
+            &mut tx,
+            &self.schema,
+            "agent_health",
+            "agent_id",
+            state.agent_health.keys().cloned().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_text_rows(
+            &mut tx,
+            &self.schema,
+            "provider_trust",
+            "provider_id",
+            state.provider_trust.keys().cloned().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_text_rows(
+            &mut tx,
+            &self.schema,
+            "agent_trust",
+            "agent_id",
+            state.agent_trust.keys().cloned().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_uuid_rows(
+            &mut tx,
+            &self.schema,
+            "verifications",
+            "receipt_id",
+            state.verifications.keys().copied().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_uuid_rows(
+            &mut tx,
+            &self.schema,
+            "auth_contexts",
+            "auth_context_id",
+            state.auth_contexts.keys().copied().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_uuid_rows(
+            &mut tx,
+            &self.schema,
+            "auth_context_secrets",
+            "auth_context_id",
+            state
+                .auth_context_secrets
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_uuid_rows(
+            &mut tx,
+            &self.schema,
+            "provider_ownership_challenges",
+            "challenge_id",
+            state
+                .provider_ownership_challenges
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_uuid_rows(
+            &mut tx,
+            &self.schema,
+            "provider_audit_events",
+            "event_id",
+            state
+                .provider_audit_events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_uuid_rows(
+            &mut tx,
+            &self.schema,
+            "moderation_cases",
+            "case_id",
+            state.moderation_cases.keys().copied().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_uuid_rows(
+            &mut tx,
+            &self.schema,
+            "agent_submissions",
+            "submission_id",
+            state.agent_submissions.keys().copied().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_text_rows(
+            &mut tx,
+            &self.schema,
+            "published_agents",
+            "agent_id",
+            state.published_agents.keys().cloned().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_text_rows(
+            &mut tx,
+            &self.schema,
+            "consumed_attestation_nonces",
+            "key",
+            state
+                .consumed_attestation_nonces
+                .values()
+                .map(|record| ConsumedAttestationNonce::key(&record.attester_did, &record.nonce))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
         tx.commit().await?;
         Ok(())
     }
+}
+
+fn provider_record_timestamps(provider: &ProviderRecord) -> (DateTime<Utc>, DateTime<Utc>) {
+    let created_at = provider.registered_at;
+    let updated_at = provider.revoked_at.unwrap_or(created_at);
+    (created_at, updated_at)
+}
+
+fn receipt_timestamps(stored: &StoredReceipt) -> (DateTime<Utc>, DateTime<Utc>) {
+    let created_at = stored.receipt.started_at;
+    let updated_at = stored.receipt.completed_at.unwrap_or(created_at);
+    (created_at, updated_at)
+}
+
+fn verification_timestamps(
+    records: &[VerificationRecord],
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let mut iter = records.iter().map(|record| record.verified_at);
+    let first = iter.next()?;
+    let (created_at, updated_at) = iter.fold((first, first), |(min_at, max_at), verified_at| {
+        (min_at.min(verified_at), max_at.max(verified_at))
+    });
+    Some((created_at, updated_at))
+}
+
+fn unix_ms_to_datetime(timestamp_ms: u64) -> DateTime<Utc> {
+    let timestamp_ms = i64::try_from(timestamp_ms).unwrap_or(i64::MAX);
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms).unwrap_or_else(Utc::now)
+}
+
+async fn delete_stale_text_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    schema: &str,
+    table: &str,
+    column: &str,
+    keys: Vec<String>,
+) -> Result<()> {
+    sqlx::query(&format!(
+        r#"DELETE FROM "{schema}"."{table}" WHERE NOT ({column} = ANY($1))"#
+    ))
+    .bind(keys)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn delete_stale_uuid_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    schema: &str,
+    table: &str,
+    column: &str,
+    keys: Vec<Uuid>,
+) -> Result<()> {
+    sqlx::query(&format!(
+        r#"DELETE FROM "{schema}"."{table}" WHERE NOT ({column} = ANY($1))"#
+    ))
+    .bind(keys)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 #[derive(Clone)]

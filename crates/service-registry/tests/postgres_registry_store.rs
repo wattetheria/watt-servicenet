@@ -3,6 +3,7 @@ use base64::engine::general_purpose::STANDARD;
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
+use sqlx::Row;
 use uuid::Uuid;
 use watt_servicenet_protocol::{
     AgentArtifacts, AgentAttestations, AgentDeployment, AgentDeploymentEndpoint,
@@ -124,6 +125,51 @@ fn stored_receipt() -> StoredReceipt {
     }
 }
 
+fn registry_tables() -> Vec<String> {
+    [
+        "providers",
+        "receipts",
+        "provider_health",
+        "agent_health",
+        "provider_trust",
+        "agent_trust",
+        "verifications",
+        "auth_contexts",
+        "auth_context_secrets",
+        "provider_ownership_challenges",
+        "provider_audit_events",
+        "moderation_cases",
+        "agent_submissions",
+        "published_agents",
+        "consumed_attestation_nonces",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+async fn assert_temporal_columns_exist(database_url: &str, schema: &str) {
+    let pool = sqlx::PgPool::connect(database_url)
+        .await
+        .expect("postgres pool should connect");
+    let rows = sqlx::query(
+        r#"
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = $1
+          AND table_name = ANY($2)
+          AND column_name IN ('created_at', 'updated_at')
+        "#,
+    )
+    .bind(schema)
+    .bind(registry_tables())
+    .fetch_all(&pool)
+    .await
+    .expect("temporal columns should be queryable");
+
+    assert_eq!(rows.len(), registry_tables().len() * 2);
+}
+
 #[tokio::test]
 async fn postgres_store_handles_provider_agent_and_rotation_flow() {
     let Some(database_url) = database_url() else {
@@ -138,11 +184,24 @@ async fn postgres_store_handles_provider_agent_and_rotation_flow() {
     )
     .await
     .expect("postgres registry should initialize");
+    assert_temporal_columns_exist(&database_url, &schema).await;
 
     registry
         .register_provider(provider_request())
         .await
         .expect("provider should register");
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("postgres pool should connect");
+    let provider_created_at_before: chrono::DateTime<Utc> = sqlx::query(&format!(
+        r#"SELECT created_at FROM "{schema}"."providers" WHERE provider_id = $1"#
+    ))
+    .bind("provider-pg")
+    .fetch_one(&pool)
+    .await
+    .expect("provider timestamp should load")
+    .try_get("created_at")
+    .expect("created_at should decode");
     let submission = registry
         .submit_agent(agent_submission())
         .await
@@ -182,6 +241,16 @@ async fn postgres_store_handles_provider_agent_and_rotation_flow() {
         rotated.provider_did,
         "did:key:z6MkhY7vL8T5d4w8n8f1M5uH1D2e4Q9zP3n5K7s2V4x6Y8Za"
     );
+    let provider_created_at_after: chrono::DateTime<Utc> = sqlx::query(&format!(
+        r#"SELECT created_at FROM "{schema}"."providers" WHERE provider_id = $1"#
+    ))
+    .bind("provider-pg")
+    .fetch_one(&pool)
+    .await
+    .expect("provider timestamp should load after upsert")
+    .try_get("created_at")
+    .expect("created_at should decode after upsert");
+    assert_eq!(provider_created_at_after, provider_created_at_before);
 
     let revoked = registry
         .revoke_provider(
