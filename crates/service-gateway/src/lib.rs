@@ -118,11 +118,15 @@ impl A2aAdapter for GoogleA2aAdapter {
                 "parts": parts,
             }),
         );
+        let mut extensions = serde_json::Map::new();
         if let Some(settlement) = settlement {
-            map.insert(
-                "extensions".to_owned(),
-                serde_json::json!({ "settlement": settlement }),
-            );
+            extensions.insert("settlement".to_owned(), serde_json::json!(settlement));
+        }
+        if let Some(agent_envelope) = &request.agent_envelope {
+            extensions.insert("agent_envelope".to_owned(), agent_envelope.clone());
+        }
+        if !extensions.is_empty() {
+            map.insert("extensions".to_owned(), Value::Object(extensions));
         }
         Value::Object(map)
     }
@@ -481,14 +485,36 @@ fn verification_for_risk(risk_level: &RiskLevel) -> VerificationVerdict {
 
 fn agent_requires_auth(agent_card: &Value) -> bool {
     let Some(security) = agent_card.get("security") else {
-        return false;
+        return security_schemes_require_auth(agent_card);
     };
     match security {
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(map) => !map.is_empty(),
+        Value::Array(items) => {
+            !items.is_empty()
+                && !items.iter().any(|item| {
+                    item.as_object()
+                        .is_some_and(|object| object.contains_key("none"))
+                })
+        }
+        Value::Object(map) => !map.is_empty() && !map.contains_key("none"),
         Value::Null => false,
         _ => true,
     }
+}
+
+fn security_schemes_require_auth(agent_card: &Value) -> bool {
+    agent_card
+        .get("securitySchemes")
+        .and_then(Value::as_object)
+        .is_some_and(|schemes| {
+            !schemes.is_empty()
+                && !schemes.iter().all(|(name, scheme)| {
+                    name == "none"
+                        || scheme
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|scheme_type| scheme_type.eq_ignore_ascii_case("none"))
+                })
+        })
 }
 
 fn agent_cost_units(agent_card: &Value) -> Option<u32> {
@@ -868,6 +894,7 @@ mod tests {
                         region: None,
                         confirm_risky: false,
                         max_cost_units: Some(10),
+                        agent_envelope: None,
                     }
                 },
             )
@@ -914,6 +941,7 @@ mod tests {
                         region: None,
                         confirm_risky: false,
                         max_cost_units: Some(10),
+                        agent_envelope: None,
                     }
                 },
             )
@@ -950,6 +978,7 @@ mod tests {
                     region: Some("AU".to_owned()),
                     confirm_risky: true,
                     max_cost_units: Some(10),
+                    agent_envelope: None,
                 },
             )
             .await
@@ -1008,6 +1037,7 @@ mod tests {
                     region: Some("AU".to_owned()),
                     confirm_risky: true,
                     max_cost_units: Some(10),
+                    agent_envelope: None,
                 },
             )
             .await
@@ -1043,6 +1073,21 @@ mod tests {
     }
 
     #[test]
+    fn agent_requires_auth_treats_none_security_as_public() {
+        assert!(!agent_requires_auth(&serde_json::json!({
+            "securitySchemes": {"none": {"type": "none"}},
+            "security": [{"none": []}]
+        })));
+        assert!(agent_requires_auth(&serde_json::json!({
+            "securitySchemes": {"oauth2": {"type": "oauth2"}},
+            "security": [{"oauth2": ["payments:write"]}]
+        })));
+        assert!(agent_requires_auth(&serde_json::json!({
+            "securitySchemes": {"oauth2": {"type": "oauth2"}}
+        })));
+    }
+
+    #[test]
     fn google_a2a_adapter_builds_existing_send_message_shape() {
         let adapter = GoogleA2aAdapter;
         let payload = adapter.build_send_message_payload(
@@ -1058,6 +1103,12 @@ mod tests {
                 region: None,
                 confirm_risky: false,
                 max_cost_units: None,
+                agent_envelope: Some(serde_json::json!({
+                    "source_agent_id": "did:key:zCaller",
+                    "source_agent_card": {
+                        "agent_id": "did:key:zCaller"
+                    }
+                })),
             },
             None,
         );
@@ -1074,6 +1125,10 @@ mod tests {
         assert_eq!(
             payload["message"]["parts"][1]["data"]["amount"].as_i64(),
             Some(42)
+        );
+        assert_eq!(
+            payload["extensions"]["agent_envelope"]["source_agent_id"].as_str(),
+            Some("did:key:zCaller")
         );
     }
 }

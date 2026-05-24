@@ -609,6 +609,8 @@ pub struct InvokeAgentRequest {
     pub confirm_risky: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_units: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
