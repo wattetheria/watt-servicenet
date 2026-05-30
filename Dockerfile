@@ -12,27 +12,38 @@ WORKDIR /workspace
 
 COPY . ./watt-servicenet
 
-RUN --mount=type=secret,id=github_token set -eu; \
+WORKDIR /workspace/watt-servicenet
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/cargo-target,sharing=locked \
+    --mount=type=secret,id=github_token \
+    set -eu; \
     token_file=/run/secrets/github_token; \
     if [ -s "$token_file" ]; then \
       token="$(cat "$token_file")"; \
       git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"; \
     fi; \
-    clone_ref() { \
-      repo="$1"; \
-      ref="$2"; \
-      dir="$3"; \
-      git clone --filter=blob:none --no-checkout "$repo" "$dir"; \
-      git -C "$dir" fetch --depth 1 origin "$ref"; \
-      git -C "$dir" checkout --detach FETCH_HEAD; \
-    }; \
-    clone_ref "$WATTSWARM_REPO" "$WATTSWARM_REF" ./wattswarm; \
-    clone_ref "$WATT_DID_REPO" "$WATT_DID_REF" ./watt-did; \
-    clone_ref "$WATT_WALLET_REPO" "$WATT_WALLET_REF" ./watt-wallet; \
-    git config --global --unset-all url."https://x-access-token:${token:-}@github.com/".insteadOf || true
-
-WORKDIR /workspace/watt-servicenet
-RUN cargo build --release -p watt-servicenet-node
+    sed -i \
+      -e "s|wattswarm-artifact-store = { path = \"../wattswarm/crates/artifact-store\" }|wattswarm-artifact-store = { git = \"${WATTSWARM_REPO}\", branch = \"${WATTSWARM_REF}\", package = \"wattswarm-artifact-store\" }|" \
+      -e "s|wattswarm-network-substrate = { path = \"../wattswarm/crates/network-substrate\" }|wattswarm-network-substrate = { git = \"${WATTSWARM_REPO}\", branch = \"${WATTSWARM_REF}\", package = \"wattswarm-network-substrate\" }|" \
+      -e "s|wattswarm-network-transport-core = { path = \"../wattswarm/crates/network-transport-core\" }|wattswarm-network-transport-core = { git = \"${WATTSWARM_REPO}\", branch = \"${WATTSWARM_REF}\", package = \"wattswarm-network-transport-core\" }|" \
+      -e "s|wattswarm-network-transport-iroh = { path = \"../wattswarm/crates/network-transport-iroh\" }|wattswarm-network-transport-iroh = { git = \"${WATTSWARM_REPO}\", branch = \"${WATTSWARM_REF}\", package = \"wattswarm-network-transport-iroh\" }|" \
+      Cargo.toml; \
+    sed -i \
+      -e "s|watt-did = { path = \"../../../watt-did\" }|watt-did = { git = \"${WATT_DID_REPO}\", branch = \"${WATT_DID_REF}\" }|" \
+      crates/service-protocol/Cargo.toml crates/service-registry/Cargo.toml; \
+    sed -i \
+      -e "s|watt-wallet = { path = \"../../../watt-wallet\" }|watt-wallet = { git = \"${WATT_WALLET_REPO}\", branch = \"${WATT_WALLET_REF}\" }|" \
+      crates/service-registry/Cargo.toml; \
+    sed -i \
+      -e "s|wattswarm-crypto = { path = \"../../../wattswarm/crates/crypto\" }|wattswarm-crypto = { git = \"${WATTSWARM_REPO}\", branch = \"${WATTSWARM_REF}\", package = \"wattswarm-crypto\" }|" \
+      crates/service-network-p2p/Cargo.toml; \
+    printf '\n[patch."%s"]\nwatt-did = { git = "%s", branch = "%s" }\n' \
+      "$WATT_WALLET_REPO" "$WATT_DID_REPO" "$WATT_DID_REF" >> Cargo.toml; \
+    CARGO_TARGET_DIR=/cargo-target cargo build --release -p watt-servicenet-node; \
+    mkdir -p /out; \
+    cp /cargo-target/release/watt-servicenet-node /out/watt-servicenet-node; \
+    rm -f /root/.gitconfig
 
 FROM debian:bookworm-slim AS runtime
 
@@ -42,7 +53,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --from=builder /workspace/watt-servicenet/target/release/watt-servicenet-node /usr/local/bin/watt-servicenet-node
+COPY --from=builder /out/watt-servicenet-node /usr/local/bin/watt-servicenet-node
 
 ENV SERVICENET_REGISTRY_FILE=/data/registry.json
 ENV SERVICENET_P2P_ENABLED=0
