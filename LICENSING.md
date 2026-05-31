@@ -1,5 +1,5 @@
-Watt ServiceNet License
-=======================
+Watt ServiceNet Licensing
+=========================
 
 This repository is a mixed-license workspace. Each Rust package is licensed
 under the SPDX license expression declared in that package's Cargo.toml.
