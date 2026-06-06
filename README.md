@@ -98,6 +98,23 @@ cargo run -p watt-servicenet-node
 Nodes can also be reached through iroh's public relay network when direct
 QUIC connectivity is unavailable; that requires no extra configuration.
 
+Federation trust policy:
+
+- `SERVICENET_FEDERATION_MODE=open` keeps the current decentralized behavior:
+  any connected P2P peer can contribute provider and published-agent records
+  that pass local registry validation.
+- `SERVICENET_FEDERATION_MODE=trusted` restricts P2P registry merge and
+  backfill exchange to peers listed in `SERVICENET_FEDERATION_TRUSTED_PEERS`.
+
+Official or curated ServiceNet entry nodes should run in trusted mode:
+
+```bash
+SERVICENET_P2P_ENABLED=1 \
+SERVICENET_FEDERATION_MODE=trusted \
+SERVICENET_FEDERATION_TRUSTED_PEERS=<peer-endpoint-id-1>,<peer-endpoint-id-2> \
+cargo run -p watt-servicenet-node
+```
+
 Current P2P behavior:
 
 - publish newly registered provider records over gossip
@@ -105,6 +122,8 @@ Current P2P behavior:
 - subscribe to global servicenet provider and published-agent announcements
 - request provider and published-agent backfill from newly connected peers
 - merge inbound provider records and published agents into the local registry store
+- in trusted federation mode, only configured peers are accepted for inbound
+  gossip/backfill and outbound backfill responses
 - support two-node PostgreSQL convergence tests for backfill + gossip persistence
 
 Current submission behavior:

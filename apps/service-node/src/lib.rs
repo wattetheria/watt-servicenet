@@ -5,6 +5,8 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use std::collections::BTreeSet;
+use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -27,6 +29,47 @@ use watt_servicenet_registry::{RegistryError, ServiceRegistry, ServiceRegistryCo
 
 const DEFAULT_AGENT_LIST_LIMIT: usize = 50;
 const MAX_AGENT_LIST_LIMIT: usize = 100;
+const SERVICENET_FEDERATION_MODE_ENV: &str = "SERVICENET_FEDERATION_MODE";
+const SERVICENET_FEDERATION_TRUSTED_PEERS_ENV: &str = "SERVICENET_FEDERATION_TRUSTED_PEERS";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FederationTrustMode {
+    Open,
+    Trusted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FederationTrustPolicy {
+    mode: FederationTrustMode,
+    trusted_peers: BTreeSet<String>,
+}
+
+impl FederationTrustPolicy {
+    fn from_env() -> Self {
+        let mode = match std::env::var(SERVICENET_FEDERATION_MODE_ENV)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("trusted" | "allowlist" | "allow-list") => FederationTrustMode::Trusted,
+            _ => FederationTrustMode::Open,
+        };
+        Self {
+            mode,
+            trusted_peers: std::env::var(SERVICENET_FEDERATION_TRUSTED_PEERS_ENV)
+                .ok()
+                .map(|value| split_csv(&value).into_iter().collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn allows_peer(&self, peer: &impl Display) -> bool {
+        match self.mode {
+            FederationTrustMode::Open => true,
+            FederationTrustMode::Trusted => self.trusted_peers.contains(&peer.to_string()),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -742,6 +785,7 @@ async fn start_p2p_sync_if_enabled(
         config.namespace.network_id = network_id;
     }
     config.validate()?;
+    let federation_policy = FederationTrustPolicy::from_env();
 
     let mut runtime = ServiceNetworkRuntime::new(ServiceNetworkNode::generate(config)?)?;
     runtime.subscribe_global()?;
@@ -757,7 +801,9 @@ async fn start_p2p_sync_if_enabled(
 
             match timeout(Duration::from_millis(250), runtime.next_event()).await {
                 Ok(Ok(event)) => {
-                    if let Err(err) = handle_p2p_event(&registry, &mut runtime, event).await {
+                    if let Err(err) =
+                        handle_p2p_event(&registry, &federation_policy, &mut runtime, event).await
+                    {
                         eprintln!("servicenet p2p event handling failed: {err}");
                     }
                 }
@@ -790,6 +836,7 @@ fn handle_p2p_command(
 
 async fn handle_p2p_event(
     registry: &ServiceRegistry,
+    federation_policy: &FederationTrustPolicy,
     runtime: &mut ServiceNetworkRuntime,
     event: ServiceNetworkRuntimeEvent,
 ) -> anyhow::Result<()> {
@@ -798,59 +845,71 @@ async fn handle_p2p_event(
             println!("servicenet p2p listening on {address}");
         }
         ServiceNetworkRuntimeEvent::ConnectionEstablished { peer } => {
-            if runtime.allows_outbound_backfill_to(&peer) {
+            if federation_policy.allows_peer(&peer) && runtime.allows_outbound_backfill_to(&peer) {
                 let _ = runtime.send_provider_sync_request(&peer, 256);
                 let _ = runtime.send_published_agent_sync_request(&peer, 256);
             }
         }
-        ServiceNetworkRuntimeEvent::ProviderPublished { peer: _, provider } => {
-            registry.upsert_provider_record(provider).await?;
-        }
-        ServiceNetworkRuntimeEvent::PublishedAgentRecordPublished { peer: _, record } => {
-            registry.upsert_published_agent(record).await?;
-        }
-        ServiceNetworkRuntimeEvent::ProviderSyncRequest {
-            peer: _,
-            limit,
-            channel,
-        } => {
-            let providers = registry
-                .list_providers()
-                .await?
-                .into_iter()
-                .take(limit)
-                .collect::<Vec<_>>();
-            runtime.send_provider_sync_response(channel, &providers)?;
-        }
-        ServiceNetworkRuntimeEvent::ProviderSyncResponse {
-            peer: _,
-            request_id: _,
-            providers,
-        } => {
-            for provider in providers {
+        ServiceNetworkRuntimeEvent::ProviderPublished { peer, provider } => {
+            if federation_policy.allows_peer(&peer) {
                 registry.upsert_provider_record(provider).await?;
             }
         }
-        ServiceNetworkRuntimeEvent::PublishedAgentSyncRequest {
-            peer: _,
+        ServiceNetworkRuntimeEvent::PublishedAgentRecordPublished { peer, record } => {
+            if federation_policy.allows_peer(&peer) {
+                registry.upsert_published_agent(record).await?;
+            }
+        }
+        ServiceNetworkRuntimeEvent::ProviderSyncRequest {
+            peer,
             limit,
             channel,
         } => {
-            let records = registry
-                .list_published_agents()
-                .await?
-                .into_iter()
-                .take(limit)
-                .collect::<Vec<_>>();
-            runtime.send_published_agent_sync_response(channel, &records)?;
+            if federation_policy.allows_peer(&peer) {
+                let providers = registry
+                    .list_providers()
+                    .await?
+                    .into_iter()
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                runtime.send_provider_sync_response(channel, &providers)?;
+            }
+        }
+        ServiceNetworkRuntimeEvent::ProviderSyncResponse {
+            peer,
+            request_id: _,
+            providers,
+        } => {
+            if federation_policy.allows_peer(&peer) {
+                for provider in providers {
+                    registry.upsert_provider_record(provider).await?;
+                }
+            }
+        }
+        ServiceNetworkRuntimeEvent::PublishedAgentSyncRequest {
+            peer,
+            limit,
+            channel,
+        } => {
+            if federation_policy.allows_peer(&peer) {
+                let records = registry
+                    .list_published_agents()
+                    .await?
+                    .into_iter()
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                runtime.send_published_agent_sync_response(channel, &records)?;
+            }
         }
         ServiceNetworkRuntimeEvent::PublishedAgentSyncResponse {
-            peer: _,
+            peer,
             request_id: _,
             records,
         } => {
-            for record in records {
-                registry.upsert_published_agent(record).await?;
+            if federation_policy.allows_peer(&peer) {
+                for record in records {
+                    registry.upsert_published_agent(record).await?;
+                }
             }
         }
     }
@@ -957,7 +1016,11 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, P2pCommand, parse_env_flag, publish_auto_approved_agent, split_csv};
+    use super::{
+        AppState, FederationTrustMode, FederationTrustPolicy, P2pCommand, parse_env_flag,
+        publish_auto_approved_agent, split_csv,
+    };
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -981,6 +1044,26 @@ mod tests {
         assert!(parse_env_flag(Some("YES")));
         assert!(!parse_env_flag(Some("0")));
         assert!(!parse_env_flag(None));
+    }
+
+    #[test]
+    fn open_federation_policy_allows_any_peer() {
+        let policy = FederationTrustPolicy {
+            mode: FederationTrustMode::Open,
+            trusted_peers: BTreeSet::new(),
+        };
+        assert!(policy.allows_peer(&"peer-a"));
+        assert!(policy.allows_peer(&"peer-b"));
+    }
+
+    #[test]
+    fn trusted_federation_policy_only_allows_configured_peers() {
+        let policy = FederationTrustPolicy {
+            mode: FederationTrustMode::Trusted,
+            trusted_peers: BTreeSet::from(["peer-a".to_owned()]),
+        };
+        assert!(policy.allows_peer(&"peer-a"));
+        assert!(!policy.allows_peer(&"peer-b"));
     }
 
     #[tokio::test]
