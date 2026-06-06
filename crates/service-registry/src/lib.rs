@@ -32,7 +32,8 @@ use watt_servicenet_protocol::{
     RegisterAuthContextRequest, RegisterProviderRequest, RejectAgentSubmissionRequest,
     ResolveModerationCaseRequest, RevokeProviderRequest, RiskLevel, RotateProviderKeyRequest,
     RunVerifierSweepRequest, SERVICE_PROTOCOL_SCHEMA_VERSION, StoredReceipt, SubmitAgentRequest,
-    VerificationRecord, VerificationVerdict, VerifyReceiptRequest, build_agent_attestation_payload,
+    UnpublishAgentRequest, VerificationRecord, VerificationVerdict, VerifyReceiptRequest,
+    build_agent_attestation_payload, build_agent_unpublish_payload,
 };
 
 #[derive(Debug, Error)]
@@ -139,6 +140,7 @@ pub trait RegistryStore: Send + Sync {
             .await?
             .published_agents
             .into_values()
+            .filter(|record| record.status == PublishedAgentStatus::Approved)
             .collect::<Vec<_>>();
         items.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
         let known_count = items.len();
@@ -791,13 +793,13 @@ impl RegistryStore for PostgresRegistryStore {
         offset: usize,
     ) -> Result<(Vec<PublishedAgentRecord>, usize)> {
         let known_count = sqlx::query_scalar::<_, i64>(&format!(
-            r#"SELECT COUNT(*) FROM "{}"."published_agents""#,
+            r#"SELECT COUNT(*) FROM "{}"."published_agents" WHERE status = 'Approved'"#,
             self.schema
         ))
         .fetch_one(&self.pool)
         .await?;
         let rows = sqlx::query(&format!(
-            r#"SELECT record_json FROM "{}"."published_agents" ORDER BY agent_id ASC LIMIT $1 OFFSET $2"#,
+            r#"SELECT record_json FROM "{}"."published_agents" WHERE status = 'Approved' ORDER BY agent_id ASC LIMIT $1 OFFSET $2"#,
             self.schema
         ))
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
@@ -2494,6 +2496,67 @@ impl ServiceRegistry {
         Ok(record)
     }
 
+    pub async fn unpublish_agent(
+        &self,
+        agent_id: &str,
+        request: UnpublishAgentRequest,
+    ) -> Result<PublishedAgentRecord, RegistryError> {
+        validate_unpublish_agent_request(agent_id, &request)?;
+        let mut state = self.load_state().await?;
+        evict_expired_attestation_nonces(&mut state);
+        let provider = state
+            .providers
+            .get(&request.provider_id)
+            .cloned()
+            .ok_or_else(|| RegistryError::ProviderNotFound(request.provider_id.clone()))?;
+        if provider.provider_did != request.provider_did {
+            return Err(RegistryError::InvalidProvider(
+                "provider_did does not match provider_id".to_owned(),
+            ));
+        }
+        if provider.status == ProviderStatus::Revoked {
+            return Err(RegistryError::ProviderRevoked(request.provider_id.clone()));
+        }
+        let record_provider_id = state
+            .published_agents
+            .get(agent_id)
+            .map(|record| record.provider_id.clone())
+            .ok_or_else(|| RegistryError::PublishedAgentNotFound(agent_id.to_owned()))?;
+        if record_provider_id != request.provider_id {
+            return Err(RegistryError::InvalidAgent(
+                "agent is not owned by the requested provider".to_owned(),
+            ));
+        }
+        check_unpublish_nonce_not_replayed(&request, &state)?;
+        verify_agent_unpublish_signature(agent_id, &request)?;
+        let now = Utc::now();
+        let record = state
+            .published_agents
+            .get_mut(agent_id)
+            .ok_or_else(|| RegistryError::PublishedAgentNotFound(agent_id.to_owned()))?;
+        record.status = PublishedAgentStatus::Revoked;
+        record.updated_at = now;
+        record.review_notes = request
+            .reason
+            .clone()
+            .or_else(|| record.review_notes.clone());
+        let record = record.clone();
+        if let Some(health) = state.agent_health.get_mut(agent_id) {
+            health.status = HealthStatus::Offline;
+            health.updated_at = now;
+        }
+        for submission in state.agent_submissions.values_mut() {
+            if submission.provider_id == request.provider_id && submission.agent_id == agent_id {
+                submission.status = AgentSubmissionStatus::Revoked;
+                submission.updated_at = now;
+                submission.review_notes = request.reason.clone();
+            }
+        }
+        record_unpublish_nonce(agent_id, &request, &mut state);
+        self.save_state(&state).await?;
+        Ok(record)
+    }
+
     pub async fn list_published_agents(&self) -> Result<Vec<PublishedAgentRecord>, RegistryError> {
         let mut items = self
             .load_state()
@@ -2520,12 +2583,17 @@ impl ServiceRegistry {
         &self,
         agent_id: &str,
     ) -> Result<PublishedAgentRecord, RegistryError> {
-        self.load_state()
+        let record = self
+            .load_state()
             .await?
             .published_agents
             .get(agent_id)
             .cloned()
-            .ok_or_else(|| RegistryError::PublishedAgentNotFound(agent_id.to_owned()))
+            .ok_or_else(|| RegistryError::PublishedAgentNotFound(agent_id.to_owned()))?;
+        if record.status != PublishedAgentStatus::Approved {
+            return Err(RegistryError::PublishedAgentNotFound(agent_id.to_owned()));
+        }
+        Ok(record)
     }
 
     pub async fn upsert_published_agent(
@@ -2890,6 +2958,99 @@ fn record_attestation_nonce(request: &SubmitAgentRequest, state: &mut RegistrySt
         .insert(ConsumedAttestationNonce::key(attester_did, nonce), record);
 }
 
+fn validate_unpublish_agent_request(
+    agent_id: &str,
+    request: &UnpublishAgentRequest,
+) -> Result<(), RegistryError> {
+    if agent_id.trim().is_empty() {
+        return Err(RegistryError::InvalidAgent(
+            "agent_id must not be empty".to_owned(),
+        ));
+    }
+    if request.provider_id.trim().is_empty() {
+        return Err(RegistryError::InvalidProvider(
+            "provider_id must not be empty".to_owned(),
+        ));
+    }
+    if request.provider_did.trim().is_empty() {
+        return Err(RegistryError::InvalidProvider(
+            "provider_did must not be empty".to_owned(),
+        ));
+    }
+    validate_provider_did(&request.provider_did)?;
+    if request.signature.trim().is_empty() {
+        return Err(RegistryError::InvalidAgent(
+            "signature must not be empty".to_owned(),
+        ));
+    }
+    if request.nonce.trim().is_empty() {
+        return Err(RegistryError::InvalidAgent(
+            "nonce must not be empty".to_owned(),
+        ));
+    }
+    verify_unpublish_freshness(request)
+}
+
+fn verify_unpublish_freshness(request: &UnpublishAgentRequest) -> Result<(), RegistryError> {
+    let now_ms = Utc::now().timestamp_millis();
+    let issued_at = request.issued_at_ms as i64;
+    let expires_at = request.expires_at_ms as i64;
+    if issued_at - now_ms > ATTESTATION_MAX_CLOCK_SKEW_MS {
+        return Err(RegistryError::InvalidAgent(
+            "issued_at_ms is too far in the future".to_owned(),
+        ));
+    }
+    if now_ms - issued_at > ATTESTATION_MAX_AGE_MS {
+        return Err(RegistryError::InvalidAgent(
+            "issued_at_ms is older than the maximum allowed age".to_owned(),
+        ));
+    }
+    if expires_at <= issued_at {
+        return Err(RegistryError::InvalidAgent(
+            "expires_at_ms must be greater than issued_at_ms".to_owned(),
+        ));
+    }
+    if expires_at + ATTESTATION_MAX_CLOCK_SKEW_MS < now_ms {
+        return Err(RegistryError::InvalidAgent(
+            "expires_at_ms has already passed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_unpublish_nonce_not_replayed(
+    request: &UnpublishAgentRequest,
+    state: &RegistryState,
+) -> Result<(), RegistryError> {
+    let key = ConsumedAttestationNonce::key(&request.provider_did, &request.nonce);
+    if state.consumed_attestation_nonces.contains_key(&key) {
+        return Err(RegistryError::InvalidAgent(
+            "unpublish nonce has already been used; refusing to replay".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn record_unpublish_nonce(
+    agent_id: &str,
+    request: &UnpublishAgentRequest,
+    state: &mut RegistryState,
+) {
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let record = ConsumedAttestationNonce {
+        attester_did: request.provider_did.clone(),
+        nonce: request.nonce.clone(),
+        provider_id: request.provider_id.clone(),
+        agent_id: agent_id.to_owned(),
+        consumed_at_ms: now_ms,
+        expires_at_ms: request.expires_at_ms,
+    };
+    state.consumed_attestation_nonces.insert(
+        ConsumedAttestationNonce::key(&request.provider_did, &request.nonce),
+        record,
+    );
+}
+
 fn evict_expired_attestation_nonces(state: &mut RegistryState) {
     let now_ms = Utc::now().timestamp_millis().max(0) as u64;
     let skew = ATTESTATION_MAX_CLOCK_SKEW_MS as u64;
@@ -2999,6 +3160,33 @@ fn verify_agent_attestation_signature(
         .verify(&payload, &Signature::from_bytes(&signature_bytes))
         .map_err(|_| {
             RegistryError::InvalidAgent("attestation signature verification failed".to_owned())
+        })
+}
+
+fn verify_agent_unpublish_signature(
+    agent_id: &str,
+    request: &UnpublishAgentRequest,
+) -> Result<(), RegistryError> {
+    let public_key_bytes = public_key_bytes_from_ref(&request.provider_did)?;
+    let signature_bytes = STANDARD.decode(&request.signature).map_err(|_| {
+        RegistryError::InvalidAgent("invalid unpublish signature encoding".to_owned())
+    })?;
+    let public_key_bytes: [u8; 32] = public_key_bytes.try_into().map_err(|_| {
+        RegistryError::InvalidAgent("invalid provider public key length".to_owned())
+    })?;
+    let signature_bytes: [u8; 64] = signature_bytes.try_into().map_err(|_| {
+        RegistryError::InvalidAgent("invalid unpublish signature length".to_owned())
+    })?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
+        .map_err(|_| RegistryError::InvalidAgent("invalid provider public key bytes".to_owned()))?;
+    let payload =
+        serde_jcs::to_vec(&build_agent_unpublish_payload(agent_id, request)).map_err(|error| {
+            RegistryError::InvalidAgent(format!("canonicalize unpublish payload: {error}"))
+        })?;
+    verifying_key
+        .verify(&payload, &Signature::from_bytes(&signature_bytes))
+        .map_err(|_| {
+            RegistryError::InvalidAgent("unpublish signature verification failed".to_owned())
         })
 }
 

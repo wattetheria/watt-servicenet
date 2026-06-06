@@ -20,7 +20,8 @@ use watt_servicenet_protocol::{
     GetAgentTaskRequest, InvokeAgentRequest, ModerationCaseQuery, PublishedAgentRecord,
     ReceiptQuery, RegisterAuthContextRequest, RegisterProviderRequest,
     RejectAgentSubmissionRequest, ResolveModerationCaseRequest, RevokeProviderRequest,
-    RotateProviderKeyRequest, RunVerifierSweepRequest, SubmitAgentRequest, VerifyReceiptRequest,
+    RotateProviderKeyRequest, RunVerifierSweepRequest, SubmitAgentRequest, UnpublishAgentRequest,
+    VerifyReceiptRequest,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry, ServiceRegistryConfig};
 
@@ -132,6 +133,7 @@ fn build_app(state: RouterState) -> Router {
         )
         .route("/v1/agents", get(list_agents))
         .route("/v1/agents/:agent_id", get(get_agent))
+        .route("/v1/agents/:agent_id/unpublish", post(unpublish_agent))
         .route("/v1/agents/:agent_id/invoke", post(invoke_agent))
         .route(
             "/v1/agents/:agent_id/invoke-async",
@@ -327,6 +329,19 @@ async fn get_agent(
     let agent = state
         .registry
         .get_published_agent(&agent_id)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!(agent)))
+}
+
+async fn unpublish_agent(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(request): Json<UnpublishAgentRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let agent = state
+        .registry
+        .unpublish_agent(&agent_id, request)
         .await
         .map_err(AppError::from)?;
     Ok(Json(serde_json::json!(agent)))

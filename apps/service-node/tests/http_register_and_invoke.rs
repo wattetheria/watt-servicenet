@@ -5,9 +5,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer, SigningKey};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 use watt_servicenet_node::build_local_app;
-use watt_servicenet_protocol::build_agent_attestation_payload;
+use watt_servicenet_protocol::{build_agent_attestation_payload, build_agent_unpublish_payload};
 use watt_servicenet_registry::ServiceRegistry;
 
 fn provider_signing_key() -> SigningKey {
@@ -109,6 +110,38 @@ fn valid_agent_submission_payload_for_agent(
 
 fn valid_agent_submission_payload(url_base: &str, endpoint_url: &str) -> serde_json::Value {
     valid_agent_submission_payload_for_agent("stripe-agent", url_base, endpoint_url)
+}
+
+fn valid_agent_unpublish_payload(agent_id: &str) -> serde_json::Value {
+    let signing_key = provider_signing_key();
+    let issued_at_ms: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("current millis should fit u64");
+    let mut payload = serde_json::json!({
+        "provider_id": "provider-local",
+        "provider_did": did_from_signing_key(&signing_key),
+        "signature": "",
+        "nonce": format!("unpublish-{agent_id}"),
+        "issued_at_ms": issued_at_ms,
+        "expires_at_ms": issued_at_ms.saturating_add(30 * 60 * 1000),
+        "reason": "operator requested unpublish"
+    });
+    let signature = STANDARD.encode(
+        signing_key
+            .sign(
+                &serde_jcs::to_vec(&build_agent_unpublish_payload(
+                    agent_id,
+                    &serde_json::from_value(payload.clone()).expect("unpublish should parse"),
+                ))
+                .expect("unpublish payload should canonicalize"),
+            )
+            .to_bytes(),
+    );
+    payload["signature"] = serde_json::Value::String(signature);
+    payload
 }
 
 async fn response_json(response: axum::response::Response) -> serde_json::Value {
@@ -465,6 +498,90 @@ async fn agent_submission_can_be_approved_and_published() {
 }
 
 #[tokio::test]
+async fn published_agent_can_be_unpublished_by_provider_signature() {
+    let app = build_local_app(Arc::new(ServiceRegistry::in_memory()));
+
+    let register_provider = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/providers/register")
+                .header("content-type", "application/json")
+                .body(Body::from(provider_payload().to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("provider register should succeed");
+    assert_eq!(register_provider.status(), StatusCode::CREATED);
+
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/agent-submissions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    valid_agent_submission_payload(
+                        "https://stripe-agent.example.com",
+                        "https://stripe-agent.example.com/a2a",
+                    )
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("submission should succeed");
+    assert_eq!(submit.status(), StatusCode::CREATED);
+
+    let unpublish = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/agents/stripe-agent/unpublish")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    valid_agent_unpublish_payload("stripe-agent").to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("unpublish should succeed");
+    assert_eq!(unpublish.status(), StatusCode::OK);
+    let unpublish_json = response_json(unpublish).await;
+    assert_eq!(unpublish_json["agent_id"], "stripe-agent");
+    assert_eq!(unpublish_json["status"], "revoked");
+
+    let agents = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/agents")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("agent list should succeed");
+    assert_eq!(agents.status(), StatusCode::OK);
+    let agents_json = response_json(agents).await;
+    assert_eq!(agents_json["count"], 0);
+    assert_eq!(agents_json["known_count"], 0);
+
+    let get_agent = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/agents/stripe-agent")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("agent get should respond");
+    assert_eq!(get_agent.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn agents_list_supports_limit_offset_pagination() {
     let app = build_local_app(Arc::new(ServiceRegistry::in_memory()));
 
@@ -677,8 +794,11 @@ async fn approved_agent_can_be_invoked_async_and_polled_by_receipt() {
 
     assert_eq!(receipt_json["receipt"]["status"], "succeeded");
     assert!(receipt_json["receipt"]["completed_at"].is_string());
-    assert_eq!(receipt_json["output"]["task_id"], "task-1");
-    assert_eq!(receipt_json["output"]["status"], "TASK_STATE_WORKING");
+    assert_eq!(receipt_json["output"]["result"]["task"]["id"], "task-1");
+    assert_eq!(
+        receipt_json["output"]["result"]["task"]["status"]["state"],
+        "TASK_STATE_WORKING"
+    );
 }
 
 #[tokio::test]

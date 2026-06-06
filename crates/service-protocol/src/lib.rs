@@ -572,6 +572,31 @@ pub struct RejectAgentSubmissionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnpublishAgentRequest {
+    pub provider_id: String,
+    pub provider_did: String,
+    pub signature: String,
+    pub nonce: String,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub fn build_agent_unpublish_payload(agent_id: &str, request: &UnpublishAgentRequest) -> Value {
+    json!({
+        "action": "unpublish_agent",
+        "provider_id": request.provider_id,
+        "provider_did": request.provider_did,
+        "agent_id": agent_id,
+        "nonce": request.nonce,
+        "issued_at_ms": request.issued_at_ms,
+        "expires_at_ms": request.expires_at_ms,
+        "reason": request.reason,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublishedAgentRecord {
     pub agent_id: String,
     pub provider_id: String,
