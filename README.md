@@ -1,79 +1,123 @@
 # watt-servicenet
 
-Decentralized agent registry and execution gateway for agent networks.
+Decentralized agent registry and execution gateway for Watt agent networks.
 
-## What This Repository Contains
+`watt-servicenet` provides the first ServiceNet node implementation: provider
+registration, A2A agent submission and publishing, invocation receipts,
+governance records, and optional Iroh-backed P2P registry sync.
 
-This repository starts the first `registry + gateway` implementation.
+Full product documentation and API reference live at
+[Watt ServiceNet Docs](https://hs-df36fa00.mintlify.app/).
 
-Current MVP scope:
+## Architecture
 
-- agent-native protocol, submission, publish, and invocation records
-- independent provider records with revoke support
-- in-memory provider, submission, and published-agent registry state
-- optional JSON file-backed registry persistence
-- PostgreSQL-backed registry, receipts, health, trust, auth-context, and audit persistence
-- signed provider ownership challenge support for provider register and key rotation
-- encrypted auth-context secret broker storage
-- automated verifier sweep plus manual adjudication records
-- moderation case workflow for provider and agent review
-- HTTP gateway for agent invocation
-- A2A JSON-RPC adapter
-- execution receipts with request/result digests
-- Iroh-backed provider and published-agent gossip/backfill via the shared
-  `wattswarm-network-substrate` transport (no libp2p / no multiaddr;
-  endpoints are iroh `EndpointId`s with QUIC hole-punching + relay fallback)
+```mermaid
+flowchart TB
+    provider["Agent provider<br/>DID ownership + attestation"]
+    client["Agent consumer<br/>HTTP invocation client"]
+    remote["Published A2A agent<br/>JSON-RPC endpoint"]
+    peer["ServiceNet peer node"]
 
-This first version is still local-first in storage and policy, but it now includes an initial
-P2P provider and published-agent sync layer built on the shared `network-substrate`.
+    subgraph node["watt-servicenet-node"]
+        api["Node interface<br/>providers, submissions, agents, receipts"]
+        registry["Service registry<br/>providers, submissions, published agents"]
+        gateway["Execution gateway<br/>policy preflight + A2A adapter"]
+        governance["Trust, health, moderation<br/>verification + audit records"]
+        auth["Auth-context broker<br/>encrypted secret references"]
+        p2p["Iroh P2P sync<br/>gossip + backfill"]
+    end
 
-## Direction
+    subgraph storage["Persistence options"]
+        memory["In-memory"]
+        file["JSON registry file"]
+        postgres["PostgreSQL<br/>registry, receipts, trust, audit"]
+    end
 
-The public and internal model in this repository is now agent-native:
+    provider -->|register provider / submit agent| api
+    client -->|invoke agent / query receipts| api
+    api --> registry
+    api --> gateway
+    api --> governance
+    api --> auth
+    registry --> storage
+    gateway -->|A2A JSON-RPC| remote
+    gateway -->|receipt| governance
+    auth --> postgres
+    governance --> postgres
+    registry <--> p2p
+    p2p <--> peer
+```
 
-- public discovery and interaction standard: A2A
-- developer review payload: `AgentSubmission`
-- network-published identity: approved A2A agent
+## Run Locally
 
-## Workspace Layout
-
-- `crates/service-protocol`: canonical agent, provider, moderation, and receipt types
-- `crates/service-registry`: provider registry, agent submission store, and published-agent state
-- `crates/service-gateway`: agent policy preflight and A2A execution adapter
-- `crates/service-network-p2p`: servicenet-specific Iroh overlay over shared substrate
-- `apps/service-node`: HTTP node exposing registry and gateway APIs
-
-## HTTP API
-
-Run the node:
+Run with in-memory state:
 
 ```bash
 cargo run -p watt-servicenet-node
 ```
 
-Run the node with file-backed persistence:
+Run with file-backed state:
 
 ```bash
-SERVICENET_REGISTRY_FILE=.data/registry.json cargo run -p watt-servicenet-node
+SERVICENET_REGISTRY_FILE=.data/registry.json \
+cargo run -p watt-servicenet-node
 ```
 
-Run the node with PostgreSQL-backed persistence:
+Run with PostgreSQL-backed state:
 
 ```bash
 SERVICENET_DATABASE_URL=postgres://servicenet:servicenet@127.0.0.1:55433/watt-servicenet \
 SERVICENET_DATABASE_SCHEMA=public \
-SERVICENET_REQUIRE_PROVIDER_OWNERSHIP_CHALLENGES=1 \
 SERVICENET_SECRET_BROKER_KEY=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc= \
+SERVICENET_REQUIRE_PROVIDER_OWNERSHIP_CHALLENGES=1 \
 cargo run -p watt-servicenet-node
 ```
 
-Run with Docker Compose:
+The HTTP node listens on `127.0.0.1:8042` by default. Override it with
+`SERVICENET_HTTP_ADDR`.
+
+## Docker
 
 ```bash
 docker compose up --build
 ```
 
-Run the node with iroh-backed P2P registry sync enabled:
+Docker Compose starts PostgreSQL and `watt-servicenet-node`, with the API on
+`127.0.0.1:8042` and PostgreSQL on `127.0.0.1:55433`.
+
+The Rust workspace keeps local path dependencies for development. During Docker
+builds, the `Dockerfile` rewrites those path dependencies to git dependencies so
+release builds can run outside the local Watt source tree. Private dependency
+access uses the BuildKit secret `github_token`, backed by the `GITHUB_TOKEN`
+environment variable:
+
+```bash
+export GITHUB_TOKEN=<token>
+docker compose up --build
+```
+
+Use these build args to pin dependency sources when needed:
+
+- `WATTSWARM_REPO`, `WATTSWARM_REF`
+- `WATT_DID_REPO`, `WATT_DID_REF`
+- `WATT_WALLET_REPO`, `WATT_WALLET_REF`
+
+## Core Configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `SERVICENET_HTTP_ADDR` | HTTP bind address. |
+| `SERVICENET_REGISTRY_FILE` | JSON file-backed registry path. |
+| `SERVICENET_DATABASE_URL` | Enables PostgreSQL-backed registry state. |
+| `SERVICENET_DATABASE_SCHEMA` | PostgreSQL schema, defaults to `public`. |
+| `SERVICENET_SECRET_BROKER_KEY` | Required for database-backed encrypted auth-context storage. |
+| `SERVICENET_REQUIRE_PROVIDER_OWNERSHIP_CHALLENGES` | Requires signed provider ownership challenges. |
+| `SERVICENET_REQUIRE_ADMIN_APPROVE` | Keeps submissions admin-gated instead of auto-publishing valid submissions. |
+| `SERVICENET_GATEWAY_MAX_COST_UNITS` | Default gateway cost guardrail. |
+
+## P2P Sync
+
+Enable Iroh-backed provider and published-agent sync:
 
 ```bash
 SERVICENET_P2P_ENABLED=1 \
@@ -82,307 +126,43 @@ SERVICENET_P2P_LISTEN_ADDRS=0.0.0.0:4101 \
 cargo run -p watt-servicenet-node
 ```
 
-Each node prints its iroh `EndpointId` on startup (also persisted in
-`SERVICENET_P2P_STATE_DIR/node_seed.hex`). Use that endpoint id to join an
-existing peer — bootstrap peers are written as `<endpoint_id>@<addr>`,
-not as libp2p multiaddrs:
+Each node prints and persists its Iroh `EndpointId` in
+`SERVICENET_P2P_STATE_DIR/node_seed.hex`. Bootstrap peers use
+`<endpoint-id>@<addr>` format:
 
 ```bash
 SERVICENET_P2P_ENABLED=1 \
 SERVICENET_P2P_NETWORK_ID=devnet \
-SERVICENET_P2P_LISTEN_ADDRS=0.0.0.0:4102 \
 SERVICENET_P2P_BOOTSTRAP_PEERS=<peer-endpoint-id>@127.0.0.1:4101 \
 cargo run -p watt-servicenet-node
 ```
 
-Nodes can also be reached through iroh's public relay network when direct
-QUIC connectivity is unavailable; that requires no extra configuration.
+Set `SERVICENET_FEDERATION_MODE=trusted` and
+`SERVICENET_FEDERATION_TRUSTED_PEERS=<endpoint-id-1>,<endpoint-id-2>` for curated
+entry nodes that should only merge records from trusted peers. The default mode
+is open federation.
 
-Federation trust policy:
-
-- `SERVICENET_FEDERATION_MODE=open` keeps the current decentralized behavior:
-  any connected P2P peer can contribute provider and published-agent records
-  that pass local registry validation.
-- `SERVICENET_FEDERATION_MODE=trusted` restricts P2P registry merge and
-  backfill exchange to peers listed in `SERVICENET_FEDERATION_TRUSTED_PEERS`.
-
-Official or curated ServiceNet entry nodes should run in trusted mode:
+## Development
 
 ```bash
-SERVICENET_P2P_ENABLED=1 \
-SERVICENET_FEDERATION_MODE=trusted \
-SERVICENET_FEDERATION_TRUSTED_PEERS=<peer-endpoint-id-1>,<peer-endpoint-id-2> \
-cargo run -p watt-servicenet-node
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test
 ```
 
-Current P2P behavior:
-
-- publish newly registered provider records over gossip
-- publish newly approved agents over gossip
-- subscribe to global servicenet provider and published-agent announcements
-- request provider and published-agent backfill from newly connected peers
-- merge inbound provider records and published agents into the local registry store
-- in trusted federation mode, only configured peers are accepted for inbound
-  gossip/backfill and outbound backfill responses
-- support two-node PostgreSQL convergence tests for backfill + gossip persistence
-
-Current submission behavior:
-
-- provider registration and key rotation can require ownership challenges
-- agent submissions must include an A2A-compatible card and a signed provider
-  attestation
-- by default, submissions whose signatures, binding proofs, smoke-tests, and
-  schema all pass are auto-approved and published immediately
-  (set `SERVICENET_REQUIRE_ADMIN_APPROVE=1` to keep the legacy admin-gated flow)
-- only approved records are published over the shared network
-
-Current provider behavior:
-
-- provider records are registered independently from agent submissions
-- provider registration and key rotation can require signed ownership challenges
-- approved agents require an existing non-revoked provider
-- provider key rotation is supported via the HTTP API
-- revoked or blocked providers remain auditable but cannot be invoked
-
-Current execution and policy behavior:
-
-- receipts are persisted and queryable by `provider_id` or `agent_id`
-- provider and agent health records are exposed over the public API
-- provider and agent trust records include blocklist support
-- agent review profiles carry risk and region policy metadata
-- auth can be provided directly or via stored auth-context references
-- auth-context secrets are encrypted at rest and only exposed as masked previews
-- receipt verification supports automated sweeps and manual adjudication
-- moderation cases can block providers or agents and then be resolved
-
-## Docker
-
-This repository currently depends on the shared local crate
-`../wattswarm/crates/network-substrate`, so container builds use the parent `Watt` directory as
-the Docker build context.
-
-- `Dockerfile`: multi-stage build for `watt-servicenet-node`
-- `docker-compose.yml`: local runtime with PostgreSQL + `watt-servicenet-node`
-- `.dockerignore`: excludes local build and OS junk from repo-local Docker workflows
-- PostgreSQL is exposed on `127.0.0.1:55433`
-- database-backed runs now require `SERVICENET_SECRET_BROKER_KEY`
-
-Run PostgreSQL-backed integration tests locally:
+PostgreSQL integration tests use `SERVICENET_TEST_DATABASE_URL`:
 
 ```bash
-SERVICENET_TEST_DATABASE_URL=postgres://servicenet:servicenet@127.0.0.1:55433/servicenet cargo test
+SERVICENET_TEST_DATABASE_URL=postgres://servicenet:servicenet@127.0.0.1:55433/watt-servicenet \
+cargo test
 ```
 
-Register a provider:
+For Docker configuration checks:
 
 ```bash
-curl -X POST http://127.0.0.1:8042/v1/providers/ownership-challenges \
-  -H 'content-type: application/json' \
-  -d '{
-    "provider_did": "did:key:z6MkhaXgBZDvotD1X9gRrYkM5Xq9jYQqK6d8r8bQdE1mV2Xa",
-    "operation": "register"
-  }'
+docker compose config
 ```
 
-Register a provider after signing the challenge:
+## Star History
 
-```bash
-curl -X POST http://127.0.0.1:8042/v1/providers/register \
-  -H 'content-type: application/json' \
-  -d '{
-    "provider_id": "<PROVIDER_ID_FROM_CHALLENGE>",
-    "provider_did": "did:key:z6MkhaXgBZDvotD1X9gRrYkM5Xq9jYQqK6d8r8bQdE1mV2Xa",
-    "display_name": "Provider Local",
-    "ownership_challenge_id": "<CHALLENGE_ID>",
-    "ownership_signature": "<BASE64_ED25519_SIGNATURE>"
-  }'
-```
-
-Submit an agent for review:
-
-```bash
-curl -X POST http://127.0.0.1:8042/v1/agent-submissions \
-  -H 'content-type: application/json' \
-  -d '{
-    "provider_id": "provider-local",
-    "agent_id": "stripe-agent",
-    "version": "0.1.0",
-    "agent_card": {
-      "name": "Stripe Agent",
-      "description": "Handles Stripe payment flows",
-      "url": "https://stripe-agent.example.com",
-      "preferredTransport": "JSONRPC",
-      "protocolVersion": "1.0",
-      "supportsTask": false,
-      "skills": [
-        {
-          "id": "payments.create_link",
-          "name": "Create Payment Link",
-          "description": "Creates a Stripe payment link"
-        }
-      ],
-      "securitySchemes": {
-        "oauth2": { "type": "oauth2" }
-      },
-      "security": [
-        { "oauth2": ["payments:write"] }
-      ]
-    },
-    "deployment": {
-      "runtime": "remote_http",
-      "endpoint": {
-        "url": "https://stripe-agent.example.com/a2a",
-        "protocol_binding": "JSONRPC",
-        "protocol_version": "1.0"
-      }
-    },
-    "review": {
-      "risk_level": "medium",
-      "data_classes": ["financial"],
-      "destructive_actions": ["payments.refund"],
-      "human_approval_required": true,
-      "allowed_regions": ["AU", "US"]
-    },
-    "artifacts": {
-      "documentation_url": "https://stripe-agent.example.com/docs",
-      "security_url": "https://stripe-agent.example.com/security"
-    },
-    "attestations": {
-      "attestation_signature": "<ATTESTATION_SIGNATURE>",
-      "source_commit": "<COMMIT_SHA>",
-      "build_digest": "<BUILD_DIGEST>"
-    }
-  }'
-```
-
-Approve a submitted agent:
-
-```bash
-curl -X POST http://127.0.0.1:8042/v1/admin/agent-submissions/<SUBMISSION_ID>/approve \
-  -H 'content-type: application/json' \
-  -d '{
-    "reviewed_by": "moderator-local",
-    "review_notes": "approved"
-  }'
-```
-
-Invoke an approved A2A agent:
-
-```bash
-curl -X POST http://127.0.0.1:8042/v1/agents/stripe-agent/invoke \
-  -H 'content-type: application/json' \
-  -d '{
-    "message": "Create a payment link for 15 AUD",
-    "input": {
-      "amount": 15,
-      "currency": "AUD"
-    },
-    "auth_token": "secret-token",
-    "region": "AU"
-  }'
-```
-
-Submit an invocation for ServiceNet receipt polling:
-
-```bash
-curl -X POST http://127.0.0.1:8042/v1/agents/stripe-agent/invoke-async \
-  -H 'content-type: application/json' \
-  -d '{
-    "message": "Create a payment link for 15 AUD",
-    "auth_token": "secret-token",
-    "region": "AU"
-  }'
-```
-
-Poll an A2A task:
-
-```bash
-curl -X POST http://127.0.0.1:8042/v1/agents/stripe-agent/tasks/<TASK_ID>/get \
-  -H 'content-type: application/json' \
-  -d '{
-    "history_length": 10,
-    "auth_token": "secret-token"
-  }'
-```
-
-Register an auth context:
-
-```bash
-curl -X POST http://127.0.0.1:8042/v1/auth-contexts/register \
-  -H 'content-type: application/json' \
-  -d '{
-    "subject_did": "did:key:z6MkhaXgBZDvotD1X9gRrYkM5Xq9jYQqK6d8r8bQdE1mV2Xa",
-    "provider_id": "provider-local",
-    "auth_model": { "mode": "bearer_token" },
-    "token": "secret-token"
-  }'
-```
-
-Run the automated verifier sweep:
-
-```bash
-curl -X POST http://127.0.0.1:8042/v1/verifier/run \
-  -H 'content-type: application/json' \
-  -d '{
-    "verifier_id": "auto-verifier"
-  }'
-```
-
-List verification records for a receipt:
-
-```bash
-curl http://127.0.0.1:8042/v1/receipts/<RECEIPT_ID>/verifications
-```
-
-Query receipts:
-
-```bash
-curl http://127.0.0.1:8042/v1/receipts?provider_id=provider-local
-curl http://127.0.0.1:8042/v1/receipts/<RECEIPT_ID>
-```
-
-Verify a receipt:
-
-```bash
-curl -X POST http://127.0.0.1:8042/v1/receipts/<RECEIPT_ID>/verify \
-  -H 'content-type: application/json' \
-  -d '{
-    "verifier_id": "verifier-local",
-    "verdict": "verified"
-  }'
-```
-
-Inspect agent trust:
-
-```bash
-curl http://127.0.0.1:8042/v1/trust/agents
-```
-
-Inspect agent health:
-
-```bash
-curl http://127.0.0.1:8042/v1/health/agents
-```
-
-Block an agent:
-
-```bash
-curl -X POST http://127.0.0.1:8042/v1/admin/agents/stripe-agent/block \
-  -H 'content-type: application/json' \
-  -d '{ "reason": "manual review" }'
-```
-
-Create an agent moderation case:
-
-```bash
-curl -X POST http://127.0.0.1:8042/v1/admin/moderation/cases \
-  -H 'content-type: application/json' \
-  -d '{
-    "target_kind": "agent",
-    "target_id": "stripe-agent",
-    "created_by": "moderator-a",
-    "reason": "manual review",
-    "auto_block": true,
-    "auto_revoke_provider": false
-  }'
-```
+[![Star History Chart](https://api.star-history.com/svg?repos=wattetheria/wattetheria&type=Date)](https://www.star-history.com/#wattetheria/wattetheria&Date)
