@@ -165,4 +165,4 @@ docker compose config
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=wattetheria/wattetheria&type=Date)](https://www.star-history.com/#wattetheria/wattetheria&Date)
+[![Star History Chart](https://api.star-history.com/image?repos=wattetheria/watt-servicenet&type=Date)](https://star-history.com/#wattetheria/watt-servicenet&Date)
