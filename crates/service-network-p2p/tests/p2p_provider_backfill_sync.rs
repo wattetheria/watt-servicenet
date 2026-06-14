@@ -35,7 +35,16 @@ fn revoked_provider() -> ProviderRecord {
     }
 }
 
+fn enable_test_direct_addr_publishing() {
+    static DIRECT_ADDR_PUBLISHING: OnceLock<()> = OnceLock::new();
+    DIRECT_ADDR_PUBLISHING.get_or_init(|| unsafe {
+        env::set_var("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", "true");
+    });
+}
+
 fn test_config(network_id: &str) -> ServiceNetworkP2pConfig {
+    enable_test_direct_addr_publishing();
+
     let mut config = ServiceNetworkP2pConfig {
         state_dir: temp_state_dir("provider-backfill"),
         listen_addrs: vec!["127.0.0.1:0".to_owned()],

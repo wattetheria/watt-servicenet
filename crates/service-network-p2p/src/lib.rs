@@ -104,14 +104,22 @@ impl ServiceNetworkP2pConfig {
     }
 
     fn as_substrate(&self) -> SubstrateConfig {
+        let defaults = SubstrateConfig::default();
+
         SubstrateConfig {
             namespace: self.namespace.clone(),
             protocol_version: self.protocol_version.clone(),
             listen_addrs: self.listen_addrs.clone(),
             bootstrap_peers: self.bootstrap_peers.clone(),
+            max_established_per_peer: defaults.max_established_per_peer,
+            gossip_mesh_d: defaults.gossip_mesh_d,
+            gossip_mesh_d_low: defaults.gossip_mesh_d_low,
+            gossip_mesh_d_high: defaults.gossip_mesh_d_high,
+            gossip_mesh_heartbeat_ms: defaults.gossip_mesh_heartbeat_ms,
+            gossip_mesh_max_transmit_size: defaults.gossip_mesh_max_transmit_size,
             max_backfill_events: self.max_backfill_events,
             max_backfill_events_hard_limit: self.max_backfill_events_hard_limit,
-            control_request_timeout_ms: SubstrateConfig::default().control_request_timeout_ms,
+            control_request_timeout_ms: defaults.control_request_timeout_ms,
         }
     }
 
@@ -697,16 +705,26 @@ mod tests {
         dir
     }
 
+    fn test_p2p_config(prefix: &str) -> ServiceNetworkP2pConfig {
+        static DIRECT_ADDR_PUBLISHING: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        DIRECT_ADDR_PUBLISHING.get_or_init(|| unsafe {
+            std::env::set_var("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", "true");
+        });
+
+        ServiceNetworkP2pConfig {
+            state_dir: temp_state_dir(prefix),
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
+            ..ServiceNetworkP2pConfig::default()
+        }
+    }
+
     /// Produce a NetworkNodeId for tests by deriving a real iroh endpoint id
     /// from a deterministic seed. Plain strings no longer parse: substrate
     /// requires a valid base32 iroh endpoint id (see `parse_iroh_endpoint_id_string`).
     fn random_network_node_id() -> NetworkNodeId {
         let runtime = ServiceNetworkRuntime::new(
-            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
-                state_dir: temp_state_dir("random-node-id"),
-                ..ServiceNetworkP2pConfig::default()
-            })
-            .expect("node should start"),
+            ServiceNetworkNode::generate(test_p2p_config("random-node-id"))
+                .expect("node should start"),
         )
         .expect("runtime should start");
         runtime.local_peer_id()
@@ -760,19 +778,13 @@ mod tests {
     async fn published_agent_gossip_round_trip_from_substrate_event() {
         let record = demo_published_agent();
         let sender_runtime = ServiceNetworkRuntime::new(
-            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
-                state_dir: temp_state_dir("mapping-sender"),
-                ..ServiceNetworkP2pConfig::default()
-            })
-            .expect("node should start"),
+            ServiceNetworkNode::generate(test_p2p_config("mapping-sender"))
+                .expect("node should start"),
         )
         .expect("sender runtime should start");
         let mut receiver_runtime = ServiceNetworkRuntime::new(
-            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
-                state_dir: temp_state_dir("mapping-receiver"),
-                ..ServiceNetworkP2pConfig::default()
-            })
-            .expect("receiver node should start"),
+            ServiceNetworkNode::generate(test_p2p_config("mapping-receiver"))
+                .expect("receiver node should start"),
         )
         .expect("receiver runtime should start");
         let envelope = sender_runtime
@@ -807,11 +819,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ignores_unrelated_feed_key() {
         let mut runtime = ServiceNetworkRuntime::new(
-            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
-                state_dir: temp_state_dir("ignore-feed"),
-                ..ServiceNetworkP2pConfig::default()
-            })
-            .expect("node should start"),
+            ServiceNetworkNode::generate(test_p2p_config("ignore-feed"))
+                .expect("node should start"),
         )
         .expect("runtime should start");
         let event = SubstrateRuntimeEvent::Gossip {
@@ -831,11 +840,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exported_contact_material_advertises_iroh_direct_capability() {
         let runtime = ServiceNetworkRuntime::new(
-            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
-                state_dir: temp_state_dir("contact-material"),
-                ..ServiceNetworkP2pConfig::default()
-            })
-            .expect("node should start"),
+            ServiceNetworkNode::generate(test_p2p_config("contact-material"))
+                .expect("node should start"),
         )
         .expect("runtime should start");
 
@@ -857,11 +863,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transport_router_prefers_iroh_for_large_backfill_when_remote_supports_it() {
         let runtime = ServiceNetworkRuntime::new(
-            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
-                state_dir: temp_state_dir("backfill-route"),
-                ..ServiceNetworkP2pConfig::default()
-            })
-            .expect("node should start"),
+            ServiceNetworkNode::generate(test_p2p_config("backfill-route"))
+                .expect("node should start"),
         )
         .expect("runtime should start");
 
@@ -880,11 +883,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transport_router_keeps_control_messages_on_iroh_control() {
         let runtime = ServiceNetworkRuntime::new(
-            ServiceNetworkNode::generate(ServiceNetworkP2pConfig {
-                state_dir: temp_state_dir("control-route"),
-                ..ServiceNetworkP2pConfig::default()
-            })
-            .expect("node should start"),
+            ServiceNetworkNode::generate(test_p2p_config("control-route"))
+                .expect("node should start"),
         )
         .expect("runtime should start");
 
