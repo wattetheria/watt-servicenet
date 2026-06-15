@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use watt_servicenet_protocol::{ProviderRecord, PublishedAgentRecord};
+use watt_servicenet_protocol::{
+    ProviderRecord, ProviderStatus, PublishedAgentRecord, PublishedAgentStatus,
+};
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_substrate::{
-    BackfillRequestId, BackfillResponseChannel, GossipKind, NetworkNodeId,
-    NetworkRuntimeObservabilitySnapshot, RawBackfillRequest, RawBackfillResponse, RawGossipMessage,
-    SubstrateConfig, SubstrateNode, SubstrateRuntime, SubstrateRuntimeEvent, SwarmScope,
-    TopicNamespace,
+    BackfillRequestId, BackfillResponseChannel, GossipKind, NetworkRuntimeObservabilitySnapshot,
+    RawBackfillRequest, RawBackfillResponse, RawGossipMessage, SubstrateConfig, SubstrateNode,
+    SubstrateRuntime, SubstrateRuntimeEvent, SwarmScope, TopicNamespace,
 };
 use wattswarm_network_transport_core::{
     DirectDataFetchRequest, DirectDataObjectKind, PeerTransportCapabilities, TransferIntent,
@@ -21,7 +22,7 @@ use wattswarm_network_transport_iroh::{
     shutdown_local_iroh_data_plane,
 };
 
-pub use wattswarm_network_substrate::NetworkAddress;
+pub use wattswarm_network_substrate::{NetworkAddress, NetworkNodeId};
 pub use wattswarm_network_transport_core::{
     PeerTransportCapabilities as ServiceNetworkTransportCapabilities,
     TransferIntent as ServiceNetworkTransferIntent, TransferKind as ServiceNetworkTransferKind,
@@ -52,12 +53,29 @@ pub struct ServiceNetworkContentEnvelope {
     pub transport_contact_material: Option<TransportContactMaterial>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceNetworkRecordSummary {
+    pub record_id: String,
+    pub status: String,
+    pub version_ms: u64,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceNetworkSyncManifest {
+    pub generated_at_ms: u64,
+    pub producer: String,
+    pub providers: Vec<ServiceNetworkRecordSummary>,
+    pub published_agents: Vec<ServiceNetworkRecordSummary>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum ServiceNetworkMessage {
     ProviderPublished(ServiceNetworkContentEnvelope),
     PublishedAgentRecordPublished(ServiceNetworkContentEnvelope),
+    SyncManifestPublished(ServiceNetworkContentEnvelope),
 }
 
 impl ServiceNetworkMessage {
@@ -172,23 +190,31 @@ pub enum ServiceNetworkRuntimeEvent {
     },
     ProviderSyncRequest {
         peer: NetworkNodeId,
+        from_event_seq: u64,
         limit: usize,
         channel: BackfillResponseChannel,
     },
     ProviderSyncResponse {
         peer: NetworkNodeId,
         request_id: BackfillRequestId,
+        next_from_event_seq: u64,
         providers: Vec<ProviderRecord>,
     },
     PublishedAgentSyncRequest {
         peer: NetworkNodeId,
+        from_event_seq: u64,
         limit: usize,
         channel: BackfillResponseChannel,
     },
     PublishedAgentSyncResponse {
         peer: NetworkNodeId,
         request_id: BackfillRequestId,
+        next_from_event_seq: u64,
         records: Vec<PublishedAgentRecord>,
+    },
+    SyncManifestPublished {
+        peer: NetworkNodeId,
+        manifest: ServiceNetworkSyncManifest,
     },
 }
 
@@ -268,6 +294,39 @@ impl ServiceNetworkRuntime {
         )
     }
 
+    pub fn build_sync_manifest(
+        &self,
+        providers: &[ProviderRecord],
+        records: &[PublishedAgentRecord],
+    ) -> Result<ServiceNetworkSyncManifest> {
+        let mut provider_summaries = providers
+            .iter()
+            .map(provider_record_summary)
+            .collect::<Result<Vec<_>>>()?;
+        provider_summaries.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+        let mut published_agent_summaries = records
+            .iter()
+            .map(published_agent_record_summary)
+            .collect::<Result<Vec<_>>>()?;
+        published_agent_summaries.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+        Ok(ServiceNetworkSyncManifest {
+            generated_at_ms: now_ms(),
+            producer: self.local_peer_id().to_string(),
+            providers: provider_summaries,
+            published_agents: published_agent_summaries,
+        })
+    }
+
+    pub fn publish_sync_manifest(&mut self, manifest: &ServiceNetworkSyncManifest) -> Result<()> {
+        let envelope = self.materialize_record_envelope(manifest)?;
+        let message = ServiceNetworkMessage::SyncManifestPublished(envelope);
+        self.inner.publish(
+            &SwarmScope::Global,
+            GossipKind::Rules,
+            &message.encode_json()?,
+        )
+    }
+
     pub fn allows_outbound_backfill_to(&self, peer: &NetworkNodeId) -> bool {
         self.inner.allows_outbound_backfill_to(peer)
     }
@@ -277,11 +336,20 @@ impl ServiceNetworkRuntime {
         peer: &NetworkNodeId,
         limit: usize,
     ) -> Result<BackfillRequestId> {
+        self.send_provider_sync_request_from(peer, 0, limit)
+    }
+
+    pub fn send_provider_sync_request_from(
+        &mut self,
+        peer: &NetworkNodeId,
+        from_event_seq: u64,
+        limit: usize,
+    ) -> Result<BackfillRequestId> {
         self.inner.send_backfill_request(
             peer,
             RawBackfillRequest {
                 scope: SwarmScope::Global,
-                from_event_seq: 0,
+                from_event_seq,
                 limit,
                 feed_key: Some(PROVIDER_FEED_KEY.to_owned()),
                 known_event_ids: Vec::new(),
@@ -292,6 +360,15 @@ impl ServiceNetworkRuntime {
     pub fn send_provider_sync_response(
         &mut self,
         channel: BackfillResponseChannel,
+        providers: &[ProviderRecord],
+    ) -> Result<()> {
+        self.send_provider_sync_response_from(channel, 0, providers)
+    }
+
+    pub fn send_provider_sync_response_from(
+        &mut self,
+        channel: BackfillResponseChannel,
+        from_event_seq: u64,
         providers: &[ProviderRecord],
     ) -> Result<()> {
         let items = providers
@@ -305,7 +382,7 @@ impl ServiceNetworkRuntime {
             channel,
             RawBackfillResponse {
                 scope: SwarmScope::Global,
-                next_from_event_seq: providers.len() as u64,
+                next_from_event_seq: from_event_seq.saturating_add(providers.len() as u64),
                 feed_key: Some(PROVIDER_FEED_KEY.to_owned()),
                 head_event_ids: Vec::new(),
                 items,
@@ -318,11 +395,20 @@ impl ServiceNetworkRuntime {
         peer: &NetworkNodeId,
         limit: usize,
     ) -> Result<BackfillRequestId> {
+        self.send_published_agent_sync_request_from(peer, 0, limit)
+    }
+
+    pub fn send_published_agent_sync_request_from(
+        &mut self,
+        peer: &NetworkNodeId,
+        from_event_seq: u64,
+        limit: usize,
+    ) -> Result<BackfillRequestId> {
         self.inner.send_backfill_request(
             peer,
             RawBackfillRequest {
                 scope: SwarmScope::Global,
-                from_event_seq: 0,
+                from_event_seq,
                 limit,
                 feed_key: Some(PUBLISHED_AGENT_FEED_KEY.to_owned()),
                 known_event_ids: Vec::new(),
@@ -333,6 +419,15 @@ impl ServiceNetworkRuntime {
     pub fn send_published_agent_sync_response(
         &mut self,
         channel: BackfillResponseChannel,
+        records: &[PublishedAgentRecord],
+    ) -> Result<()> {
+        self.send_published_agent_sync_response_from(channel, 0, records)
+    }
+
+    pub fn send_published_agent_sync_response_from(
+        &mut self,
+        channel: BackfillResponseChannel,
+        from_event_seq: u64,
         records: &[PublishedAgentRecord],
     ) -> Result<()> {
         let items = records
@@ -346,7 +441,7 @@ impl ServiceNetworkRuntime {
             channel,
             RawBackfillResponse {
                 scope: SwarmScope::Global,
-                next_from_event_seq: records.len() as u64,
+                next_from_event_seq: from_event_seq.saturating_add(records.len() as u64),
                 feed_key: Some(PUBLISHED_AGENT_FEED_KEY.to_owned()),
                 head_event_ids: Vec::new(),
                 items,
@@ -409,6 +504,16 @@ impl ServiceNetworkRuntime {
                         record,
                     })
                 }
+                ServiceNetworkMessage::SyncManifestPublished(envelope) => {
+                    let manifest = self.hydrate_remote_record::<ServiceNetworkSyncManifest>(
+                        &propagation_source,
+                        envelope,
+                    )?;
+                    Some(ServiceNetworkRuntimeEvent::SyncManifestPublished {
+                        peer: propagation_source,
+                        manifest,
+                    })
+                }
             },
             SubstrateRuntimeEvent::BackfillRequest {
                 peer,
@@ -419,6 +524,7 @@ impl ServiceNetworkRuntime {
             {
                 Some(ServiceNetworkRuntimeEvent::ProviderSyncRequest {
                     peer,
+                    from_event_seq: request.from_event_seq,
                     limit: request.limit,
                     channel,
                 })
@@ -432,6 +538,7 @@ impl ServiceNetworkRuntime {
             {
                 Some(ServiceNetworkRuntimeEvent::PublishedAgentSyncRequest {
                     peer,
+                    from_event_seq: request.from_event_seq,
                     limit: request.limit,
                     channel,
                 })
@@ -455,6 +562,7 @@ impl ServiceNetworkRuntime {
                 Some(ServiceNetworkRuntimeEvent::ProviderSyncResponse {
                     peer,
                     request_id,
+                    next_from_event_seq: response.next_from_event_seq,
                     providers,
                 })
             }
@@ -477,6 +585,7 @@ impl ServiceNetworkRuntime {
                 Some(ServiceNetworkRuntimeEvent::PublishedAgentSyncResponse {
                     peer,
                     request_id,
+                    next_from_event_seq: response.next_from_event_seq,
                     records,
                 })
             }
@@ -612,6 +721,53 @@ fn open_local_artifact_store(state_dir: &Path) -> Result<ArtifactStore> {
 
 fn content_artifact_uri(digest: &str) -> String {
     format!("artifact://reference/{digest}")
+}
+
+pub fn provider_record_summary(provider: &ProviderRecord) -> Result<ServiceNetworkRecordSummary> {
+    Ok(ServiceNetworkRecordSummary {
+        record_id: provider.provider_id.clone(),
+        status: provider_status_label(&provider.status).to_owned(),
+        version_ms: datetime_ms(provider.revoked_at.unwrap_or(provider.registered_at)),
+        digest: record_digest(provider)?,
+    })
+}
+
+pub fn published_agent_record_summary(
+    record: &PublishedAgentRecord,
+) -> Result<ServiceNetworkRecordSummary> {
+    Ok(ServiceNetworkRecordSummary {
+        record_id: record.agent_id.clone(),
+        status: published_agent_status_label(&record.status).to_owned(),
+        version_ms: datetime_ms(record.updated_at),
+        digest: record_digest(record)?,
+    })
+}
+
+pub fn record_digest<T>(content: &T) -> Result<String>
+where
+    T: Serialize,
+{
+    let bytes = serde_json::to_vec(content)?;
+    Ok(format!("sha256:{}", wattswarm_crypto::sha256_hex(&bytes)))
+}
+
+fn provider_status_label(status: &ProviderStatus) -> &'static str {
+    match status {
+        ProviderStatus::Active => "active",
+        ProviderStatus::Revoked => "revoked",
+    }
+}
+
+fn published_agent_status_label(status: &PublishedAgentStatus) -> &'static str {
+    match status {
+        PublishedAgentStatus::Approved => "approved",
+        PublishedAgentStatus::Suspended => "suspended",
+        PublishedAgentStatus::Revoked => "revoked",
+    }
+}
+
+fn datetime_ms(value: chrono::DateTime<chrono::Utc>) -> u64 {
+    value.timestamp_millis().max(0) as u64
 }
 
 fn materialize_json_content_artifact<T>(
@@ -765,6 +921,50 @@ mod tests {
         let bytes = message.encode_json().expect("encode should work");
         let decoded = ServiceNetworkMessage::decode_json(&bytes).expect("decode should work");
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn sync_manifest_message_round_trip() {
+        let message = ServiceNetworkMessage::SyncManifestPublished(ServiceNetworkContentEnvelope {
+            content_ref: ServiceNetworkContentRef {
+                uri: "artifact://reference/sha256:manifest".to_owned(),
+                digest: "sha256:manifest".to_owned(),
+                size_bytes: 128,
+                mime: "application/json".to_owned(),
+                created_at: 789,
+                producer: "peer-c".to_owned(),
+            },
+            transport_contact_material: None,
+        });
+        let bytes = message.encode_json().expect("encode should work");
+        let decoded = ServiceNetworkMessage::decode_json(&bytes).expect("decode should work");
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn record_summaries_include_status_version_and_digest() {
+        let provider = ProviderRecord {
+            schema_version: 1,
+            provider_id: "provider-local".to_owned(),
+            provider_did: "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp".to_owned(),
+            display_name: Some("Provider Local".to_owned()),
+            status: ProviderStatus::Active,
+            registered_at: Utc::now(),
+            revoked_at: None,
+            revoke_reason: None,
+        };
+        let provider_summary =
+            provider_record_summary(&provider).expect("provider summary should build");
+        let agent = demo_published_agent();
+        let agent_summary =
+            published_agent_record_summary(&agent).expect("agent summary should build");
+
+        assert_eq!(provider_summary.record_id, "provider-local");
+        assert_eq!(provider_summary.status, "active");
+        assert!(provider_summary.digest.starts_with("sha256:"));
+        assert_eq!(agent_summary.record_id, "stripe-agent");
+        assert_eq!(agent_summary.status, "approved");
+        assert!(agent_summary.digest.starts_with("sha256:"));
     }
 
     #[test]

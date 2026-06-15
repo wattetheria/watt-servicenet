@@ -5,22 +5,24 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout};
 use uuid::Uuid;
 use watt_servicenet_gateway::{GatewayError, GatewayPolicyConfig, GatewayService};
 use watt_servicenet_p2p::{
-    ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRuntime, ServiceNetworkRuntimeEvent,
+    NetworkNodeId, ServiceNetworkNode, ServiceNetworkP2pConfig, ServiceNetworkRecordSummary,
+    ServiceNetworkRuntime, ServiceNetworkRuntimeEvent, ServiceNetworkSyncManifest,
+    provider_record_summary, published_agent_record_summary,
 };
 use watt_servicenet_protocol::{
     AgentSubmissionQuery, AgentSubmissionStatus, ApproveAgentSubmissionRequest, AuthContextQuery,
     BlockEntityRequest, CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest,
-    GetAgentTaskRequest, InvokeAgentRequest, ModerationCaseQuery, PublishedAgentRecord,
-    ReceiptQuery, RegisterAuthContextRequest, RegisterProviderRequest,
+    GetAgentTaskRequest, InvokeAgentRequest, ModerationCaseQuery, ProviderRecord,
+    PublishedAgentRecord, ReceiptQuery, RegisterAuthContextRequest, RegisterProviderRequest,
     RejectAgentSubmissionRequest, ResolveModerationCaseRequest, RevokeProviderRequest,
     RotateProviderKeyRequest, RunVerifierSweepRequest, SubmitAgentRequest, UnpublishAgentRequest,
     VerifyReceiptRequest,
@@ -29,8 +31,12 @@ use watt_servicenet_registry::{RegistryError, ServiceRegistry, ServiceRegistryCo
 
 const DEFAULT_AGENT_LIST_LIMIT: usize = 50;
 const MAX_AGENT_LIST_LIMIT: usize = 100;
+const P2P_BACKFILL_PAGE_SIZE: usize = 256;
+const DEFAULT_P2P_ANTI_ENTROPY_INTERVAL_SECS: u64 = 60;
 const SERVICENET_FEDERATION_MODE_ENV: &str = "SERVICENET_FEDERATION_MODE";
 const SERVICENET_FEDERATION_TRUSTED_PEERS_ENV: &str = "SERVICENET_FEDERATION_TRUSTED_PEERS";
+const SERVICENET_P2P_ANTI_ENTROPY_INTERVAL_SECS_ENV: &str =
+    "SERVICENET_P2P_ANTI_ENTROPY_INTERVAL_SECS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FederationTrustMode {
@@ -387,6 +393,7 @@ async fn unpublish_agent(
         .unpublish_agent(&agent_id, request)
         .await
         .map_err(AppError::from)?;
+    queue_published_agent(&state.p2p_commands, agent.clone());
     Ok(Json(serde_json::json!(agent)))
 }
 
@@ -790,8 +797,12 @@ async fn start_p2p_sync_if_enabled(
     let mut runtime = ServiceNetworkRuntime::new(ServiceNetworkNode::generate(config)?)?;
     runtime.subscribe_global()?;
     let (tx, mut rx) = mpsc::channel::<P2pCommand>(128);
+    let anti_entropy_interval = p2p_anti_entropy_interval();
 
     tokio::spawn(async move {
+        let mut connected_peers = BTreeMap::<String, NetworkNodeId>::new();
+        let mut next_anti_entropy_at = Instant::now() + anti_entropy_interval;
+
         loop {
             while let Ok(command) = rx.try_recv() {
                 if let Err(err) = handle_p2p_command(&mut runtime, command) {
@@ -799,10 +810,30 @@ async fn start_p2p_sync_if_enabled(
                 }
             }
 
-            match timeout(Duration::from_millis(250), runtime.next_event()).await {
+            if Instant::now() >= next_anti_entropy_at {
+                if connected_peers.is_empty() {
+                    next_anti_entropy_at = Instant::now() + anti_entropy_interval;
+                    continue;
+                }
+                if let Err(err) = publish_local_sync_manifest(&registry, &mut runtime).await {
+                    eprintln!("servicenet p2p anti-entropy publish failed: {err}");
+                }
+                next_anti_entropy_at = Instant::now() + anti_entropy_interval;
+            }
+
+            let poll_timeout = next_anti_entropy_at
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(250));
+            match timeout(poll_timeout, runtime.next_event()).await {
                 Ok(Ok(event)) => {
-                    if let Err(err) =
-                        handle_p2p_event(&registry, &federation_policy, &mut runtime, event).await
+                    if let Err(err) = handle_p2p_event(
+                        &registry,
+                        &federation_policy,
+                        &mut runtime,
+                        &mut connected_peers,
+                        event,
+                    )
+                    .await
                     {
                         eprintln!("servicenet p2p event handling failed: {err}");
                     }
@@ -816,6 +847,15 @@ async fn start_p2p_sync_if_enabled(
     });
 
     Ok(Some(tx))
+}
+
+fn p2p_anti_entropy_interval() -> Duration {
+    let seconds = std::env::var(SERVICENET_P2P_ANTI_ENTROPY_INTERVAL_SECS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_P2P_ANTI_ENTROPY_INTERVAL_SECS)
+        .max(1);
+    Duration::from_secs(seconds)
 }
 
 fn default_p2p_state_dir() -> PathBuf {
@@ -838,6 +878,7 @@ async fn handle_p2p_event(
     registry: &ServiceRegistry,
     federation_policy: &FederationTrustPolicy,
     runtime: &mut ServiceNetworkRuntime,
+    connected_peers: &mut BTreeMap<String, NetworkNodeId>,
     event: ServiceNetworkRuntimeEvent,
 ) -> anyhow::Result<()> {
     match event {
@@ -845,23 +886,33 @@ async fn handle_p2p_event(
             println!("servicenet p2p listening on {address}");
         }
         ServiceNetworkRuntimeEvent::ConnectionEstablished { peer } => {
-            if federation_policy.allows_peer(&peer) && runtime.allows_outbound_backfill_to(&peer) {
-                let _ = runtime.send_provider_sync_request(&peer, 256);
-                let _ = runtime.send_published_agent_sync_request(&peer, 256);
+            connected_peers.insert(peer.to_string(), peer.clone());
+            if federation_policy.allows_peer(&peer) {
+                request_full_sync_from_peer(runtime, &peer)?;
             }
         }
         ServiceNetworkRuntimeEvent::ProviderPublished { peer, provider } => {
             if federation_policy.allows_peer(&peer) {
-                registry.upsert_provider_record(provider).await?;
+                merge_provider_record(registry, provider).await?;
             }
         }
         ServiceNetworkRuntimeEvent::PublishedAgentRecordPublished { peer, record } => {
-            if federation_policy.allows_peer(&peer) {
-                registry.upsert_published_agent(record).await?;
+            if federation_policy.allows_peer(&peer)
+                && let Err(err) = merge_published_agent_record(registry, record).await
+            {
+                if matches!(
+                    err.downcast_ref::<RegistryError>(),
+                    Some(RegistryError::ProviderNotFound(_))
+                ) && runtime.allows_outbound_backfill_to(&peer)
+                {
+                    let _ = runtime.send_provider_sync_request(&peer, P2P_BACKFILL_PAGE_SIZE);
+                }
+                return Err(err);
             }
         }
         ServiceNetworkRuntimeEvent::ProviderSyncRequest {
             peer,
+            from_event_seq,
             limit,
             channel,
         } => {
@@ -870,24 +921,35 @@ async fn handle_p2p_event(
                     .list_providers()
                     .await?
                     .into_iter()
+                    .skip(backfill_offset(from_event_seq))
                     .take(limit)
                     .collect::<Vec<_>>();
-                runtime.send_provider_sync_response(channel, &providers)?;
+                runtime.send_provider_sync_response_from(channel, from_event_seq, &providers)?;
             }
         }
         ServiceNetworkRuntimeEvent::ProviderSyncResponse {
             peer,
             request_id: _,
+            next_from_event_seq,
             providers,
         } => {
             if federation_policy.allows_peer(&peer) {
+                let should_continue = providers.len() >= P2P_BACKFILL_PAGE_SIZE;
                 for provider in providers {
-                    registry.upsert_provider_record(provider).await?;
+                    merge_provider_record(registry, provider).await?;
+                }
+                if should_continue && runtime.allows_outbound_backfill_to(&peer) {
+                    let _ = runtime.send_provider_sync_request_from(
+                        &peer,
+                        next_from_event_seq,
+                        P2P_BACKFILL_PAGE_SIZE,
+                    );
                 }
             }
         }
         ServiceNetworkRuntimeEvent::PublishedAgentSyncRequest {
             peer,
+            from_event_seq,
             limit,
             channel,
         } => {
@@ -896,24 +958,222 @@ async fn handle_p2p_event(
                     .list_published_agents()
                     .await?
                     .into_iter()
+                    .skip(backfill_offset(from_event_seq))
                     .take(limit)
                     .collect::<Vec<_>>();
-                runtime.send_published_agent_sync_response(channel, &records)?;
+                runtime.send_published_agent_sync_response_from(
+                    channel,
+                    from_event_seq,
+                    &records,
+                )?;
             }
         }
         ServiceNetworkRuntimeEvent::PublishedAgentSyncResponse {
             peer,
             request_id: _,
+            next_from_event_seq,
             records,
         } => {
             if federation_policy.allows_peer(&peer) {
+                let should_continue = records.len() >= P2P_BACKFILL_PAGE_SIZE;
                 for record in records {
-                    registry.upsert_published_agent(record).await?;
+                    merge_published_agent_record(registry, record).await?;
                 }
+                if should_continue && runtime.allows_outbound_backfill_to(&peer) {
+                    let _ = runtime.send_published_agent_sync_request_from(
+                        &peer,
+                        next_from_event_seq,
+                        P2P_BACKFILL_PAGE_SIZE,
+                    );
+                }
+            }
+        }
+        ServiceNetworkRuntimeEvent::SyncManifestPublished { peer, manifest } => {
+            connected_peers.insert(peer.to_string(), peer.clone());
+            if federation_policy.allows_peer(&peer) && runtime.allows_outbound_backfill_to(&peer) {
+                request_backfill_for_manifest_gaps(registry, runtime, &peer, &manifest).await?;
             }
         }
     }
     Ok(())
+}
+
+fn backfill_offset(from_event_seq: u64) -> usize {
+    usize::try_from(from_event_seq).unwrap_or(usize::MAX)
+}
+
+fn request_full_sync_from_peer(
+    runtime: &mut ServiceNetworkRuntime,
+    peer: &NetworkNodeId,
+) -> anyhow::Result<()> {
+    if runtime.allows_outbound_backfill_to(peer) {
+        let _ = runtime.send_provider_sync_request(peer, P2P_BACKFILL_PAGE_SIZE)?;
+        let _ = runtime.send_published_agent_sync_request(peer, P2P_BACKFILL_PAGE_SIZE)?;
+    }
+    Ok(())
+}
+
+async fn publish_local_sync_manifest(
+    registry: &ServiceRegistry,
+    runtime: &mut ServiceNetworkRuntime,
+) -> anyhow::Result<()> {
+    let providers = registry.list_providers().await?;
+    let records = registry.list_published_agents().await?;
+    let manifest = runtime.build_sync_manifest(&providers, &records)?;
+    runtime.publish_sync_manifest(&manifest)?;
+    Ok(())
+}
+
+async fn request_backfill_for_manifest_gaps(
+    registry: &ServiceRegistry,
+    runtime: &mut ServiceNetworkRuntime,
+    peer: &NetworkNodeId,
+    manifest: &ServiceNetworkSyncManifest,
+) -> anyhow::Result<()> {
+    if provider_manifest_has_remote_winner(registry, manifest).await? {
+        let _ = runtime.send_provider_sync_request(peer, P2P_BACKFILL_PAGE_SIZE)?;
+    }
+    if published_agent_manifest_has_remote_winner(registry, manifest).await? {
+        let _ = runtime.send_published_agent_sync_request(peer, P2P_BACKFILL_PAGE_SIZE)?;
+    }
+    Ok(())
+}
+
+async fn provider_manifest_has_remote_winner(
+    registry: &ServiceRegistry,
+    manifest: &ServiceNetworkSyncManifest,
+) -> anyhow::Result<bool> {
+    let mut local = BTreeMap::new();
+    for provider in registry.list_providers().await? {
+        let summary = provider_record_summary(&provider)?;
+        local.insert(summary.record_id.clone(), summary);
+    }
+    Ok(manifest
+        .providers
+        .iter()
+        .any(|remote| summary_wins(local.get(&remote.record_id), remote, SummaryKind::Provider)))
+}
+
+async fn published_agent_manifest_has_remote_winner(
+    registry: &ServiceRegistry,
+    manifest: &ServiceNetworkSyncManifest,
+) -> anyhow::Result<bool> {
+    let mut local = BTreeMap::new();
+    for record in registry.list_published_agents().await? {
+        let summary = published_agent_record_summary(&record)?;
+        local.insert(summary.record_id.clone(), summary);
+    }
+    Ok(manifest.published_agents.iter().any(|remote| {
+        summary_wins(
+            local.get(&remote.record_id),
+            remote,
+            SummaryKind::PublishedAgent,
+        )
+    }))
+}
+
+async fn merge_provider_record(
+    registry: &ServiceRegistry,
+    incoming: ProviderRecord,
+) -> anyhow::Result<bool> {
+    let should_merge = match registry.get_provider(&incoming.provider_id).await {
+        Ok(local) => provider_record_wins(&local, &incoming)?,
+        Err(RegistryError::ProviderNotFound(_)) => true,
+        Err(err) => return Err(err.into()),
+    };
+    if should_merge {
+        registry.upsert_provider_record(incoming).await?;
+    }
+    Ok(should_merge)
+}
+
+async fn merge_published_agent_record(
+    registry: &ServiceRegistry,
+    incoming: PublishedAgentRecord,
+) -> anyhow::Result<bool> {
+    let local = registry
+        .list_published_agents()
+        .await?
+        .into_iter()
+        .find(|record| record.agent_id == incoming.agent_id);
+    let should_merge = match local {
+        Some(local) => published_agent_record_wins(&local, &incoming)?,
+        None => true,
+    };
+    if should_merge {
+        registry.upsert_published_agent(incoming).await?;
+    }
+    Ok(should_merge)
+}
+
+fn provider_record_wins(local: &ProviderRecord, incoming: &ProviderRecord) -> anyhow::Result<bool> {
+    let local_summary = provider_record_summary(local)?;
+    let incoming_summary = provider_record_summary(incoming)?;
+    Ok(summary_wins(
+        Some(&local_summary),
+        &incoming_summary,
+        SummaryKind::Provider,
+    ))
+}
+
+fn published_agent_record_wins(
+    local: &PublishedAgentRecord,
+    incoming: &PublishedAgentRecord,
+) -> anyhow::Result<bool> {
+    let local_summary = published_agent_record_summary(local)?;
+    let incoming_summary = published_agent_record_summary(incoming)?;
+    Ok(summary_wins(
+        Some(&local_summary),
+        &incoming_summary,
+        SummaryKind::PublishedAgent,
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum SummaryKind {
+    Provider,
+    PublishedAgent,
+}
+
+fn summary_wins(
+    local: Option<&ServiceNetworkRecordSummary>,
+    remote: &ServiceNetworkRecordSummary,
+    kind: SummaryKind,
+) -> bool {
+    let Some(local) = local else {
+        return true;
+    };
+    if local.digest == remote.digest {
+        return false;
+    }
+    let local_rank = status_rank(kind, &local.status);
+    let remote_rank = status_rank(kind, &remote.status);
+    if matches!(kind, SummaryKind::Provider) && local_rank != remote_rank {
+        return remote_rank > local_rank;
+    }
+    if local.version_ms != remote.version_ms {
+        return remote.version_ms > local.version_ms;
+    }
+    if local_rank != remote_rank {
+        return remote_rank > local_rank;
+    }
+    remote.digest > local.digest
+}
+
+fn status_rank(kind: SummaryKind, status: &str) -> u8 {
+    match kind {
+        SummaryKind::Provider => match status {
+            "revoked" => 2,
+            "active" => 1,
+            _ => 0,
+        },
+        SummaryKind::PublishedAgent => match status {
+            "revoked" => 3,
+            "suspended" => 2,
+            "approved" => 1,
+            _ => 0,
+        },
+    }
 }
 
 fn split_csv(raw: &str) -> Vec<String> {
@@ -1017,16 +1277,21 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, FederationTrustMode, FederationTrustPolicy, P2pCommand, parse_env_flag,
-        publish_auto_approved_agent, split_csv,
+        AppState, FederationTrustMode, FederationTrustPolicy, P2pCommand,
+        ServiceNetworkSyncManifest, SummaryKind, backfill_offset, parse_env_flag,
+        provider_manifest_has_remote_winner, provider_record_wins, publish_auto_approved_agent,
+        published_agent_record_wins, split_csv, summary_wins,
     };
     use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
     use watt_servicenet_gateway::{GatewayPolicyConfig, GatewayService};
+    use watt_servicenet_p2p::{
+        ServiceNetworkRecordSummary, provider_record_summary, published_agent_record_summary,
+    };
     use watt_servicenet_protocol::{
-        AgentSubmissionStatus, PublishedAgentRecord, RegisterProviderRequest,
+        AgentSubmissionStatus, ProviderRecord, PublishedAgentRecord, RegisterProviderRequest,
     };
     use watt_servicenet_registry::ServiceRegistry;
 
@@ -1152,5 +1417,164 @@ mod tests {
             }
             P2pCommand::PublishProvider(_) => panic!("expected published agent command"),
         }
+    }
+
+    #[test]
+    fn provider_revocation_wins_over_active_record() {
+        let active = provider_fixture(
+            "active",
+            "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp",
+            None,
+        );
+        let revoked = provider_fixture(
+            "revoked",
+            "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp",
+            Some("2026-01-02T00:00:00Z"),
+        );
+
+        assert!(provider_record_wins(&active, &revoked).expect("compare provider records"));
+        assert!(!provider_record_wins(&revoked, &active).expect("compare provider records"));
+    }
+
+    #[test]
+    fn published_agent_newer_record_wins_old_record_does_not() {
+        let older = published_agent_fixture("approved", "2026-01-01T00:00:00Z", "older");
+        let newer = published_agent_fixture("approved", "2026-01-02T00:00:00Z", "newer");
+
+        assert!(published_agent_record_wins(&older, &newer).expect("compare agent records"));
+        assert!(!published_agent_record_wins(&newer, &older).expect("compare agent records"));
+    }
+
+    #[test]
+    fn same_version_summary_uses_digest_tie_break() {
+        let local = ServiceNetworkRecordSummary {
+            record_id: "provider-local".to_owned(),
+            status: "active".to_owned(),
+            version_ms: 1,
+            digest: "sha256:aaa".to_owned(),
+        };
+        let remote = ServiceNetworkRecordSummary {
+            record_id: "provider-local".to_owned(),
+            status: "active".to_owned(),
+            version_ms: 1,
+            digest: "sha256:bbb".to_owned(),
+        };
+
+        assert!(summary_wins(Some(&local), &remote, SummaryKind::Provider));
+        assert!(!summary_wins(Some(&remote), &local, SummaryKind::Provider));
+    }
+
+    #[test]
+    fn backfill_offset_saturates_unrepresentable_values() {
+        assert_eq!(backfill_offset(7), 7);
+        assert_eq!(backfill_offset(u64::MAX), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn provider_manifest_gap_detection_ignores_remote_loser() {
+        let registry = ServiceRegistry::in_memory();
+        let local_revoked = provider_fixture(
+            "revoked",
+            "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp",
+            Some("2026-01-02T00:00:00Z"),
+        );
+        registry
+            .upsert_provider_record(local_revoked)
+            .await
+            .expect("local provider should persist");
+        let remote_active = provider_fixture(
+            "active",
+            "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp",
+            None,
+        );
+        let manifest = ServiceNetworkSyncManifest {
+            generated_at_ms: 1,
+            producer: "peer-a".to_owned(),
+            providers: vec![
+                provider_record_summary(&remote_active).expect("provider summary should build"),
+            ],
+            published_agents: Vec::new(),
+        };
+
+        assert!(
+            !provider_manifest_has_remote_winner(&registry, &manifest)
+                .await
+                .expect("manifest should compare")
+        );
+    }
+
+    #[test]
+    fn published_agent_summary_digest_changes_with_content() {
+        let first = published_agent_fixture("approved", "2026-01-01T00:00:00Z", "first");
+        let second = published_agent_fixture("approved", "2026-01-01T00:00:00Z", "second");
+        let first_summary =
+            published_agent_record_summary(&first).expect("first summary should build");
+        let second_summary =
+            published_agent_record_summary(&second).expect("second summary should build");
+
+        assert_ne!(first_summary.digest, second_summary.digest);
+        assert_eq!(first_summary.version_ms, second_summary.version_ms);
+    }
+
+    fn provider_fixture(
+        status: &str,
+        provider_did: &str,
+        revoked_at: Option<&str>,
+    ) -> ProviderRecord {
+        serde_json::from_value(serde_json::json!({
+            "provider_id": "provider-local",
+            "provider_did": provider_did,
+            "display_name": "Provider Local",
+            "status": status,
+            "registered_at": "2026-01-01T00:00:00Z",
+            "revoked_at": revoked_at,
+            "revoke_reason": if revoked_at.is_some() { Some("compromised") } else { None::<&str> }
+        }))
+        .expect("provider fixture should parse")
+    }
+
+    fn published_agent_fixture(
+        status: &str,
+        updated_at: &str,
+        review_notes: &str,
+    ) -> PublishedAgentRecord {
+        serde_json::from_value(serde_json::json!({
+            "agent_id": "agent-auto-approved",
+            "provider_id": "provider-local",
+            "version": "0.1.0",
+            "status": status,
+            "agent_card": {
+                "name": "Auto Approved Agent",
+                "description": "Test agent",
+                "url": "https://agent.example.com",
+                "preferredTransport": "JSONRPC",
+                "protocolVersion": "1.0",
+                "supportsTask": false,
+                "skills": [{ "id": "demo.run", "name": "Run Demo" }],
+                "securitySchemes": { "none": { "type": "none" } },
+                "security": [{ "none": [] }]
+            },
+            "deployment": {
+                "runtime": "remote_http",
+                "endpoint": {
+                    "url": "https://agent.example.com/a2a",
+                    "protocol_binding": "JSONRPC",
+                    "protocol_version": "1.0",
+                    "interaction_protocol": "google_a2a"
+                }
+            },
+            "review": {
+                "risk_level": "low",
+                "data_classes": [],
+                "destructive_actions": [],
+                "human_approval_required": false,
+                "allowed_regions": []
+            },
+            "approved_at": "2026-01-01T00:00:00Z",
+            "updated_at": updated_at,
+            "reviewed_by": "auto-approve",
+            "review_notes": review_notes
+        }))
+        .expect("published agent fixture should parse")
     }
 }

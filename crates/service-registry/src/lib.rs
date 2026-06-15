@@ -1776,7 +1776,7 @@ impl ServiceRegistry {
             .get(&receipt_id)
             .cloned()
             .ok_or(RegistryError::ReceiptNotFound(receipt_id))?;
-        items.sort_by(|left, right| left.verified_at.cmp(&right.verified_at));
+        items.sort_by_key(|item| item.verified_at);
         Ok(items)
     }
 
@@ -1985,7 +1985,7 @@ impl ServiceRegistry {
             .into_iter()
             .filter(|event| event.provider_id == provider_id)
             .collect::<Vec<_>>();
-        items.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        items.sort_by_key(|item| item.created_at);
         Ok(items)
     }
 
@@ -2241,7 +2241,7 @@ impl ServiceRegistry {
                     .is_none_or(|status| &case.status == status)
             })
             .collect::<Vec<_>>();
-        items.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        items.sort_by_key(|item| item.created_at);
         Ok(items)
     }
 
@@ -2378,7 +2378,7 @@ impl ServiceRegistry {
                     .is_none_or(|status| &record.status == status)
             })
             .collect::<Vec<_>>();
-        items.sort_by(|left, right| left.submitted_at.cmp(&right.submitted_at));
+        items.sort_by_key(|item| item.submitted_at);
         Ok(items)
     }
 
@@ -2712,7 +2712,7 @@ impl ServiceRegistry {
                     .is_none_or(|subject_did| record.subject_did == subject_did)
             })
             .collect::<Vec<_>>();
-        items.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        items.sort_by_key(|item| item.created_at);
         Ok(items)
     }
 
