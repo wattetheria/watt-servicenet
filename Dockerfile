@@ -16,13 +16,7 @@ WORKDIR /workspace/watt-servicenet
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/cargo-target,sharing=locked \
-    --mount=type=secret,id=github_token \
     set -eu; \
-    token_file=/run/secrets/github_token; \
-    if [ -s "$token_file" ]; then \
-      token="$(cat "$token_file")"; \
-      git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"; \
-    fi; \
     sed -i \
       -e "s|wattswarm-artifact-store = { path = \"../wattswarm/crates/artifact-store\" }|wattswarm-artifact-store = { git = \"${WATTSWARM_REPO}\", branch = \"${WATTSWARM_REF}\", package = \"wattswarm-artifact-store\" }|" \
       -e "s|wattswarm-network-substrate = { path = \"../wattswarm/crates/network-substrate\" }|wattswarm-network-substrate = { git = \"${WATTSWARM_REPO}\", branch = \"${WATTSWARM_REF}\", package = \"wattswarm-network-substrate\" }|" \
@@ -31,7 +25,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       Cargo.toml; \
     sed -i \
       -e "s|watt-did = { path = \"../../../watt-did\" }|watt-did = { git = \"${WATT_DID_REPO}\", branch = \"${WATT_DID_REF}\" }|" \
-      crates/service-protocol/Cargo.toml crates/service-registry/Cargo.toml; \
+      crates/service-gateway/Cargo.toml crates/service-protocol/Cargo.toml crates/service-registry/Cargo.toml; \
     sed -i \
       -e "s|watt-wallet = { path = \"../../../watt-wallet\" }|watt-wallet = { git = \"${WATT_WALLET_REPO}\", branch = \"${WATT_WALLET_REF}\" }|" \
       crates/service-registry/Cargo.toml; \
@@ -42,8 +36,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       "$WATT_WALLET_REPO" "$WATT_DID_REPO" "$WATT_DID_REF" >> Cargo.toml; \
     CARGO_TARGET_DIR=/cargo-target cargo build --release -p watt-servicenet-node; \
     mkdir -p /out; \
-    cp /cargo-target/release/watt-servicenet-node /out/watt-servicenet-node; \
-    rm -f /root/.gitconfig
+    cp /cargo-target/release/watt-servicenet-node /out/watt-servicenet-node
 
 FROM debian:bookworm-slim AS runtime
 
