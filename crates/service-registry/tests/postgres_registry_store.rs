@@ -112,6 +112,10 @@ fn stored_receipt() -> StoredReceipt {
             receipt_id: Uuid::new_v4(),
             agent_id: "stripe-agent".to_owned(),
             provider_id: "provider-pg".to_owned(),
+            caller_agent_id: Some("did:key:zCallerPg".to_owned()),
+            caller_public_id: Some("pub_caller_pg".to_owned()),
+            caller_display_name: Some("Postgres Caller".to_owned()),
+            caller_node_id: Some("node-caller-pg".to_owned()),
             status: ReceiptStatus::Succeeded,
             verification: VerificationVerdict::NotRequired,
             request_digest: "req".to_owned(),
@@ -313,6 +317,24 @@ async fn postgres_store_persists_agent_receipts_and_health() {
         .await
         .expect("receipt query should succeed");
     assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts[0].receipt.caller_agent_id.as_deref(),
+        Some("did:key:zCallerPg")
+    );
+    assert_eq!(
+        receipts[0].receipt.caller_public_id.as_deref(),
+        Some("pub_caller_pg")
+    );
+
+    let caller_receipts = registry
+        .list_receipts(&ReceiptQuery {
+            caller_agent_id: Some("did:key:zCallerPg".to_owned()),
+            caller_public_id: Some("pub_caller_pg".to_owned()),
+            ..ReceiptQuery::default()
+        })
+        .await
+        .expect("caller receipt query should succeed");
+    assert_eq!(caller_receipts.len(), 1);
 
     let agent_health = registry
         .list_agent_health()

@@ -360,8 +360,12 @@ async fn list_agents(
         .map_err(AppError::from)?;
     let next_offset = offset.saturating_add(items.len());
     let has_more = next_offset < known_count;
+    let public_items = items
+        .iter()
+        .map(public_published_agent_view)
+        .collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
-        "items": items,
+        "items": public_items,
         "count": items.len(),
         "limit": limit,
         "offset": offset,
@@ -380,7 +384,36 @@ async fn get_agent(
         .get_published_agent(&agent_id)
         .await
         .map_err(AppError::from)?;
-    Ok(Json(serde_json::json!(agent)))
+    Ok(Json(public_published_agent_view(&agent)))
+}
+
+fn public_published_agent_view(agent: &PublishedAgentRecord) -> serde_json::Value {
+    let mut view = serde_json::to_value(agent).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = view.as_object_mut() {
+        if let Some(agent_card) = object
+            .get_mut("agent_card")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            agent_card.remove("url");
+        }
+        if let Some(endpoint) = object
+            .get_mut("deployment")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|deployment| deployment.get_mut("endpoint"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            endpoint.remove("url");
+        }
+        object.insert(
+            "invoke".to_owned(),
+            serde_json::json!({
+                "transport": "servicenet",
+                "sync_url": format!("/v1/agents/{}/invoke", agent.agent_id),
+                "async_url": format!("/v1/agents/{}/invoke-async", agent.agent_id),
+            }),
+        );
+    }
+    view
 }
 
 async fn unpublish_agent(

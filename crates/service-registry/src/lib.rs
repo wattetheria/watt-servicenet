@@ -344,11 +344,33 @@ impl PostgresRegistryStore {
                     receipt_id UUID PRIMARY KEY,
                     agent_id TEXT NOT NULL,
                     provider_id TEXT NOT NULL,
+                    caller_agent_id TEXT NULL,
+                    caller_public_id TEXT NULL,
+                    caller_display_name TEXT NULL,
+                    caller_node_id TEXT NULL,
                     verification TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     stored_json JSONB NOT NULL
                 )"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS caller_agent_id TEXT NULL"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS caller_public_id TEXT NULL"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS caller_display_name TEXT NULL"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS caller_node_id TEXT NULL"#
+            ),
+            format!(
+                r#"CREATE INDEX IF NOT EXISTS "receipts_agent_caller_idx" ON "{schema}"."receipts" (agent_id, caller_agent_id)"#
+            ),
+            format!(
+                r#"CREATE INDEX IF NOT EXISTS "receipts_public_caller_idx" ON "{schema}"."receipts" (caller_public_id)"#
             ),
             format!(
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."provider_health" (
@@ -839,11 +861,15 @@ impl RegistryStore for PostgresRegistryStore {
         for stored in state.receipts.values() {
             let (created_at, updated_at) = receipt_timestamps(stored);
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."receipts" (receipt_id, agent_id, provider_id, verification, created_at, updated_at, stored_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                r#"INSERT INTO "{}"."receipts" (receipt_id, agent_id, provider_id, caller_agent_id, caller_public_id, caller_display_name, caller_node_id, verification, created_at, updated_at, stored_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                    ON CONFLICT (receipt_id) DO UPDATE SET
                      agent_id = EXCLUDED.agent_id,
                      provider_id = EXCLUDED.provider_id,
+                     caller_agent_id = EXCLUDED.caller_agent_id,
+                     caller_public_id = EXCLUDED.caller_public_id,
+                     caller_display_name = EXCLUDED.caller_display_name,
+                     caller_node_id = EXCLUDED.caller_node_id,
                      verification = EXCLUDED.verification,
                      updated_at = EXCLUDED.updated_at,
                      stored_json = EXCLUDED.stored_json"#,
@@ -852,6 +878,10 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(stored.receipt.receipt_id)
             .bind(&stored.receipt.agent_id)
             .bind(&stored.receipt.provider_id)
+            .bind(&stored.receipt.caller_agent_id)
+            .bind(&stored.receipt.caller_public_id)
+            .bind(&stored.receipt.caller_display_name)
+            .bind(&stored.receipt.caller_node_id)
             .bind(format!("{:?}", stored.receipt.verification))
             .bind(created_at)
             .bind(updated_at)
@@ -1659,6 +1689,22 @@ impl ServiceRegistry {
                     .provider_id
                     .as_deref()
                     .is_none_or(|provider_id| stored.receipt.provider_id == provider_id)
+            })
+            .filter(|stored| {
+                query
+                    .caller_agent_id
+                    .as_deref()
+                    .is_none_or(|caller_agent_id| {
+                        stored.receipt.caller_agent_id.as_deref() == Some(caller_agent_id)
+                    })
+            })
+            .filter(|stored| {
+                query
+                    .caller_public_id
+                    .as_deref()
+                    .is_none_or(|caller_public_id| {
+                        stored.receipt.caller_public_id.as_deref() == Some(caller_public_id)
+                    })
             })
             .filter(|stored| {
                 query
@@ -3920,6 +3966,10 @@ mod tests {
                 receipt_id: Uuid::new_v4(),
                 agent_id: "stripe-agent".to_owned(),
                 provider_id: "provider-1".to_owned(),
+                caller_agent_id: Some("did:key:zCaller".to_owned()),
+                caller_public_id: Some("pub_caller".to_owned()),
+                caller_display_name: Some("Caller Agent".to_owned()),
+                caller_node_id: Some("node-caller".to_owned()),
                 status: watt_servicenet_protocol::ReceiptStatus::Succeeded,
                 verification: VerificationVerdict::Pending,
                 request_digest: "req".to_owned(),
@@ -4358,6 +4408,10 @@ mod tests {
                 receipt_id: Uuid::new_v4(),
                 agent_id: "risk-medium".to_owned(),
                 provider_id: "provider-1".to_owned(),
+                caller_agent_id: None,
+                caller_public_id: None,
+                caller_display_name: None,
+                caller_node_id: None,
                 status: watt_servicenet_protocol::ReceiptStatus::Succeeded,
                 verification: VerificationVerdict::Pending,
                 request_digest: "req".to_owned(),

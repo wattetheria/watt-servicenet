@@ -6,19 +6,21 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 chrono.workspace = true
+ed25519-dalek.workspace = true
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+serde_jcs = "0.1"
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+watt-did = { path = "../../../watt-did" }
 watt-servicenet-protocol = { path = "../service-protocol" }
 watt-servicenet-registry = { path = "../service-registry" }
 
 [dev-dependencies]
 axum.workspace = true
-base64.workspace = true
-ed25519-dalek.workspace = true
-serde_jcs = "0.1"
 bs58 = "0.5"

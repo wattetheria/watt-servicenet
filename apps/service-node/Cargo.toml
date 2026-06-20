@@ -22,3 +22,4 @@ base64.workspace = true
 ed25519-dalek.workspace = true
 serde_jcs = "0.1"
 bs58 = "0.5"
+sha2.workspace = true

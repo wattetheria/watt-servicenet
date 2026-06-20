@@ -1,10 +1,14 @@
 use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
+use watt_did::{Did, DidKey, DidKeyPublicKey};
 use watt_servicenet_protocol::{
     AgentInteractionProtocol, AuthContextRecord, ExecutionReceipt, GetAgentTaskRequest,
     InvokeAgentRequest, InvokeAgentResponse, NormalizedSettlementRequest, PublishedAgentRecord,
@@ -12,6 +16,8 @@ use watt_servicenet_protocol::{
     VerificationVerdict,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry};
+
+const DEFAULT_SERVICENET_CONTEXT_NETWORK_ID: &str = "mainnet:watt-etheria";
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -42,6 +48,56 @@ struct PreparedInvocation {
     normalized_settlement: Option<NormalizedSettlementRequest>,
     cost_units: Option<u32>,
     request_digest: String,
+    caller_context: InvocationCallerContext,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InvocationCallerContext {
+    caller_agent_id: Option<String>,
+    caller_public_id: Option<String>,
+    caller_display_name: Option<String>,
+    caller_node_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SignedAgentEnvelopePayload<'a> {
+    protocol: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport_profile: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_agent_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_node_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_node_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent_card_hash: Option<&'a String>,
+    message_json: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extensions_json: Option<&'a String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SignedSourceAgentCardPayload<'a> {
+    agent_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_id: Option<&'a String>,
+    card_hash: &'a str,
+    issued_at: u64,
+}
+
+impl InvocationCallerContext {
+    fn service_context_id(&self, callee_agent_id: &str) -> Option<String> {
+        self.caller_agent_id.as_deref().map(|caller_agent_id| {
+            format!(
+                "wattetheria:servicenet:{caller_agent_id}:{callee_agent_id}:{DEFAULT_SERVICENET_CONTEXT_NETWORK_ID}"
+            )
+        })
+    }
 }
 
 trait A2aAdapter: Send + Sync {
@@ -236,6 +292,10 @@ impl GatewayService {
                 receipt_id,
                 agent_id: prepared.record.agent_id.clone(),
                 provider_id: prepared.record.provider_id.clone(),
+                caller_agent_id: prepared.caller_context.caller_agent_id.clone(),
+                caller_public_id: prepared.caller_context.caller_public_id.clone(),
+                caller_display_name: prepared.caller_context.caller_display_name.clone(),
+                caller_node_id: prepared.caller_context.caller_node_id.clone(),
                 status: ReceiptStatus::Running,
                 verification: VerificationVerdict::NotRequired,
                 request_digest: prepared.request_digest.clone(),
@@ -302,6 +362,7 @@ impl GatewayService {
             .resolve_agent_auth_context(&record, request.auth_context_id)
             .await?
             .or(request.auth_token.clone());
+        verify_agent_envelope_signature(request)?;
         self.enforce_agent_preflight(&record, request, auth_token.as_deref())
             .await?;
         let adapter = a2a_adapter(record.deployment.endpoint.interaction_protocol);
@@ -319,17 +380,26 @@ impl GatewayService {
             normalized_settlement,
             cost_units,
             request_digest,
+            caller_context: invocation_caller_context(request),
         })
     }
 
     async fn execute_prepared_invocation(
         &self,
         agent_id: &str,
-        request: InvokeAgentRequest,
+        mut request: InvokeAgentRequest,
         prepared: PreparedInvocation,
         receipt_id: Uuid,
         started_at: DateTime<Utc>,
     ) -> Result<InvokeAgentResponse, GatewayError> {
+        if request
+            .context_id
+            .as_deref()
+            .is_none_or(|context_id| context_id.trim().is_empty())
+            && let Some(context_id) = prepared.caller_context.service_context_id(agent_id)
+        {
+            request.context_id = Some(context_id);
+        }
         let response = self
             .a2a_jsonrpc_call(
                 &prepared.record,
@@ -349,6 +419,10 @@ impl GatewayService {
                 receipt_id,
                 agent_id: prepared.record.agent_id.clone(),
                 provider_id: prepared.record.provider_id.clone(),
+                caller_agent_id: prepared.caller_context.caller_agent_id.clone(),
+                caller_public_id: prepared.caller_context.caller_public_id.clone(),
+                caller_display_name: prepared.caller_context.caller_display_name.clone(),
+                caller_node_id: prepared.caller_context.caller_node_id.clone(),
                 status: ReceiptStatus::Succeeded,
                 verification: verification_for_risk(&prepared.record.review.risk_level),
                 request_digest: prepared.request_digest,
@@ -683,6 +757,187 @@ fn invocation_request_digest(
     .map_err(|err| GatewayError::Execution(err.to_string()))
 }
 
+fn invocation_caller_context(request: &InvokeAgentRequest) -> InvocationCallerContext {
+    let Some(envelope) = request.agent_envelope.as_ref() else {
+        return InvocationCallerContext::default();
+    };
+    InvocationCallerContext {
+        caller_agent_id: json_string_at(envelope, &["source_agent_id"]),
+        caller_public_id: json_string_at(envelope, &["extensions", "caller_public_id"])
+            .or_else(|| json_string_at(envelope, &["caller_public_id"])),
+        caller_display_name: json_string_at(envelope, &["source_agent_card", "card", "name"])
+            .or_else(|| json_string_at(envelope, &["source_agent_card", "name"])),
+        caller_node_id: json_string_at(envelope, &["source_node_id"]),
+    }
+}
+
+fn verify_agent_envelope_signature(request: &InvokeAgentRequest) -> Result<(), GatewayError> {
+    let envelope = request
+        .agent_envelope
+        .as_ref()
+        .ok_or_else(|| GatewayError::Rejected("agent_envelope is required".to_owned()))?;
+    let signature = json_string_at(envelope, &["signature"])
+        .ok_or_else(|| GatewayError::Rejected("agent_envelope.signature is required".to_owned()))?;
+    let source_agent_id = json_string_at(envelope, &["source_agent_id"]).ok_or_else(|| {
+        GatewayError::Rejected("agent_envelope.source_agent_id is required".to_owned())
+    })?;
+    let protocol = json_string_at(envelope, &["protocol"])
+        .ok_or_else(|| GatewayError::Rejected("agent_envelope.protocol is required".to_owned()))?;
+    let message = envelope
+        .get("message")
+        .ok_or_else(|| GatewayError::Rejected("agent_envelope.message is required".to_owned()))?;
+    let message_json = serde_json::to_string(message).map_err(|error| {
+        GatewayError::Rejected(format!("invalid agent_envelope.message: {error}"))
+    })?;
+    let extensions_json = envelope
+        .get("extensions")
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| {
+            GatewayError::Rejected(format!("invalid agent_envelope.extensions: {error}"))
+        })?;
+    verify_source_agent_card(envelope, &source_agent_id)?;
+    let source_agent_id = Some(source_agent_id);
+    let transport_profile = json_string_at(envelope, &["transport_profile"]);
+    let target_agent_id = json_string_at(envelope, &["target_agent_id"]);
+    let source_node_id = json_string_at(envelope, &["source_node_id"]);
+    let target_node_id = json_string_at(envelope, &["target_node_id"]);
+    let capability = json_string_at(envelope, &["capability"]);
+    let source_agent_card_hash = json_string_at(envelope, &["source_agent_card", "card_hash"]);
+    let payload = SignedAgentEnvelopePayload {
+        protocol: &protocol,
+        transport_profile: transport_profile.as_ref(),
+        source_agent_id: source_agent_id.as_ref(),
+        target_agent_id: target_agent_id.as_ref(),
+        source_node_id: source_node_id.as_ref(),
+        target_node_id: target_node_id.as_ref(),
+        capability: capability.as_ref(),
+        source_agent_card_hash: source_agent_card_hash.as_ref(),
+        message_json: &message_json,
+        extensions_json: extensions_json.as_ref(),
+    };
+    verify_payload_signature(&payload, &signature, source_agent_id.as_deref().unwrap()).map_err(
+        |error| {
+            GatewayError::Rejected(format!(
+                "agent_envelope signature verification failed: {error}"
+            ))
+        },
+    )?;
+    Ok(())
+}
+
+fn verify_source_agent_card(envelope: &Value, source_agent_id: &str) -> Result<(), GatewayError> {
+    let Some(card) = envelope.get("source_agent_card") else {
+        return Ok(());
+    };
+    let card_agent_id = json_string_at(card, &["agent_id"]).ok_or_else(|| {
+        GatewayError::Rejected("agent_envelope.source_agent_card.agent_id is required".to_owned())
+    })?;
+    if card_agent_id != source_agent_id {
+        return Err(GatewayError::Rejected(
+            "agent_envelope.source_agent_card.agent_id must match source_agent_id".to_owned(),
+        ));
+    }
+    let card_hash = json_string_at(card, &["card_hash"]).ok_or_else(|| {
+        GatewayError::Rejected("agent_envelope.source_agent_card.card_hash is required".to_owned())
+    })?;
+    let card_body = card.get("card").ok_or_else(|| {
+        GatewayError::Rejected("agent_envelope.source_agent_card.card is required".to_owned())
+    })?;
+    let computed_hash = canonical_value_hash(card_body)?;
+    if card_hash != computed_hash {
+        return Err(GatewayError::Rejected(
+            "agent_envelope.source_agent_card.card_hash does not match card".to_owned(),
+        ));
+    }
+    let signature = json_string_at(card, &["signature"]).ok_or_else(|| {
+        GatewayError::Rejected("agent_envelope.source_agent_card.signature is required".to_owned())
+    })?;
+    let issued_at = card
+        .get("issued_at")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            GatewayError::Rejected(
+                "agent_envelope.source_agent_card.issued_at is required".to_owned(),
+            )
+        })?;
+    let node_id = json_string_at(card, &["node_id"]);
+    let payload = SignedSourceAgentCardPayload {
+        agent_id: &card_agent_id,
+        node_id: node_id.as_ref(),
+        card_hash: &card_hash,
+        issued_at,
+    };
+    verify_payload_signature(&payload, &signature, source_agent_id).map_err(|error| {
+        GatewayError::Rejected(format!(
+            "source_agent_card signature verification failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn verify_payload_signature(
+    payload: &impl Serialize,
+    signature_b64: &str,
+    signer_did: &str,
+) -> Result<(), GatewayError> {
+    let payload = serde_jcs::to_vec(payload).map_err(|error| {
+        GatewayError::Rejected(format!("canonicalize signed payload failed: {error}"))
+    })?;
+    let signature = STANDARD
+        .decode(signature_b64)
+        .map_err(|_| GatewayError::Rejected("invalid signature encoding".to_owned()))?;
+    let signature: [u8; 64] = signature
+        .try_into()
+        .map_err(|_| GatewayError::Rejected("invalid signature length".to_owned()))?;
+    let public_key = did_ed25519_public_key(signer_did)?;
+    let public_key: [u8; 32] = public_key
+        .try_into()
+        .map_err(|_| GatewayError::Rejected("invalid did:key public key length".to_owned()))?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| GatewayError::Rejected("invalid did:key public key bytes".to_owned()))?;
+    verifying_key
+        .verify(&payload, &Signature::from_bytes(&signature))
+        .map_err(|_| GatewayError::Rejected("signature does not verify".to_owned()))
+}
+
+fn did_ed25519_public_key(signer_did: &str) -> Result<Vec<u8>, GatewayError> {
+    let did = Did::parse(signer_did)
+        .map_err(|error| GatewayError::Rejected(format!("invalid source agent DID: {error}")))?;
+    let did_key = DidKey::from_did(did).map_err(|error| {
+        GatewayError::Rejected(format!("unsupported source agent DID: {error}"))
+    })?;
+    match did_key.decode_public_key().map_err(|error| {
+        GatewayError::Rejected(format!("invalid source agent DID public key: {error}"))
+    })? {
+        DidKeyPublicKey::Ed25519(bytes) => Ok(bytes.to_vec()),
+        _ => Err(GatewayError::Rejected(
+            "source agent DID must resolve to an Ed25519 key".to_owned(),
+        )),
+    }
+}
+
+fn canonical_value_hash(value: &Value) -> Result<String, GatewayError> {
+    let bytes = serde_jcs::to_vec(value).map_err(|error| {
+        GatewayError::Rejected(format!("canonicalize agent card failed: {error}"))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn json_string_at(value: &Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(segment)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn normalize_settlement_request(
     settlement: Option<&SettlementRequest>,
 ) -> Result<Option<NormalizedSettlementRequest>, GatewayError> {
@@ -849,7 +1104,6 @@ fn map_registry_error(error: RegistryError) -> GatewayError {
 mod tests {
     use super::*;
     use axum::{Json, Router, extract::State, routing::post};
-    use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use ed25519_dalek::{Signer, SigningKey};
     use std::sync::{Arc, Mutex};
@@ -862,6 +1116,10 @@ mod tests {
 
     fn provider_signing_key() -> SigningKey {
         SigningKey::from_bytes(&[21u8; 32])
+    }
+
+    fn caller_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[42u8; 32])
     }
 
     fn did_from_signing_key(signing_key: &SigningKey) -> String {
@@ -882,6 +1140,82 @@ mod tests {
         let payload = serde_jcs::to_vec(&build_agent_attestation_payload(request)).unwrap();
         request.attestations.attestation_signature =
             STANDARD.encode(signing_key.sign(&payload).to_bytes());
+    }
+
+    fn sign_payload(payload: &impl Serialize, signing_key: &SigningKey) -> String {
+        STANDARD.encode(
+            signing_key
+                .sign(&serde_jcs::to_vec(payload).expect("payload should canonicalize"))
+                .to_bytes(),
+        )
+    }
+
+    fn signed_source_agent_card(signing_key: &SigningKey) -> Value {
+        let agent_id = did_from_signing_key(signing_key);
+        let node_id = Some("node-caller".to_owned());
+        let card = serde_json::json!({
+            "name": "Caller Agent"
+        });
+        let card_hash = canonical_value_hash(&card).expect("card should hash");
+        let issued_at = 1_776_000_000;
+        let payload = SignedSourceAgentCardPayload {
+            agent_id: &agent_id,
+            node_id: node_id.as_ref(),
+            card_hash: &card_hash,
+            issued_at,
+        };
+        serde_json::json!({
+            "agent_id": agent_id,
+            "node_id": node_id,
+            "card_hash": card_hash,
+            "issued_at": issued_at,
+            "card": card,
+            "signature": sign_payload(&payload, signing_key)
+        })
+    }
+
+    fn signed_agent_envelope() -> Value {
+        let signing_key = caller_signing_key();
+        let source_agent_id = did_from_signing_key(&signing_key);
+        let transport_profile = Some("wattswarm_mesh".to_owned());
+        let target_agent_id = Some("stripe-agent".to_owned());
+        let source_node_id = Some("node-caller".to_owned());
+        let capability = Some("servicenet.agents.invoke".to_owned());
+        let source_agent_card = signed_source_agent_card(&signing_key);
+        let source_agent_card_hash = json_string_at(&source_agent_card, &["card_hash"]);
+        let message = serde_json::json!({
+            "message": "Create payment link"
+        });
+        let extensions = serde_json::json!({
+            "caller_public_id": "pub_caller"
+        });
+        let message_json = serde_json::to_string(&message).expect("message should serialize");
+        let extensions_json =
+            Some(serde_json::to_string(&extensions).expect("extensions should serialize"));
+        let payload = SignedAgentEnvelopePayload {
+            protocol: "google_a2a",
+            transport_profile: transport_profile.as_ref(),
+            source_agent_id: Some(&source_agent_id),
+            target_agent_id: target_agent_id.as_ref(),
+            source_node_id: source_node_id.as_ref(),
+            target_node_id: None,
+            capability: capability.as_ref(),
+            source_agent_card_hash: source_agent_card_hash.as_ref(),
+            message_json: &message_json,
+            extensions_json: extensions_json.as_ref(),
+        };
+        serde_json::json!({
+            "protocol": "google_a2a",
+            "transport_profile": transport_profile,
+            "source_agent_id": source_agent_id,
+            "target_agent_id": target_agent_id,
+            "source_node_id": source_node_id,
+            "capability": capability,
+            "source_agent_card": source_agent_card,
+            "message": message,
+            "extensions": extensions,
+            "signature": sign_payload(&payload, &signing_key)
+        })
     }
 
     fn provider_request() -> RegisterProviderRequest {
@@ -1125,7 +1459,7 @@ mod tests {
                         region: None,
                         confirm_risky: false,
                         max_cost_units: Some(10),
-                        agent_envelope: None,
+                        agent_envelope: Some(signed_agent_envelope()),
                     }
                 },
             )
@@ -1140,6 +1474,70 @@ mod tests {
             .await
             .expect("receipts should load");
         assert_eq!(receipts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invoke_agent_derives_servicenet_context_id_from_caller_envelope() {
+        let (a2a_url, captured) = start_mock_a2a_server_with_capture().await;
+        let (_registry, gateway) = approved_gateway_with_a2a_url(a2a_url).await;
+        gateway
+            .invoke_agent(
+                "stripe-agent",
+                InvokeAgentRequest {
+                    task_id: None,
+                    context_id: None,
+                    message: Some("Create payment link".to_owned()),
+                    input: serde_json::json!({"amount": 42}),
+                    skill_id: None,
+                    settlement: None,
+                    auth_token: Some("secret-token".to_owned()),
+                    auth_context_id: None,
+                    region: Some("AU".to_owned()),
+                    confirm_risky: true,
+                    max_cost_units: Some(10),
+                    agent_envelope: Some(signed_agent_envelope()),
+                },
+            )
+            .await
+            .expect("invoke should succeed");
+
+        let captured = captured.lock().expect("capture lock");
+        let request = captured.last().expect("captured request");
+        let expected_context_id = format!(
+            "wattetheria:servicenet:{}:stripe-agent:mainnet:watt-etheria",
+            did_from_signing_key(&caller_signing_key())
+        );
+        assert_eq!(
+            request["params"]["contextId"].as_str(),
+            Some(expected_context_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_agent_rejects_missing_agent_envelope() {
+        let (_registry, gateway) = approved_gateway().await;
+        let err = gateway
+            .invoke_agent(
+                "stripe-agent",
+                InvokeAgentRequest {
+                    task_id: None,
+                    context_id: None,
+                    message: Some("Create payment link".to_owned()),
+                    input: Value::Null,
+                    skill_id: None,
+                    settlement: None,
+                    auth_token: Some("secret-token".to_owned()),
+                    auth_context_id: None,
+                    region: Some("AU".to_owned()),
+                    confirm_risky: true,
+                    max_cost_units: Some(10),
+                    agent_envelope: None,
+                },
+            )
+            .await
+            .expect_err("invoke should reject unsigned callers");
+        assert!(matches!(err, GatewayError::Rejected(_)));
+        assert!(err.to_string().contains("agent_envelope is required"));
     }
 
     #[tokio::test]
@@ -1167,7 +1565,7 @@ mod tests {
                         region: None,
                         confirm_risky: false,
                         max_cost_units: None,
-                        agent_envelope: None,
+                        agent_envelope: Some(signed_agent_envelope()),
                     }
                 },
             )
@@ -1198,7 +1596,7 @@ mod tests {
                     region: Some("AU".to_owned()),
                     confirm_risky: true,
                     max_cost_units: Some(10),
-                    agent_envelope: None,
+                    agent_envelope: Some(signed_agent_envelope()),
                 },
             )
             .await
@@ -1309,7 +1707,7 @@ mod tests {
                         region: None,
                         confirm_risky: false,
                         max_cost_units: Some(10),
-                        agent_envelope: None,
+                        agent_envelope: Some(signed_agent_envelope()),
                     }
                 },
             )
@@ -1346,7 +1744,7 @@ mod tests {
                     region: Some("AU".to_owned()),
                     confirm_risky: true,
                     max_cost_units: Some(10),
-                    agent_envelope: None,
+                    agent_envelope: Some(signed_agent_envelope()),
                 },
             )
             .await
@@ -1405,7 +1803,7 @@ mod tests {
                     region: Some("AU".to_owned()),
                     confirm_risky: true,
                     max_cost_units: Some(10),
-                    agent_envelope: None,
+                    agent_envelope: Some(signed_agent_envelope()),
                 },
             )
             .await

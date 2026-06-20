@@ -86,6 +86,14 @@ pub struct ExecutionReceipt {
     pub receipt_id: Uuid,
     pub agent_id: String,
     pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_public_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_node_id: Option<String>,
     pub status: ReceiptStatus,
     pub verification: VerificationVerdict,
     pub request_digest: String,
@@ -113,6 +121,10 @@ pub struct ReceiptQuery {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_public_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<VerificationVerdict>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

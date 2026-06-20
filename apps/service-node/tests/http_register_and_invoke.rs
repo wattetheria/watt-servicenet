@@ -4,6 +4,8 @@ use axum::{Json, Router, extract::State, routing::post};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer, SigningKey};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
@@ -13,6 +15,41 @@ use watt_servicenet_registry::ServiceRegistry;
 
 fn provider_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[21u8; 32])
+}
+
+fn caller_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[42u8; 32])
+}
+
+#[derive(Debug, Serialize)]
+struct SignedAgentEnvelopePayload<'a> {
+    protocol: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport_profile: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_agent_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_node_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_node_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent_card_hash: Option<&'a String>,
+    message_json: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extensions_json: Option<&'a String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SignedSourceAgentCardPayload<'a> {
+    agent_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_id: Option<&'a String>,
+    card_hash: &'a str,
+    issued_at: u64,
 }
 
 fn did_from_signing_key(signing_key: &SigningKey) -> String {
@@ -27,6 +64,92 @@ fn did_from_signing_key(signing_key: &SigningKey) -> String {
         )
         .into_string()
     )
+}
+
+fn sign_payload(payload: &impl Serialize, signing_key: &SigningKey) -> String {
+    STANDARD.encode(
+        signing_key
+            .sign(&serde_jcs::to_vec(payload).expect("payload should canonicalize"))
+            .to_bytes(),
+    )
+}
+
+fn canonical_value_hash(value: &serde_json::Value) -> String {
+    let bytes = serde_jcs::to_vec(value).expect("value should canonicalize");
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn signed_source_agent_card(signing_key: &SigningKey) -> serde_json::Value {
+    let agent_id = did_from_signing_key(signing_key);
+    let node_id = Some("node-caller".to_owned());
+    let card = serde_json::json!({
+        "name": "Caller Agent"
+    });
+    let card_hash = canonical_value_hash(&card);
+    let issued_at = 1_776_000_000;
+    let payload = SignedSourceAgentCardPayload {
+        agent_id: &agent_id,
+        node_id: node_id.as_ref(),
+        card_hash: &card_hash,
+        issued_at,
+    };
+    serde_json::json!({
+        "agent_id": agent_id,
+        "node_id": node_id,
+        "card_hash": card_hash,
+        "issued_at": issued_at,
+        "card": card,
+        "signature": sign_payload(&payload, signing_key)
+    })
+}
+
+fn signed_agent_envelope() -> serde_json::Value {
+    let signing_key = caller_signing_key();
+    let source_agent_id = did_from_signing_key(&signing_key);
+    let transport_profile = Some("wattswarm_mesh".to_owned());
+    let target_agent_id = Some("stripe-agent".to_owned());
+    let source_node_id = Some("node-caller".to_owned());
+    let capability = Some("servicenet.agents.invoke".to_owned());
+    let source_agent_card = signed_source_agent_card(&signing_key);
+    let source_agent_card_hash = source_agent_card
+        .get("card_hash")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let message = serde_json::json!({
+        "message": "Book a flight"
+    });
+    let extensions = serde_json::json!({
+        "caller_public_id": "pub_caller"
+    });
+    let message_json = serde_json::to_string(&message).expect("message should serialize");
+    let extensions_json =
+        Some(serde_json::to_string(&extensions).expect("extensions should serialize"));
+    let payload = SignedAgentEnvelopePayload {
+        protocol: "google_a2a",
+        transport_profile: transport_profile.as_ref(),
+        source_agent_id: Some(&source_agent_id),
+        target_agent_id: target_agent_id.as_ref(),
+        source_node_id: source_node_id.as_ref(),
+        target_node_id: None,
+        capability: capability.as_ref(),
+        source_agent_card_hash: source_agent_card_hash.as_ref(),
+        message_json: &message_json,
+        extensions_json: extensions_json.as_ref(),
+    };
+    serde_json::json!({
+        "protocol": "google_a2a",
+        "transport_profile": transport_profile,
+        "source_agent_id": source_agent_id,
+        "target_agent_id": target_agent_id,
+        "source_node_id": source_node_id,
+        "capability": capability,
+        "source_agent_card": source_agent_card,
+        "message": message,
+        "extensions": extensions,
+        "signature": sign_payload(&payload, &signing_key)
+    })
 }
 
 fn provider_payload() -> serde_json::Value {
@@ -482,6 +605,49 @@ async fn agent_submission_can_be_approved_and_published() {
     assert_eq!(agents.status(), StatusCode::OK);
     let agents_json = response_json(agents).await;
     assert_eq!(agents_json["items"][0]["agent_id"], "stripe-agent");
+    assert_eq!(
+        agents_json["items"][0]["deployment"]["runtime"].as_str(),
+        Some("remote_http")
+    );
+    assert!(
+        agents_json["items"][0]["deployment"]["endpoint"]
+            .get("url")
+            .is_none()
+    );
+    assert!(agents_json["items"][0]["agent_card"].get("url").is_none());
+    assert_eq!(
+        agents_json["items"][0]["invoke"]["sync_url"].as_str(),
+        Some("/v1/agents/stripe-agent/invoke")
+    );
+    let public_list_body = serde_json::to_string(&agents_json).expect("list body should serialize");
+    assert!(!public_list_body.contains("https://stripe-agent.example.com"));
+
+    let agent = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/agents/stripe-agent")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("agent get should succeed");
+    assert_eq!(agent.status(), StatusCode::OK);
+    let agent_json = response_json(agent).await;
+    assert_eq!(agent_json["agent_id"], "stripe-agent");
+    assert_eq!(
+        agent_json["deployment"]["endpoint"]["protocol_binding"].as_str(),
+        Some("JSONRPC")
+    );
+    assert!(agent_json["deployment"]["endpoint"].get("url").is_none());
+    assert!(agent_json["agent_card"].get("url").is_none());
+    assert_eq!(
+        agent_json["invoke"]["async_url"].as_str(),
+        Some("/v1/agents/stripe-agent/invoke-async")
+    );
+    let public_detail_body =
+        serde_json::to_string(&agent_json).expect("detail body should serialize");
+    assert!(!public_detail_body.contains("https://stripe-agent.example.com"));
 
     let submission = app
         .oneshot(
@@ -699,7 +865,8 @@ async fn approved_agent_can_be_invoked_over_a2a_and_polled() {
                         "message": "Create a payment link",
                         "input": { "amount": 42, "currency": "AUD" },
                         "auth_token": "test-token",
-                        "region": "AU"
+                        "region": "AU",
+                        "agent_envelope": signed_agent_envelope()
                     })
                     .to_string(),
                 ))
@@ -756,7 +923,8 @@ async fn approved_agent_can_be_invoked_async_and_polled_by_receipt() {
                         "message": "Create a payment link",
                         "input": { "amount": 42, "currency": "AUD" },
                         "auth_token": "test-token",
-                        "region": "AU"
+                        "region": "AU",
+                        "agent_envelope": signed_agent_envelope()
                     })
                     .to_string(),
                 ))
@@ -810,6 +978,7 @@ async fn approved_agent_can_be_invoked_over_a2a_with_x402_settlement() {
     let _submission_id = register_provider_and_approve_agent(&app, &a2a_url, &card_url).await;
 
     let invoke = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -832,7 +1001,8 @@ async fn approved_agent_can_be_invoked_over_a2a_with_x402_settlement() {
                         },
                         "auth_token": "test-token",
                         "region": "AU",
-                        "confirm_risky": true
+                        "confirm_risky": true,
+                        "agent_envelope": signed_agent_envelope()
                     })
                     .to_string(),
                 ))
@@ -848,6 +1018,37 @@ async fn approved_agent_can_be_invoked_over_a2a_with_x402_settlement() {
         invoke_json["payment_receipt"]["status"],
         serde_json::json!("authorized")
     );
+    let receipt_id = invoke_json["receipt_id"]
+        .as_str()
+        .expect("receipt id should exist");
+    let receipt = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/receipts/{receipt_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("receipt should load");
+    assert_eq!(receipt.status(), StatusCode::OK);
+    let receipt_json = response_json(receipt).await;
+    assert_eq!(
+        receipt_json["receipt"]["caller_agent_id"],
+        serde_json::json!(did_from_signing_key(&caller_signing_key()))
+    );
+    assert_eq!(
+        receipt_json["receipt"]["caller_public_id"],
+        serde_json::json!("pub_caller")
+    );
+    assert_eq!(
+        receipt_json["receipt"]["caller_display_name"],
+        serde_json::json!("Caller Agent")
+    );
+    assert_eq!(
+        receipt_json["receipt"]["caller_node_id"],
+        serde_json::json!("node-caller")
+    );
 
     let captured = captured.lock().expect("capture lock");
     let request = captured.last().expect("captured request");
@@ -859,6 +1060,10 @@ async fn approved_agent_can_be_invoked_over_a2a_with_x402_settlement() {
     assert_eq!(
         request["params"]["extensions"]["settlement"]["request"]["protocol"],
         "x402"
+    );
+    assert_eq!(
+        request["params"]["extensions"]["agent_envelope"]["extensions"]["caller_public_id"],
+        serde_json::json!("pub_caller")
     );
 }
 
@@ -996,7 +1201,8 @@ async fn blocked_agent_is_rejected_until_unblocked() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "message": "Create a payment link"
+                        "message": "Create a payment link",
+                        "agent_envelope": signed_agent_envelope()
                     })
                     .to_string(),
                 ))
@@ -1032,7 +1238,8 @@ async fn blocked_agent_is_rejected_until_unblocked() {
                     serde_json::json!({
                         "message": "Create a payment link",
                         "auth_token": "test-token",
-                        "region": "AU"
+                        "region": "AU",
+                        "agent_envelope": signed_agent_envelope()
                     })
                     .to_string(),
                 ))
