@@ -25,15 +25,16 @@ use watt_servicenet_protocol::{
     AgentSubmissionQuery, AgentSubmissionRecord, AgentSubmissionStatus, AgentTrustRecord,
     ApproveAgentSubmissionRequest, AuthContextQuery, AuthContextRecord, BlockEntityRequest,
     CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest, ExecutionReceipt,
-    HealthStatus, ModerationAction, ModerationCase, ModerationCaseQuery, ModerationStatus,
-    ModerationTargetKind, ProviderAuditEvent, ProviderAuditKind, ProviderHealthRecord,
-    ProviderOwnershipChallenge, ProviderOwnershipOperation, ProviderRecord, ProviderStatus,
-    ProviderTrustRecord, PublishedAgentRecord, PublishedAgentStatus, ReceiptQuery, ReceiptStatus,
-    RegisterAuthContextRequest, RegisterProviderRequest, RejectAgentSubmissionRequest,
-    ResolveModerationCaseRequest, RevokeProviderRequest, RiskLevel, RotateProviderKeyRequest,
-    RunVerifierSweepRequest, SERVICE_PROTOCOL_SCHEMA_VERSION, StoredReceipt, SubmitAgentRequest,
-    UnpublishAgentRequest, VerificationRecord, VerificationVerdict, VerifyReceiptRequest,
-    build_agent_attestation_payload, build_agent_unpublish_payload,
+    HealthStatus, InvocationMode, ModerationAction, ModerationCase, ModerationCaseQuery,
+    ModerationStatus, ModerationTargetKind, ProviderAuditEvent, ProviderAuditKind,
+    ProviderHealthRecord, ProviderOwnershipChallenge, ProviderOwnershipOperation, ProviderRecord,
+    ProviderStatus, ProviderTrustRecord, PublishedAgentRecord, PublishedAgentStatus, ReceiptQuery,
+    ReceiptStatus, RegisterAuthContextRequest, RegisterProviderRequest,
+    RejectAgentSubmissionRequest, ResolveModerationCaseRequest, RevokeProviderRequest, RiskLevel,
+    RotateProviderKeyRequest, RunVerifierSweepRequest, SERVICE_PROTOCOL_SCHEMA_VERSION,
+    StoredReceipt, SubmitAgentRequest, UnpublishAgentRequest, VerificationRecord,
+    VerificationVerdict, VerifyReceiptRequest, build_agent_attestation_payload,
+    build_agent_unpublish_payload,
 };
 
 #[derive(Debug, Error)]
@@ -344,6 +345,7 @@ impl PostgresRegistryStore {
                     receipt_id UUID PRIMARY KEY,
                     agent_id TEXT NOT NULL,
                     provider_id TEXT NOT NULL,
+                    invoke_mode TEXT NOT NULL DEFAULT 'sync',
                     caller_agent_id TEXT NULL,
                     caller_public_id TEXT NULL,
                     caller_display_name TEXT NULL,
@@ -358,6 +360,9 @@ impl PostgresRegistryStore {
                 r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS caller_agent_id TEXT NULL"#
             ),
             format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS invoke_mode TEXT NOT NULL DEFAULT 'sync'"#
+            ),
+            format!(
                 r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS caller_public_id TEXT NULL"#
             ),
             format!(
@@ -368,6 +373,9 @@ impl PostgresRegistryStore {
             ),
             format!(
                 r#"CREATE INDEX IF NOT EXISTS "receipts_agent_caller_idx" ON "{schema}"."receipts" (agent_id, caller_agent_id)"#
+            ),
+            format!(
+                r#"CREATE INDEX IF NOT EXISTS "receipts_invoke_mode_idx" ON "{schema}"."receipts" (invoke_mode)"#
             ),
             format!(
                 r#"CREATE INDEX IF NOT EXISTS "receipts_public_caller_idx" ON "{schema}"."receipts" (caller_public_id)"#
@@ -861,11 +869,12 @@ impl RegistryStore for PostgresRegistryStore {
         for stored in state.receipts.values() {
             let (created_at, updated_at) = receipt_timestamps(stored);
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."receipts" (receipt_id, agent_id, provider_id, caller_agent_id, caller_public_id, caller_display_name, caller_node_id, verification, created_at, updated_at, stored_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                r#"INSERT INTO "{}"."receipts" (receipt_id, agent_id, provider_id, invoke_mode, caller_agent_id, caller_public_id, caller_display_name, caller_node_id, verification, created_at, updated_at, stored_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                    ON CONFLICT (receipt_id) DO UPDATE SET
                      agent_id = EXCLUDED.agent_id,
                      provider_id = EXCLUDED.provider_id,
+                     invoke_mode = EXCLUDED.invoke_mode,
                      caller_agent_id = EXCLUDED.caller_agent_id,
                      caller_public_id = EXCLUDED.caller_public_id,
                      caller_display_name = EXCLUDED.caller_display_name,
@@ -878,6 +887,7 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(stored.receipt.receipt_id)
             .bind(&stored.receipt.agent_id)
             .bind(&stored.receipt.provider_id)
+            .bind(invocation_mode_column(&stored.receipt.invoke_mode))
             .bind(&stored.receipt.caller_agent_id)
             .bind(&stored.receipt.caller_public_id)
             .bind(&stored.receipt.caller_display_name)
@@ -1322,6 +1332,13 @@ fn receipt_timestamps(stored: &StoredReceipt) -> (DateTime<Utc>, DateTime<Utc>) 
     (created_at, updated_at)
 }
 
+fn invocation_mode_column(mode: &InvocationMode) -> &'static str {
+    match mode {
+        InvocationMode::Sync => "sync",
+        InvocationMode::Async => "async",
+    }
+}
+
 fn verification_timestamps(
     records: &[VerificationRecord],
 ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
@@ -1705,6 +1722,12 @@ impl ServiceRegistry {
                     .is_none_or(|caller_public_id| {
                         stored.receipt.caller_public_id.as_deref() == Some(caller_public_id)
                     })
+            })
+            .filter(|stored| {
+                query
+                    .invoke_mode
+                    .as_ref()
+                    .is_none_or(|invoke_mode| &stored.receipt.invoke_mode == invoke_mode)
             })
             .filter(|stored| {
                 query
@@ -3970,6 +3993,7 @@ mod tests {
                 caller_public_id: Some("pub_caller".to_owned()),
                 caller_display_name: Some("Caller Agent".to_owned()),
                 caller_node_id: Some("node-caller".to_owned()),
+                invoke_mode: InvocationMode::Sync,
                 status: watt_servicenet_protocol::ReceiptStatus::Succeeded,
                 verification: VerificationVerdict::Pending,
                 request_digest: "req".to_owned(),
@@ -4412,6 +4436,7 @@ mod tests {
                 caller_public_id: None,
                 caller_display_name: None,
                 caller_node_id: None,
+                invoke_mode: InvocationMode::Sync,
                 status: watt_servicenet_protocol::ReceiptStatus::Succeeded,
                 verification: VerificationVerdict::Pending,
                 request_digest: "req".to_owned(),

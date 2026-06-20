@@ -11,9 +11,9 @@ use uuid::Uuid;
 use watt_did::{Did, DidKey, DidKeyPublicKey};
 use watt_servicenet_protocol::{
     AgentInteractionProtocol, AuthContextRecord, ExecutionReceipt, GetAgentTaskRequest,
-    InvokeAgentRequest, InvokeAgentResponse, NormalizedSettlementRequest, PublishedAgentRecord,
-    ReceiptStatus, RiskLevel, SettlementLayer, SettlementRequest, StoredReceipt,
-    VerificationVerdict,
+    InvocationMode, InvokeAgentRequest, InvokeAgentResponse, NormalizedSettlementRequest,
+    PublishedAgentRecord, ReceiptStatus, RiskLevel, SettlementLayer, SettlementRequest,
+    StoredReceipt, VerificationVerdict,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry};
 
@@ -275,8 +275,15 @@ impl GatewayService {
         request: InvokeAgentRequest,
     ) -> Result<InvokeAgentResponse, GatewayError> {
         let prepared = self.prepare_invocation(agent_id, &request).await?;
-        self.execute_prepared_invocation(agent_id, request, prepared, Uuid::new_v4(), Utc::now())
-            .await
+        self.execute_prepared_invocation(
+            agent_id,
+            request,
+            prepared,
+            Uuid::new_v4(),
+            Utc::now(),
+            InvocationMode::Sync,
+        )
+        .await
     }
 
     pub async fn invoke_agent_async(
@@ -296,6 +303,7 @@ impl GatewayService {
                 caller_public_id: prepared.caller_context.caller_public_id.clone(),
                 caller_display_name: prepared.caller_context.caller_display_name.clone(),
                 caller_node_id: prepared.caller_context.caller_node_id.clone(),
+                invoke_mode: InvocationMode::Async,
                 status: ReceiptStatus::Running,
                 verification: VerificationVerdict::NotRequired,
                 request_digest: prepared.request_digest.clone(),
@@ -322,6 +330,7 @@ impl GatewayService {
                     prepared,
                     receipt_id,
                     started_at,
+                    InvocationMode::Async,
                 )
                 .await
             {
@@ -391,6 +400,7 @@ impl GatewayService {
         prepared: PreparedInvocation,
         receipt_id: Uuid,
         started_at: DateTime<Utc>,
+        invoke_mode: InvocationMode,
     ) -> Result<InvokeAgentResponse, GatewayError> {
         if request
             .context_id
@@ -423,6 +433,7 @@ impl GatewayService {
                 caller_public_id: prepared.caller_context.caller_public_id.clone(),
                 caller_display_name: prepared.caller_context.caller_display_name.clone(),
                 caller_node_id: prepared.caller_context.caller_node_id.clone(),
+                invoke_mode,
                 status: ReceiptStatus::Succeeded,
                 verification: verification_for_risk(&prepared.record.review.risk_level),
                 request_digest: prepared.request_digest,
@@ -1474,6 +1485,7 @@ mod tests {
             .await
             .expect("receipts should load");
         assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].receipt.invoke_mode, InvocationMode::Sync);
     }
 
     #[tokio::test]
@@ -1608,6 +1620,7 @@ mod tests {
             .get_receipt(receipt_id)
             .await
             .expect("running receipt should exist");
+        assert_eq!(stored.receipt.invoke_mode, InvocationMode::Async);
         for _ in 0..20 {
             if stored.receipt.status == ReceiptStatus::Succeeded {
                 break;
@@ -1620,6 +1633,7 @@ mod tests {
         }
 
         assert_eq!(stored.receipt.status, ReceiptStatus::Succeeded);
+        assert_eq!(stored.receipt.invoke_mode, InvocationMode::Async);
         assert!(stored.receipt.completed_at.is_some());
         assert_eq!(
             stored

@@ -74,6 +74,17 @@ pub enum ReceiptStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum InvocationMode {
+    Sync,
+    Async,
+}
+
+fn default_invocation_mode() -> InvocationMode {
+    InvocationMode::Sync
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VerificationVerdict {
     NotRequired,
     Pending,
@@ -94,6 +105,8 @@ pub struct ExecutionReceipt {
     pub caller_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_node_id: Option<String>,
+    #[serde(default = "default_invocation_mode")]
+    pub invoke_mode: InvocationMode,
     pub status: ReceiptStatus,
     pub verification: VerificationVerdict,
     pub request_digest: String,
@@ -125,6 +138,8 @@ pub struct ReceiptQuery {
     pub caller_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_public_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoke_mode: Option<InvocationMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<VerificationVerdict>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

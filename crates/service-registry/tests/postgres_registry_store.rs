@@ -8,8 +8,9 @@ use uuid::Uuid;
 use watt_servicenet_protocol::{
     AgentArtifacts, AgentAttestations, AgentDeployment, AgentDeploymentEndpoint,
     AgentInteractionProtocol, AgentReviewProfile, ApproveAgentSubmissionRequest, ExecutionReceipt,
-    ReceiptQuery, ReceiptStatus, RegisterProviderRequest, RiskLevel, RotateProviderKeyRequest,
-    StoredReceipt, SubmitAgentRequest, VerificationVerdict, build_agent_attestation_payload,
+    InvocationMode, ReceiptQuery, ReceiptStatus, RegisterProviderRequest, RiskLevel,
+    RotateProviderKeyRequest, StoredReceipt, SubmitAgentRequest, VerificationVerdict,
+    build_agent_attestation_payload,
 };
 use watt_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
 
@@ -116,6 +117,7 @@ fn stored_receipt() -> StoredReceipt {
             caller_public_id: Some("pub_caller_pg".to_owned()),
             caller_display_name: Some("Postgres Caller".to_owned()),
             caller_node_id: Some("node-caller-pg".to_owned()),
+            invoke_mode: InvocationMode::Async,
             status: ReceiptStatus::Succeeded,
             verification: VerificationVerdict::NotRequired,
             request_digest: "req".to_owned(),
@@ -325,11 +327,25 @@ async fn postgres_store_persists_agent_receipts_and_health() {
         receipts[0].receipt.caller_public_id.as_deref(),
         Some("pub_caller_pg")
     );
+    assert_eq!(receipts[0].receipt.invoke_mode, InvocationMode::Async);
+
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("postgres pool should connect");
+    let invoke_mode: String = sqlx::query_scalar(&format!(
+        r#"SELECT invoke_mode FROM "{schema}"."receipts" WHERE receipt_id = $1"#
+    ))
+    .bind(receipts[0].receipt.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .expect("receipt invoke mode column should be queryable");
+    assert_eq!(invoke_mode, "async");
 
     let caller_receipts = registry
         .list_receipts(&ReceiptQuery {
             caller_agent_id: Some("did:key:zCallerPg".to_owned()),
             caller_public_id: Some("pub_caller_pg".to_owned()),
+            invoke_mode: Some(InvocationMode::Async),
             ..ReceiptQuery::default()
         })
         .await

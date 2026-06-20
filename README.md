@@ -87,12 +87,11 @@ Docker Compose starts PostgreSQL and `watt-servicenet-node`, with the API on
 
 The Rust workspace keeps local path dependencies for development. During Docker
 builds, the `Dockerfile` rewrites those path dependencies to git dependencies so
-release builds can run outside the local Watt source tree. Private dependency
-access uses the BuildKit secret `github_token`, backed by the `GITHUB_TOKEN`
-environment variable:
+release builds can run outside the local Watt source tree. The default
+dependency sources are public GitHub repositories, so Docker builds do not
+require a GitHub token:
 
 ```bash
-export GITHUB_TOKEN=<token>
 docker compose up --build
 ```
 
