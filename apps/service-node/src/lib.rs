@@ -33,6 +33,7 @@ const DEFAULT_AGENT_LIST_LIMIT: usize = 50;
 const MAX_AGENT_LIST_LIMIT: usize = 100;
 const P2P_BACKFILL_PAGE_SIZE: usize = 256;
 const DEFAULT_P2P_ANTI_ENTROPY_INTERVAL_SECS: u64 = 60;
+const PUBLIC_SERVICENET_NETWORK_ID: &str = "mainnet.watt-etheria";
 const SERVICENET_FEDERATION_MODE_ENV: &str = "SERVICENET_FEDERATION_MODE";
 const SERVICENET_FEDERATION_TRUSTED_PEERS_ENV: &str = "SERVICENET_FEDERATION_TRUSTED_PEERS";
 const SERVICENET_P2P_ANTI_ENTROPY_INTERVAL_SECS_ENV: &str =
@@ -412,6 +413,19 @@ fn public_published_agent_view(agent: &PublishedAgentRecord) -> serde_json::Valu
                 "async_url": format!("/v1/agents/{}/invoke-async", agent.agent_id),
             }),
         );
+        object.insert(
+            "address".to_owned(),
+            serde_json::json!(format!(
+                "wattetheria://{PUBLIC_SERVICENET_NETWORK_ID}/service/{}",
+                agent.agent_id
+            )),
+        );
+        if let Some(service_address) = agent.service_address.as_deref() {
+            object.insert(
+                "alsoKnownAs".to_owned(),
+                serde_json::json!([service_address]),
+            );
+        }
     }
     view
 }
@@ -1574,6 +1588,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "agent_id": "agent-auto-approved",
             "provider_id": "provider-local",
+            "service_address": "agent-auto-approved@wattetheria",
             "version": "0.1.0",
             "status": status,
             "agent_card": {

@@ -60,6 +60,7 @@ fn agent_submission() -> SubmitAgentRequest {
     let mut request = SubmitAgentRequest {
         provider_id: "provider-pg".to_owned(),
         agent_id: "stripe-agent".to_owned(),
+        service_address: Some("stripe@wattetheria".to_owned()),
         version: "0.1.0".to_owned(),
         agent_card: json!({
             "name": "Stripe Agent",

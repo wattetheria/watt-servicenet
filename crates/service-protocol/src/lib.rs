@@ -524,6 +524,7 @@ pub fn build_agent_attestation_payload(request: &SubmitAgentRequest) -> Value {
     json!({
         "provider_id": request.provider_id,
         "agent_id": request.agent_id,
+        "service_address": request.service_address,
         "version": request.version,
         "agent_card": request.agent_card,
         "deployment": request.deployment,
@@ -544,6 +545,8 @@ pub fn build_agent_attestation_payload(request: &SubmitAgentRequest) -> Value {
 pub struct SubmitAgentRequest {
     pub provider_id: String,
     pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_address: Option<String>,
     pub version: String,
     pub agent_card: Value,
     pub deployment: AgentDeployment,
@@ -558,6 +561,8 @@ pub struct AgentSubmissionRecord {
     pub submission_id: Uuid,
     pub provider_id: String,
     pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_address: Option<String>,
     pub version: String,
     pub status: AgentSubmissionStatus,
     pub agent_card: Value,
@@ -627,6 +632,8 @@ pub fn build_agent_unpublish_payload(agent_id: &str, request: &UnpublishAgentReq
 pub struct PublishedAgentRecord {
     pub agent_id: String,
     pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_address: Option<String>,
     pub version: String,
     pub status: PublishedAgentStatus,
     pub agent_card: Value,
@@ -748,6 +755,7 @@ mod tests {
         let request: SubmitAgentRequest = serde_json::from_value(serde_json::json!({
             "provider_id": "acme-labs",
             "agent_id": "stripe-agent",
+            "service_address": "stripe@wattetheria",
             "version": "0.1.0",
             "agent_card": {
                 "name": "Stripe Agent",
@@ -787,6 +795,10 @@ mod tests {
         }))
         .expect("submit agent request should parse");
         assert_eq!(request.agent_id, "stripe-agent");
+        assert_eq!(
+            request.service_address.as_deref(),
+            Some("stripe@wattetheria")
+        );
         assert_eq!(request.review.cost_per_call_units, Some(10));
         assert_eq!(
             request.deployment.endpoint.interaction_protocol,

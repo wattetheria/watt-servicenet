@@ -1243,6 +1243,7 @@ mod tests {
         let mut request = SubmitAgentRequest {
             provider_id: "provider-1".to_owned(),
             agent_id: "stripe-agent".to_owned(),
+            service_address: Some("stripe@wattetheria".to_owned()),
             version: "0.1.0".to_owned(),
             agent_card: serde_json::json!({
                 "name": "Stripe Agent",

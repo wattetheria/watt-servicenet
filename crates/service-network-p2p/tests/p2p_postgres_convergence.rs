@@ -37,6 +37,7 @@ fn published_agent() -> PublishedAgentRecord {
     PublishedAgentRecord {
         agent_id: "stripe-agent-p2p".to_owned(),
         provider_id: "provider-p2p".to_owned(),
+        service_address: None,
         version: "0.1.0".to_owned(),
         status: PublishedAgentStatus::Approved,
         agent_card: serde_json::json!({

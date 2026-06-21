@@ -488,6 +488,7 @@ impl PostgresRegistryStore {
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."published_agents" (
                     agent_id TEXT PRIMARY KEY,
                     provider_id TEXT NOT NULL,
+                    service_address TEXT NULL,
                     status TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -525,6 +526,28 @@ impl PostgresRegistryStore {
                     .with_context(|| format!("failed to run migration: {statement}"))?;
             }
         }
+        let published_agent_service_address_statement = format!(
+            r#"ALTER TABLE "{schema}"."published_agents" ADD COLUMN IF NOT EXISTS service_address TEXT NULL"#
+        );
+        sqlx::query(&published_agent_service_address_statement)
+            .execute(&self.pool)
+            .await
+            .with_context(|| {
+                format!("failed to run migration: {published_agent_service_address_statement}")
+            })?;
+        let published_agent_service_address_index_statement = format!(
+            r#"CREATE UNIQUE INDEX IF NOT EXISTS "{schema}_published_agents_service_address_idx"
+               ON "{schema}"."published_agents" (service_address)
+               WHERE service_address IS NOT NULL"#
+        );
+        sqlx::query(&published_agent_service_address_index_statement)
+            .execute(&self.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to run migration: {published_agent_service_address_index_statement}"
+                )
+            })?;
         let backfills = vec![
             format!(
                 r#"UPDATE "{schema}"."providers"
@@ -1130,10 +1153,11 @@ impl RegistryStore for PostgresRegistryStore {
 
         for record in state.published_agents.values() {
             sqlx::query(&format!(
-                r#"INSERT INTO "{}"."published_agents" (agent_id, provider_id, status, created_at, updated_at, record_json)
-                   VALUES ($1, $2, $3, $4, $5, $6)
+                r#"INSERT INTO "{}"."published_agents" (agent_id, provider_id, service_address, status, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
                    ON CONFLICT (agent_id) DO UPDATE SET
                      provider_id = EXCLUDED.provider_id,
+                     service_address = EXCLUDED.service_address,
                      status = EXCLUDED.status,
                      updated_at = EXCLUDED.updated_at,
                      record_json = EXCLUDED.record_json"#,
@@ -1141,6 +1165,7 @@ impl RegistryStore for PostgresRegistryStore {
             ))
             .bind(&record.agent_id)
             .bind(&record.provider_id)
+            .bind(&record.service_address)
             .bind(format!("{:?}", record.status))
             .bind(record.approved_at)
             .bind(record.updated_at)
@@ -2318,6 +2343,7 @@ impl ServiceRegistry {
         &self,
         request: SubmitAgentRequest,
     ) -> Result<AgentSubmissionRecord, RegistryError> {
+        let request = normalize_submit_agent_request(request)?;
         let mut state = self.load_state().await?;
         validate_submit_agent_request(&request, &state)?;
         evict_expired_attestation_nonces(&mut state);
@@ -2351,6 +2377,7 @@ impl ServiceRegistry {
             submission_id: Uuid::new_v4(),
             provider_id: request.provider_id,
             agent_id: request.agent_id,
+            service_address: request.service_address,
             version: request.version,
             status,
             agent_card: request.agent_card,
@@ -2368,6 +2395,7 @@ impl ServiceRegistry {
             validate_published_agent(
                 &record.provider_id,
                 &record.agent_id,
+                record.service_address.as_deref(),
                 &record.agent_card,
                 &record.deployment,
                 &record.review,
@@ -2376,6 +2404,7 @@ impl ServiceRegistry {
             let published = PublishedAgentRecord {
                 agent_id: record.agent_id.clone(),
                 provider_id: record.provider_id.clone(),
+                service_address: record.service_address.clone(),
                 version: record.version.clone(),
                 status: PublishedAgentStatus::Approved,
                 agent_card: record.agent_card.clone(),
@@ -2463,7 +2492,7 @@ impl ServiceRegistry {
         }
         let mut state = self.load_state().await?;
         let now = Utc::now();
-        let (provider_id, agent_id, version, agent_card, deployment, review) = {
+        let (provider_id, agent_id, service_address, version, agent_card, deployment, review) = {
             let submission = state
                 .agent_submissions
                 .get_mut(&submission_id)
@@ -2495,6 +2524,7 @@ impl ServiceRegistry {
             (
                 submission.provider_id.clone(),
                 submission.agent_id.clone(),
+                submission.service_address.clone(),
                 submission.version.clone(),
                 submission.agent_card.clone(),
                 submission.deployment.clone(),
@@ -2504,6 +2534,7 @@ impl ServiceRegistry {
         validate_published_agent(
             &provider_id,
             &agent_id,
+            service_address.as_deref(),
             &agent_card,
             &deployment,
             &review,
@@ -2512,6 +2543,7 @@ impl ServiceRegistry {
         let record = PublishedAgentRecord {
             agent_id: agent_id.clone(),
             provider_id,
+            service_address,
             version,
             status: PublishedAgentStatus::Approved,
             agent_card,
@@ -2673,6 +2705,7 @@ impl ServiceRegistry {
         validate_published_agent(
             &record.provider_id,
             &record.agent_id,
+            record.service_address.as_deref(),
             &record.agent_card,
             &record.deployment,
             &record.review,
@@ -3285,6 +3318,7 @@ const REQUIRE_ADMIN_APPROVE_ENV: &str = "SERVICENET_REQUIRE_ADMIN_APPROVE";
 const AUTO_APPROVE_REVIEWER: &str = "auto-approve";
 const AUTO_APPROVE_NOTE: &str =
     "Auto-approved: signature, binding, and schema validated; no admin gating.";
+const MAX_AGENT_CARD_NAME_CHARS: usize = 40;
 
 fn smoke_test_enabled() -> bool {
     matches!(
@@ -3369,6 +3403,110 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+fn normalize_submit_agent_request(
+    mut request: SubmitAgentRequest,
+) -> Result<SubmitAgentRequest, RegistryError> {
+    request.service_address = request
+        .service_address
+        .as_deref()
+        .map(normalize_service_address)
+        .transpose()?;
+    Ok(request)
+}
+
+fn normalize_service_address(raw: &str) -> Result<String, RegistryError> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    validate_service_address_value(&normalized)?;
+    Ok(normalized)
+}
+
+fn validate_service_address(
+    agent_id: &str,
+    service_address: Option<&str>,
+) -> Result<(), RegistryError> {
+    if let Some(service_address) = service_address {
+        validate_service_address_value(service_address).map_err(|error| match error {
+            RegistryError::InvalidAgent(message) => RegistryError::InvalidAgent(format!(
+                "service_address for agent_id {agent_id} is invalid: {message}"
+            )),
+            other => other,
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_service_address_value(service_address: &str) -> Result<(), RegistryError> {
+    if service_address.is_empty() {
+        return Err(RegistryError::InvalidAgent(
+            "service_address must not be empty".to_owned(),
+        ));
+    }
+    if service_address.len() > 128 {
+        return Err(RegistryError::InvalidAgent(
+            "service_address must be 128 characters or less".to_owned(),
+        ));
+    }
+    if service_address != service_address.to_ascii_lowercase() {
+        return Err(RegistryError::InvalidAgent(
+            "service_address must be lowercase".to_owned(),
+        ));
+    }
+    let (local, namespace) = service_address.split_once('@').ok_or_else(|| {
+        RegistryError::InvalidAgent("service_address must use local@namespace format".to_owned())
+    })?;
+    if namespace.contains('@') {
+        return Err(RegistryError::InvalidAgent(
+            "service_address must contain exactly one @".to_owned(),
+        ));
+    }
+    validate_service_address_label(local, "local")?;
+    for segment in namespace.split('.') {
+        validate_service_address_label(segment, "namespace")?;
+    }
+    Ok(())
+}
+
+fn validate_service_address_label(label: &str, field: &str) -> Result<(), RegistryError> {
+    if label.is_empty() {
+        return Err(RegistryError::InvalidAgent(format!(
+            "service_address {field} segment must not be empty"
+        )));
+    }
+    if label.starts_with('-') || label.ends_with('-') {
+        return Err(RegistryError::InvalidAgent(format!(
+            "service_address {field} segment must not start or end with -"
+        )));
+    }
+    if !label
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(RegistryError::InvalidAgent(format!(
+            "service_address {field} segment must contain only lowercase letters, digits, and -"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_service_address_unique(
+    state: &RegistryState,
+    agent_id: &str,
+    service_address: Option<&str>,
+) -> Result<(), RegistryError> {
+    let Some(service_address) = service_address else {
+        return Ok(());
+    };
+    if let Some(existing) = state.published_agents.values().find(|record| {
+        record.agent_id != agent_id && record.service_address.as_deref() == Some(service_address)
+    }) {
+        return Err(RegistryError::InvalidAgent(format!(
+            "service_address is already assigned to agent_id {}",
+            existing.agent_id
+        )));
+    }
+    Ok(())
+}
+
 fn validate_submit_agent_request(
     request: &SubmitAgentRequest,
     state: &RegistryState,
@@ -3388,6 +3526,8 @@ fn validate_submit_agent_request(
             "version must not be empty".to_owned(),
         ));
     }
+    validate_service_address(&request.agent_id, request.service_address.as_deref())?;
+    validate_service_address_unique(state, &request.agent_id, request.service_address.as_deref())?;
     let provider = state
         .providers
         .get(&request.provider_id)
@@ -3421,6 +3561,7 @@ fn validate_submit_agent_request(
 fn validate_published_agent(
     provider_id: &str,
     agent_id: &str,
+    service_address: Option<&str>,
     agent_card: &serde_json::Value,
     deployment: &AgentDeployment,
     review: &AgentReviewProfile,
@@ -3431,6 +3572,8 @@ fn validate_published_agent(
             "agent_id must not be empty".to_owned(),
         ));
     }
+    validate_service_address(agent_id, service_address)?;
+    validate_service_address_unique(state, agent_id, service_address)?;
     let provider = state
         .providers
         .get(provider_id)
@@ -3506,7 +3649,7 @@ fn validate_agent_deployment(deployment: &AgentDeployment) -> Result<(), Registr
 }
 
 fn validate_agent_card(agent_card: &serde_json::Value) -> Result<(), RegistryError> {
-    require_card_string_field(agent_card, "name")?;
+    validate_agent_card_name(require_card_string_field(agent_card, "name")?)?;
     require_card_string_field(agent_card, "description")?;
     let url = require_card_string_field(agent_card, "url")?;
     if !is_secure_or_loopback_url(url) {
@@ -3546,6 +3689,21 @@ fn validate_agent_card(agent_card: &serde_json::Value) -> Result<(), RegistryErr
     {
         return Err(RegistryError::InvalidAgent(
             "agent_card.securitySchemes must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_agent_card_name(name: &str) -> Result<(), RegistryError> {
+    let trimmed = name.trim();
+    if trimmed.chars().count() > MAX_AGENT_CARD_NAME_CHARS {
+        return Err(RegistryError::InvalidAgent(format!(
+            "agent_card.name must be {MAX_AGENT_CARD_NAME_CHARS} characters or less"
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(RegistryError::InvalidAgent(
+            "agent_card.name must not contain control characters".to_owned(),
         ));
     }
     Ok(())
@@ -3936,6 +4094,7 @@ mod tests {
         let mut request = SubmitAgentRequest {
             provider_id: "provider-1".to_owned(),
             agent_id: agent_id.to_owned(),
+            service_address: Some(format!("{agent_id}@wattetheria")),
             version: "0.1.0".to_owned(),
             agent_card: json!({
                 "name": "Stripe Agent",
@@ -4052,6 +4211,111 @@ mod tests {
             .expect("published agent should exist");
         assert_eq!(published.status, PublishedAgentStatus::Approved);
         assert_eq!(published.reviewed_by, "auto-approve");
+    }
+
+    #[tokio::test]
+    async fn submit_agent_normalizes_service_address_before_publishing() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let mut request = demo_agent_submission("normalized-agent");
+        request.service_address = Some("normalized@wattetheria".to_owned());
+        let provider_key = provider_signing_key();
+        sign_submission_attestation(&mut request, &provider_key, None, None);
+        request.service_address = Some("  Normalized@Wattetheria  ".to_owned());
+
+        let submission = registry
+            .submit_agent(request)
+            .await
+            .expect("submission should normalize service address");
+
+        assert_eq!(
+            submission.service_address.as_deref(),
+            Some("normalized@wattetheria")
+        );
+        let published = registry
+            .get_published_agent("normalized-agent")
+            .await
+            .expect("published agent should exist");
+        assert_eq!(
+            published.service_address.as_deref(),
+            Some("normalized@wattetheria")
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_agent_rejects_duplicate_service_address() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        registry
+            .submit_agent(demo_agent_submission("first-agent"))
+            .await
+            .expect("first submission should publish");
+
+        let mut second = demo_agent_submission("second-agent");
+        second.service_address = Some("first-agent@wattetheria".to_owned());
+        let provider_key = provider_signing_key();
+        sign_submission_attestation(&mut second, &provider_key, None, None);
+        let err = registry
+            .submit_agent(second)
+            .await
+            .expect_err("duplicate service address should fail");
+
+        assert!(
+            matches!(&err, RegistryError::InvalidAgent(message) if message.contains("service_address is already assigned")),
+            "expected duplicate service_address InvalidAgent error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_agent_rejects_unsafe_agent_card_name() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let mut request = demo_agent_submission("unsafe-name-agent");
+        request.agent_card["name"] = serde_json::json!("Bad\u{0007}Name");
+        let provider_key = provider_signing_key();
+        sign_submission_attestation(&mut request, &provider_key, None, None);
+
+        let err = registry
+            .submit_agent(request)
+            .await
+            .expect_err("unsafe agent name should fail");
+
+        assert!(
+            matches!(&err, RegistryError::InvalidAgent(message) if message.contains("agent_card.name must not contain control characters")),
+            "expected unsafe agent_card.name InvalidAgent error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_agent_rejects_overlong_agent_card_name() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let mut request = demo_agent_submission("overlong-name-agent");
+        request.agent_card["name"] = serde_json::json!("名".repeat(MAX_AGENT_CARD_NAME_CHARS + 1));
+        let provider_key = provider_signing_key();
+        sign_submission_attestation(&mut request, &provider_key, None, None);
+
+        let err = registry
+            .submit_agent(request)
+            .await
+            .expect_err("overlong agent name should fail");
+
+        assert!(
+            matches!(&err, RegistryError::InvalidAgent(message) if message.contains("agent_card.name must be 40 characters or less")),
+            "expected overlong agent_card.name InvalidAgent error, got {err:?}"
+        );
     }
 
     #[tokio::test]
