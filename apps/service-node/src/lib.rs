@@ -1326,8 +1326,8 @@ mod tests {
     use super::{
         AppState, FederationTrustMode, FederationTrustPolicy, P2pCommand,
         ServiceNetworkSyncManifest, SummaryKind, backfill_offset, parse_env_flag,
-        provider_manifest_has_remote_winner, provider_record_wins, publish_auto_approved_agent,
-        published_agent_record_wins, split_csv, summary_wins,
+        provider_manifest_has_remote_winner, provider_record_wins, public_published_agent_view,
+        publish_auto_approved_agent, published_agent_record_wins, split_csv, summary_wins,
     };
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -1561,6 +1561,21 @@ mod tests {
 
         assert_ne!(first_summary.digest, second_summary.digest);
         assert_eq!(first_summary.version_ms, second_summary.version_ms);
+    }
+
+    #[test]
+    fn public_published_agent_view_exposes_service_address() {
+        let agent = published_agent_fixture("approved", "2026-01-01T00:00:00Z", "first");
+        let view = public_published_agent_view(&agent);
+
+        assert_eq!(
+            view["service_address"].as_str(),
+            Some("agent-auto-approved@wattetheria")
+        );
+        assert_eq!(
+            view["alsoKnownAs"][0].as_str(),
+            Some("agent-auto-approved@wattetheria")
+        );
     }
 
     fn provider_fixture(

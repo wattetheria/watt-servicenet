@@ -114,6 +114,15 @@ pub struct ConsumedAttestationNonce {
     pub expires_at_ms: u64,
 }
 
+fn hydrate_published_agent_service_address(
+    record: &mut PublishedAgentRecord,
+    service_address: Option<String>,
+) {
+    if record.service_address.is_none() {
+        record.service_address = service_address;
+    }
+}
+
 impl ConsumedAttestationNonce {
     pub fn key(attester_did: &str, nonce: &str) -> String {
         format!("{attester_did}|{nonce}")
@@ -810,13 +819,18 @@ impl RegistryStore for PostgresRegistryStore {
         }
 
         for row in sqlx::query(&format!(
-            r#"SELECT record_json FROM "{}"."published_agents""#,
+            r#"SELECT record_json, service_address FROM "{}"."published_agents""#,
             self.schema
         ))
         .fetch_all(&self.pool)
         .await?
         {
-            let record: PublishedAgentRecord = serde_json::from_value(row.try_get("record_json")?)?;
+            let mut record: PublishedAgentRecord =
+                serde_json::from_value(row.try_get("record_json")?)?;
+            hydrate_published_agent_service_address(
+                &mut record,
+                row.try_get::<Option<String>, _>("service_address")?,
+            );
             state
                 .published_agents
                 .insert(record.agent_id.clone(), record);
@@ -852,7 +866,7 @@ impl RegistryStore for PostgresRegistryStore {
         .fetch_one(&self.pool)
         .await?;
         let rows = sqlx::query(&format!(
-            r#"SELECT record_json FROM "{}"."published_agents" WHERE status = 'Approved' ORDER BY agent_id ASC LIMIT $1 OFFSET $2"#,
+            r#"SELECT record_json, service_address FROM "{}"."published_agents" WHERE status = 'Approved' ORDER BY agent_id ASC LIMIT $1 OFFSET $2"#,
             self.schema
         ))
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
@@ -861,7 +875,13 @@ impl RegistryStore for PostgresRegistryStore {
         .await?;
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
-            items.push(serde_json::from_value(row.try_get("record_json")?)?);
+            let mut record: PublishedAgentRecord =
+                serde_json::from_value(row.try_get("record_json")?)?;
+            hydrate_published_agent_service_address(
+                &mut record,
+                row.try_get::<Option<String>, _>("service_address")?,
+            );
+            items.push(record);
         }
         Ok((items, usize::try_from(known_count).unwrap_or(usize::MAX)))
     }
@@ -4242,6 +4262,61 @@ mod tests {
         assert_eq!(
             published.service_address.as_deref(),
             Some("normalized@wattetheria")
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_published_agent_service_address_uses_column_when_record_json_is_legacy() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        registry
+            .submit_agent(demo_agent_submission("legacy-json-agent"))
+            .await
+            .expect("submission should auto-approve");
+        let mut published = registry
+            .get_published_agent("legacy-json-agent")
+            .await
+            .expect("published agent should exist");
+        published.service_address = None;
+
+        hydrate_published_agent_service_address(
+            &mut published,
+            Some("legacy-json-agent@wattetheria".to_owned()),
+        );
+
+        assert_eq!(
+            published.service_address.as_deref(),
+            Some("legacy-json-agent@wattetheria")
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_published_agent_service_address_keeps_record_json_value() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        registry
+            .submit_agent(demo_agent_submission("json-value-agent"))
+            .await
+            .expect("submission should auto-approve");
+        let mut published = registry
+            .get_published_agent("json-value-agent")
+            .await
+            .expect("published agent should exist");
+
+        hydrate_published_agent_service_address(
+            &mut published,
+            Some("column-value@wattetheria".to_owned()),
+        );
+
+        assert_eq!(
+            published.service_address.as_deref(),
+            Some("json-value-agent@wattetheria")
         );
     }
 

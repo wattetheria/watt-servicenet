@@ -224,12 +224,49 @@ async fn postgres_store_handles_provider_agent_and_rotation_flow() {
         .await
         .expect("agent should approve");
 
+    assert_eq!(
+        approved.service_address.as_deref(),
+        Some("stripe@wattetheria")
+    );
+    let mut legacy_record_json: serde_json::Value = sqlx::query_scalar(&format!(
+        r#"SELECT record_json FROM "{schema}"."published_agents" WHERE agent_id = $1"#
+    ))
+    .bind("stripe-agent")
+    .fetch_one(&pool)
+    .await
+    .expect("published agent record_json should load");
+    legacy_record_json
+        .as_object_mut()
+        .expect("published agent record_json should be an object")
+        .remove("service_address");
+    sqlx::query(&format!(
+        r#"UPDATE "{schema}"."published_agents" SET record_json = $1 WHERE agent_id = $2"#
+    ))
+    .bind(legacy_record_json)
+    .bind("stripe-agent")
+    .execute(&pool)
+    .await
+    .expect("legacy record_json update should succeed");
+
     let agents = registry
         .list_published_agents()
         .await
         .expect("agent list should succeed");
     assert_eq!(agents.len(), 1);
     assert_eq!(approved.agent_id, "stripe-agent");
+    assert_eq!(
+        agents[0].service_address.as_deref(),
+        Some("stripe@wattetheria")
+    );
+    let (page_agents, known_count) = registry
+        .list_published_agents_page(10, 0)
+        .await
+        .expect("agent page should succeed");
+    assert_eq!(known_count, 1);
+    assert_eq!(
+        page_agents[0].service_address.as_deref(),
+        Some("stripe@wattetheria")
+    );
 
     let rotated = registry
         .rotate_provider_key(
