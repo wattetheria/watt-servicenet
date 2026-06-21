@@ -2987,8 +2987,8 @@ fn validate_agent_attestations(
     }
 
     verify_attestation_freshness(&request.attestations)?;
-    if let Some(binding) = request.attestations.payment_account_binding.as_ref() {
-        verify_payment_binding_against_attester(binding, attester_did)?;
+    for binding in agent_card_payment_account_bindings(&request.agent_card)? {
+        verify_payment_binding_against_attester(&binding, attester_did)?;
     }
     verify_agent_attestation_signature(attester_did, request)?;
     Ok(())
@@ -3199,6 +3199,43 @@ fn verify_payment_binding_against_attester(
             "payment_account_binding verification failed: {error}"
         ))
     })
+}
+
+fn agent_card_payment_account_bindings(
+    agent_card: &serde_json::Value,
+) -> Result<Vec<watt_did::PaymentAccountBindingProof>, RegistryError> {
+    let Some(extensions) = agent_card
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("extensions"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut bindings = Vec::new();
+    for extension in extensions {
+        let Some(raw_bindings) = extension
+            .get("params")
+            .and_then(|params| params.get("payment_account_bindings"))
+        else {
+            continue;
+        };
+        let raw_bindings = raw_bindings.as_array().ok_or_else(|| {
+            RegistryError::InvalidAgent(
+                "agent_card.capabilities.extensions[].params.payment_account_bindings must be an array"
+                    .to_owned(),
+            )
+        })?;
+        for raw_binding in raw_bindings {
+            let binding = serde_json::from_value(raw_binding.clone()).map_err(|error| {
+                RegistryError::InvalidAgent(format!(
+                    "invalid agent_card.capabilities.extensions[].params.payment_account_bindings entry: {error}"
+                ))
+            })?;
+            bindings.push(binding);
+        }
+    }
+    Ok(bindings)
 }
 
 fn verify_provider_attestation_delegation(
@@ -4023,10 +4060,15 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
     use tempfile::tempdir;
+    use watt_did::PaymentAccountCustody;
     use watt_servicenet_protocol::{
         AgentArtifacts, AgentAttestations, ApproveAgentSubmissionRequest, AuthModel,
         CreateProviderOwnershipChallengeRequest, ProviderOwnershipOperation,
         RegisterAuthContextRequest, RiskLevel, RunVerifierSweepRequest,
+    };
+    use watt_wallet::{
+        InMemoryKeyStore, KeyHandle, KeyStore, PaymentAccountBindingProofOptions,
+        PaymentAccountSigner, build_payment_account_binding_proof,
     };
 
     fn provider_signing_key() -> SigningKey {
@@ -4151,7 +4193,6 @@ mod tests {
                 delegation_token: None,
                 source_commit: None,
                 build_digest: None,
-                payment_account_binding: None,
                 nonce: None,
                 issued_at_ms: None,
                 expires_at_ms: None,
@@ -4160,6 +4201,86 @@ mod tests {
         let provider_key = provider_signing_key();
         sign_submission_attestation(&mut request, &provider_key, None, None);
         request
+    }
+
+    fn wallet_backed_provider_and_agent_submission(
+        agent_id: &str,
+    ) -> (RegisterProviderRequest, SubmitAgentRequest) {
+        let mut keystore = InMemoryKeyStore::new();
+        let agent_info = keystore.generate_ed25519().expect("agent key");
+        let payment_info = keystore.generate_secp256k1().expect("payment key");
+        let binding = build_payment_account_binding_proof(
+            &keystore,
+            PaymentAccountBindingProofOptions {
+                agent_did: agent_info.did.clone(),
+                agent_key_handle: &agent_info.key_handle,
+                agent_public_key_multibase: agent_info.public_key_multibase.clone(),
+                rail: "x402".to_owned(),
+                network: Some("base".to_owned()),
+                custody: PaymentAccountCustody::LocalGenerated,
+                receive_only: false,
+                can_sign: true,
+                capabilities: vec!["payment.receive".to_owned()],
+                issued_at_ms: 1_716_120_000_000,
+                expires_at_ms: None,
+                nonce: None,
+                payment_signer: Some(PaymentAccountSigner {
+                    key_handle: &payment_info.key_handle,
+                    public_key_multibase: payment_info.public_key_multibase.clone(),
+                }),
+                watch_only_payment_address: None,
+            },
+        )
+        .expect("build binding proof");
+        let provider = RegisterProviderRequest {
+            provider_id: "provider-1".to_owned(),
+            provider_did: agent_info.did.to_string(),
+            display_name: Some("Provider One".to_owned()),
+            ownership_challenge_id: None,
+            ownership_signature: None,
+        };
+        let mut request = demo_agent_submission(agent_id);
+        request.agent_card["capabilities"] = json!({
+            "extensions": [
+                {
+                    "uri": "https://github.com/google-a2a/a2a-x402/v0.1",
+                    "required": false,
+                    "params": {
+                        "accepts": [
+                            {
+                                "scheme": "exact",
+                                "network": "base",
+                                "payTo": binding.payment_address.clone(),
+                                "maxAmountRequired": "0",
+                                "resource": "servicenet:agent:test",
+                                "description": "ServiceNet agent invocation",
+                                "maxTimeoutSeconds": 600
+                            }
+                        ],
+                        "payment_account_bindings": [
+                            serde_json::to_value(binding).expect("serialize binding")
+                        ]
+                    }
+                }
+            ]
+        });
+        request.attestations.attestation_signature.clear();
+        sign_submission_attestation_with_wallet_key(
+            &mut request,
+            &keystore,
+            &agent_info.key_handle,
+        );
+        (provider, request)
+    }
+
+    fn sign_submission_attestation_with_wallet_key(
+        request: &mut SubmitAgentRequest,
+        keystore: &InMemoryKeyStore,
+        key_handle: &KeyHandle,
+    ) {
+        let payload = serde_jcs::to_vec(&build_agent_attestation_payload(request)).unwrap();
+        let signature = keystore.sign_bytes(key_handle, &payload).unwrap();
+        request.attestations.attestation_signature = STANDARD.encode(signature.0);
     }
 
     fn demo_receipt() -> StoredReceipt {
@@ -4231,6 +4352,52 @@ mod tests {
             .expect("published agent should exist");
         assert_eq!(published.status, PublishedAgentStatus::Approved);
         assert_eq!(published.reviewed_by, "auto-approve");
+    }
+
+    #[tokio::test]
+    async fn submit_agent_validates_payment_binding_from_agent_card_extension() {
+        let registry = ServiceRegistry::in_memory();
+        let (provider, request) = wallet_backed_provider_and_agent_submission("wallet-agent");
+        registry
+            .register_provider(provider)
+            .await
+            .expect("provider should register");
+
+        let submission = registry
+            .submit_agent(request)
+            .await
+            .expect("submission with valid payment binding should pass");
+
+        assert_eq!(submission.status, AgentSubmissionStatus::Approved);
+        assert!(
+            submission.agent_card["capabilities"]["extensions"][0]["params"]
+                ["payment_account_bindings"]
+                .as_array()
+                .is_some_and(|bindings| bindings.len() == 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_agent_rejects_tampered_payment_binding_from_agent_card_extension() {
+        let registry = ServiceRegistry::in_memory();
+        let (provider, mut request) =
+            wallet_backed_provider_and_agent_submission("tampered-wallet-agent");
+        registry
+            .register_provider(provider)
+            .await
+            .expect("provider should register");
+        request.agent_card["capabilities"]["extensions"][0]["params"]["payment_account_bindings"]
+            [0]["payment_address"] = json!("0x2222222222222222222222222222222222222222");
+
+        let error = registry
+            .submit_agent(request)
+            .await
+            .expect_err("tampered payment binding should fail");
+
+        assert!(
+            error.to_string().contains("payment_account_binding"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

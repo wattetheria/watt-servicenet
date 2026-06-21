@@ -1281,7 +1281,6 @@ mod tests {
                 delegation_token: None,
                 source_commit: None,
                 build_digest: None,
-                payment_account_binding: None,
                 nonce: None,
                 issued_at_ms: None,
                 expires_at_ms: None,

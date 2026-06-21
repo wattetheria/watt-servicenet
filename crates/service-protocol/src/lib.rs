@@ -499,13 +499,6 @@ pub struct AgentAttestations {
     pub source_commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_digest: Option<String>,
-    /// Proves that `provider_attester_did` authorises a specific EVM payment
-    /// address to receive this agent's fees. Optional for backwards compat:
-    /// existing submissions without it are still accepted, but new clients
-    /// SHOULD include one so the registry can publish a verified payment
-    /// binding alongside the agent record.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payment_account_binding: Option<watt_did::PaymentAccountBindingProof>,
     /// Unique nonce for this submission, set by the client. Servers MAY
     /// reject duplicate nonces from the same provider to prevent replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -534,7 +527,6 @@ pub fn build_agent_attestation_payload(request: &SubmitAgentRequest) -> Value {
         "delegation_token": request.attestations.delegation_token,
         "source_commit": request.attestations.source_commit,
         "build_digest": request.attestations.build_digest,
-        "payment_account_binding": request.attestations.payment_account_binding,
         "nonce": request.attestations.nonce,
         "issued_at_ms": request.attestations.issued_at_ms,
         "expires_at_ms": request.attestations.expires_at_ms,
