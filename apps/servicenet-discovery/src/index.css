@@ -1,0 +1,301 @@
+@import "tailwindcss";
+
+/*
+  Monochrome black & white theme, modeled on agent-native.com.
+  Tokens are HSL triplets defined per color-scheme; the same utility
+  (e.g. bg-bg-0, text-accent) switches value when `.dark` is on <html>.
+  "accent" is the foreground primary — black on light, white on dark.
+*/
+
+:root {
+  color-scheme: light;
+
+  --bg-0: 0 0% 98%;      /* page */
+  --bg-1: 0 0% 100%;     /* card / panel */
+  --bg-2: 0 0% 95.5%;    /* subtle fill / hover */
+  --bg-3: 0 0% 91%;      /* stronger hover / highlighted row */
+
+  --text-0: 0 0% 9%;     /* foreground */
+  --text-1: 0 0% 40%;    /* muted foreground */
+  --text-2: 0 0% 55%;    /* faint labels */
+
+  --border: 0 0% 90%;
+  --border-light: 0 0% 80%;
+
+  --accent: 0 0% 9%;          /* monochrome primary */
+  --accent-dim: 0 0% 32%;
+  --accent-contrast: 0 0% 98%; /* text on a filled accent */
+  --secondary: 0 0% 35%;
+
+  --gold: 35 95% 42%;    /* ARD source / draft accents */
+  --green: 142 62% 33%;  /* published / approved */
+  --red: 0 72% 47%;      /* disabled / destructive */
+  --yellow: 38 92% 42%;  /* draft */
+}
+
+.dark {
+  color-scheme: dark;
+
+  --bg-0: 0 0% 4%;
+  --bg-1: 0 0% 6.5%;
+  --bg-2: 0 0% 11%;
+  --bg-3: 0 0% 16%;
+
+  --text-0: 0 0% 93%;
+  --text-1: 0 0% 63%;
+  --text-2: 0 0% 47%;
+
+  --border: 0 0% 14%;
+  --border-light: 0 0% 24%;
+
+  --accent: 0 0% 95%;
+  --accent-dim: 0 0% 70%;
+  --accent-contrast: 0 0% 8%;
+  --secondary: 0 0% 70%;
+
+  --gold: 38 90% 60%;
+  --green: 142 60% 52%;
+  --red: 0 80% 66%;
+  --yellow: 45 90% 58%;
+}
+
+@theme inline {
+  --color-bg-0: hsl(var(--bg-0));
+  --color-bg-1: hsl(var(--bg-1));
+  --color-bg-2: hsl(var(--bg-2));
+  --color-bg-3: hsl(var(--bg-3));
+
+  --color-text-0: hsl(var(--text-0));
+  --color-text-1: hsl(var(--text-1));
+  --color-text-2: hsl(var(--text-2));
+
+  --color-border: hsl(var(--border));
+  --color-border-light: hsl(var(--border-light));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-dim: hsl(var(--accent-dim));
+  --color-secondary: hsl(var(--secondary));
+
+  --color-gold: hsl(var(--gold));
+  --color-green: hsl(var(--green));
+  --color-red: hsl(var(--red));
+  --color-yellow: hsl(var(--yellow));
+
+  --font-sans: -apple-system, system-ui, "Segoe UI", Roboto, Inter, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --radius-panel: 10px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: hsl(var(--bg-0));
+  color: hsl(var(--text-0));
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--border-light));
+  border: 3px solid hsl(var(--bg-0));
+  border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--text-2));
+}
+
+/* Card / panel — single hairline border, soft lift on light. */
+.game-panel {
+  background: hsl(var(--bg-1));
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius-panel);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+/* Secondary button — bordered, neutral. */
+.pixel-btn {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--bg-1));
+  color: hsl(var(--text-1));
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.pixel-btn:hover {
+  background: hsl(var(--bg-2));
+  color: hsl(var(--text-0));
+  border-color: hsl(var(--border-light));
+}
+
+.pixel-btn:active {
+  transform: translateY(0.5px);
+}
+
+/* Primary CTA / selected nav — filled monochrome. */
+.pixel-btn-active,
+.pixel-btn-active:hover {
+  background: hsl(var(--accent));
+  border-color: hsl(var(--accent));
+  color: hsl(var(--accent-contrast));
+}
+
+.danger-btn {
+  border-color: color-mix(in srgb, hsl(var(--red)) 50%, transparent);
+  color: hsl(var(--red));
+  background: transparent;
+}
+
+.danger-btn:hover {
+  border-color: hsl(var(--red));
+  background: color-mix(in srgb, hsl(var(--red)) 10%, transparent);
+  color: hsl(var(--red));
+}
+
+.pixel-input {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  background: hsl(var(--bg-1));
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  color: hsl(var(--text-0));
+  padding: 8px 12px;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.pixel-input:focus,
+.pixel-input:focus-visible {
+  outline: none;
+  border-color: hsl(var(--accent));
+  box-shadow: 0 0 0 3px color-mix(in srgb, hsl(var(--accent)) 16%, transparent);
+}
+
+.pixel-input::placeholder {
+  color: hsl(var(--text-2));
+}
+
+/* Agent list row */
+.agent-row {
+  width: 100%;
+  min-height: 132px;
+  background: hsl(var(--bg-1));
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius-panel);
+  padding: 18px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+}
+
+.agent-row:hover {
+  border-color: hsl(var(--border-light));
+  background: hsl(var(--bg-2));
+}
+
+.agent-row-active {
+  border-color: hsl(var(--accent));
+  background: hsl(var(--bg-1));
+  box-shadow: 0 0 0 1px hsl(var(--accent));
+}
+
+/* Badges */
+.source-pill,
+.status-pill {
+  display: inline-flex;
+  min-height: 22px;
+  align-items: center;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  color: hsl(var(--text-1));
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.source-ard {
+  border-color: color-mix(in srgb, hsl(var(--gold)) 45%, transparent);
+  background: color-mix(in srgb, hsl(var(--gold)) 10%, transparent);
+  color: hsl(var(--gold));
+}
+
+.source-servicenet {
+  border-color: hsl(var(--border-light));
+  background: hsl(var(--bg-2));
+  color: hsl(var(--text-0));
+}
+
+.status-published,
+.status-approved {
+  border-color: color-mix(in srgb, hsl(var(--green)) 45%, transparent);
+  background: color-mix(in srgb, hsl(var(--green)) 10%, transparent);
+  color: hsl(var(--green));
+}
+
+.status-draft {
+  border-color: color-mix(in srgb, hsl(var(--yellow)) 45%, transparent);
+  background: color-mix(in srgb, hsl(var(--yellow)) 10%, transparent);
+  color: hsl(var(--yellow));
+}
+
+.status-disabled,
+.status-revoked {
+  border-color: color-mix(in srgb, hsl(var(--red)) 45%, transparent);
+  background: color-mix(in srgb, hsl(var(--red)) 10%, transparent);
+  color: hsl(var(--red));
+}
+
+.section-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: hsl(var(--text-1));
+  text-transform: uppercase;
+}
+
+.line-clamp-2 {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}

@@ -638,6 +638,193 @@ pub struct PublishedAgentRecord {
     pub review_notes: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArdAgentStatus {
+    Draft,
+    Published,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArdArtifactMode {
+    Url,
+    InlineJson,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArdAgentRecord {
+    pub ard_agent_id: Uuid,
+    pub identifier: String,
+    pub publisher_domain: String,
+    pub display_name: String,
+    pub description: String,
+    pub artifact_type: String,
+    pub artifact_mode: ArdArtifactMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_data: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub representative_queries: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_identity_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_manifest: Option<Value>,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    pub status: ArdAgentStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateArdAgentRequest {
+    pub identifier: String,
+    pub publisher_domain: String,
+    pub display_name: String,
+    pub description: String,
+    pub artifact_type: String,
+    pub artifact_mode: ArdArtifactMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_data: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub representative_queries: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_identity_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_manifest: Option<Value>,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ArdAgentStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct UpdateArdAgentRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_mode: Option<ArdArtifactMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_url: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_data: Option<Option<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub representative_queries: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_identity_type: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_identity: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_manifest: Option<Option<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ArdAgentStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ArdAgentQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ArdAgentStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArdCatalogSourceStatus {
+    Pending,
+    Active,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArdCatalogSourceRecord {
+    pub publisher_domain: String,
+    pub catalog_url: String,
+    pub status: ArdCatalogSourceStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_crawled_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublicArdCatalogSource {
+    pub publisher_domain: String,
+    pub catalog_url: String,
+    pub status: ArdCatalogSourceStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_crawled_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl From<&ArdCatalogSourceRecord> for PublicArdCatalogSource {
+    fn from(value: &ArdCatalogSourceRecord) -> Self {
+        Self {
+            publisher_domain: value.publisher_domain.clone(),
+            catalog_url: value.catalog_url.clone(),
+            status: value.status.clone(),
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            last_crawled_at: value.last_crawled_at,
+            last_error: value.last_error.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubmitArdCatalogRequest {
+    pub publisher_domain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubmitArdCatalogResponse {
+    pub source: PublicArdCatalogSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InvokeAgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]

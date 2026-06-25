@@ -1,3 +1,5 @@
 /target/
 /.data/
 .DS_Store
+/apps/servicenet-discovery/dist/
+/apps/servicenet-discovery/node_modules/

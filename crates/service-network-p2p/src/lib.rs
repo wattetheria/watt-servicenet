@@ -354,6 +354,7 @@ impl ServiceNetworkRuntime {
                 feed_key: Some(PROVIDER_FEED_KEY.to_owned()),
                 known_event_ids: Vec::new(),
             },
+            default_control_request_timeout(),
         )
     }
 
@@ -413,6 +414,7 @@ impl ServiceNetworkRuntime {
                 feed_key: Some(PUBLISHED_AGENT_FEED_KEY.to_owned()),
                 known_event_ids: Vec::new(),
             },
+            default_control_request_timeout(),
         )
     }
 
@@ -839,6 +841,10 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+fn default_control_request_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(SubstrateConfig::default().control_request_timeout_ms)
 }
 
 #[cfg(test)]

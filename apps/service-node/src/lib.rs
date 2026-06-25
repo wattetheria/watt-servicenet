@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
@@ -19,13 +19,14 @@ use watt_servicenet_p2p::{
     provider_record_summary, published_agent_record_summary,
 };
 use watt_servicenet_protocol::{
-    AgentSubmissionQuery, AgentSubmissionStatus, ApproveAgentSubmissionRequest, AuthContextQuery,
-    BlockEntityRequest, CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest,
-    GetAgentTaskRequest, InvokeAgentRequest, ModerationCaseQuery, ProviderRecord,
-    PublishedAgentRecord, ReceiptQuery, RegisterAuthContextRequest, RegisterProviderRequest,
-    RejectAgentSubmissionRequest, ResolveModerationCaseRequest, RevokeProviderRequest,
-    RotateProviderKeyRequest, RunVerifierSweepRequest, SubmitAgentRequest, UnpublishAgentRequest,
-    VerifyReceiptRequest,
+    AgentSubmissionQuery, AgentSubmissionStatus, ApproveAgentSubmissionRequest, ArdAgentQuery,
+    AuthContextQuery, BlockEntityRequest, CreateArdAgentRequest, CreateModerationCaseRequest,
+    CreateProviderOwnershipChallengeRequest, GetAgentTaskRequest, InvokeAgentRequest,
+    ModerationCaseQuery, ProviderRecord, PublishedAgentRecord, ReceiptQuery,
+    RegisterAuthContextRequest, RegisterProviderRequest, RejectAgentSubmissionRequest,
+    ResolveModerationCaseRequest, RevokeProviderRequest, RotateProviderKeyRequest,
+    RunVerifierSweepRequest, SubmitAgentRequest, SubmitArdCatalogRequest, UnpublishAgentRequest,
+    UpdateArdAgentRequest, VerifyReceiptRequest,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry, ServiceRegistryConfig};
 
@@ -38,6 +39,8 @@ const SERVICENET_FEDERATION_MODE_ENV: &str = "SERVICENET_FEDERATION_MODE";
 const SERVICENET_FEDERATION_TRUSTED_PEERS_ENV: &str = "SERVICENET_FEDERATION_TRUSTED_PEERS";
 const SERVICENET_P2P_ANTI_ENTROPY_INTERVAL_SECS_ENV: &str =
     "SERVICENET_P2P_ANTI_ENTROPY_INTERVAL_SECS";
+const SERVICENET_ARD_CATALOG_SYNC_INTERVAL_SECS_ENV: &str =
+    "SERVICENET_ARD_CATALOG_SYNC_INTERVAL_SECS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FederationTrustMode {
@@ -131,6 +134,7 @@ pub async fn build_default_state() -> anyhow::Result<RouterState> {
     };
 
     let p2p_commands = start_p2p_sync_if_enabled(registry.clone()).await?;
+    start_ard_catalog_sync_job(registry.clone());
     Ok(RouterState {
         registry,
         p2p_commands,
@@ -165,6 +169,12 @@ fn build_app(state: RouterState) -> Router {
     };
     Router::new()
         .route("/health", get(health))
+        .route("/v1/ard/agents", get(list_ard_agents))
+        .route("/v1/ard/agents", post(create_ard_agent))
+        .route("/v1/ard/agents/:ard_agent_id", get(get_ard_agent))
+        .route("/v1/ard/agents/:ard_agent_id", put(update_ard_agent))
+        .route("/v1/ard/agents/:ard_agent_id", delete(delete_ard_agent))
+        .route("/v1/ard/catalog-submissions", post(submit_ard_catalog))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/register", post(register_provider))
         .route(
@@ -249,6 +259,94 @@ async fn health() -> Json<serde_json::Value> {
         "status": "ok",
         "service": "watt-servicenet-node"
     }))
+}
+
+async fn list_ard_agents(
+    State(state): State<AppState>,
+    Query(query): Query<ArdAgentQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_AGENT_LIST_LIMIT)
+        .clamp(1, MAX_AGENT_LIST_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let (items, known_count) = state
+        .registry
+        .list_ard_agents_page(&query, limit, offset)
+        .await
+        .map_err(AppError::from)?;
+    let next_offset = offset.saturating_add(items.len());
+    let has_more = next_offset < known_count;
+    Ok(Json(serde_json::json!({
+        "items": items,
+        "count": items.len(),
+        "limit": limit,
+        "offset": offset,
+        "next_offset": if has_more { Some(next_offset) } else { None },
+        "has_more": has_more,
+        "known_count": known_count,
+    })))
+}
+
+async fn create_ard_agent(
+    State(state): State<AppState>,
+    Json(request): Json<CreateArdAgentRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let record = state
+        .registry
+        .create_ard_agent(request)
+        .await
+        .map_err(AppError::from)?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!(record))))
+}
+
+async fn get_ard_agent(
+    State(state): State<AppState>,
+    Path(ard_agent_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let record = state
+        .registry
+        .get_ard_agent(ard_agent_id)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!(record)))
+}
+
+async fn update_ard_agent(
+    State(state): State<AppState>,
+    Path(ard_agent_id): Path<Uuid>,
+    Json(request): Json<UpdateArdAgentRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let record = state
+        .registry
+        .update_ard_agent(ard_agent_id, request)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!(record)))
+}
+
+async fn delete_ard_agent(
+    State(state): State<AppState>,
+    Path(ard_agent_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let record = state
+        .registry
+        .delete_ard_agent(ard_agent_id)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!(record)))
+}
+
+async fn submit_ard_catalog(
+    State(state): State<AppState>,
+    Json(request): Json<SubmitArdCatalogRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let response = state
+        .registry
+        .submit_ard_catalog(request)
+        .await
+        .map_err(AppError::from)?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!(response))))
 }
 
 async fn register_provider(
@@ -812,6 +910,25 @@ fn queue_published_agent(
     }
 }
 
+fn start_ard_catalog_sync_job(registry: Arc<ServiceRegistry>) {
+    let interval = std::env::var(SERVICENET_ARD_CATALOG_SYNC_INTERVAL_SECS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300);
+    if interval == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+        loop {
+            ticker.tick().await;
+            if let Err(error) = registry.sync_all_ard_catalog_sources().await {
+                eprintln!("servicenet ARD catalog sync failed: {error}");
+            }
+        }
+    });
+}
+
 async fn start_p2p_sync_if_enabled(
     registry: Arc<ServiceRegistry>,
 ) -> anyhow::Result<Option<mpsc::Sender<P2pCommand>>> {
@@ -1278,6 +1395,14 @@ impl IntoResponse for AppError {
                 StatusCode::NOT_FOUND,
                 serde_json::json!({ "error": format!("agent submission `{submission_id}` not found") }),
             ),
+            Self::Registry(RegistryError::ArdAgentNotFound(ard_agent_id)) => (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({ "error": format!("ARD agent `{ard_agent_id}` not found") }),
+            ),
+            Self::Registry(RegistryError::ArdCatalogSourceNotFound(publisher_domain)) => (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({ "error": format!("ARD catalog source `{publisher_domain}` not found") }),
+            ),
             Self::Registry(RegistryError::PublishedAgentNotFound(agent_id)) => (
                 StatusCode::NOT_FOUND,
                 serde_json::json!({ "error": format!("published agent `{agent_id}` not found") }),
@@ -1290,6 +1415,8 @@ impl IntoResponse for AppError {
             ),
             Self::Registry(RegistryError::InvalidProvider(message))
             | Self::Registry(RegistryError::InvalidAgent(message))
+            | Self::Registry(RegistryError::InvalidArdAgent(message))
+            | Self::Registry(RegistryError::InvalidArdCatalogSource(message))
             | Self::Registry(RegistryError::InvalidAuthContext(message))
             | Self::Registry(RegistryError::InvalidVerification(message))
             | Self::Registry(RegistryError::InvalidOwnershipChallenge(message)) => (

@@ -23,18 +23,20 @@ use watt_did::{
 use watt_servicenet_protocol::{
     AgentDeployment, AgentHealthRecord, AgentInteractionProtocol, AgentReviewProfile,
     AgentSubmissionQuery, AgentSubmissionRecord, AgentSubmissionStatus, AgentTrustRecord,
-    ApproveAgentSubmissionRequest, AuthContextQuery, AuthContextRecord, BlockEntityRequest,
-    CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest, ExecutionReceipt,
-    HealthStatus, InvocationMode, ModerationAction, ModerationCase, ModerationCaseQuery,
-    ModerationStatus, ModerationTargetKind, ProviderAuditEvent, ProviderAuditKind,
-    ProviderHealthRecord, ProviderOwnershipChallenge, ProviderOwnershipOperation, ProviderRecord,
-    ProviderStatus, ProviderTrustRecord, PublishedAgentRecord, PublishedAgentStatus, ReceiptQuery,
-    ReceiptStatus, RegisterAuthContextRequest, RegisterProviderRequest,
-    RejectAgentSubmissionRequest, ResolveModerationCaseRequest, RevokeProviderRequest, RiskLevel,
-    RotateProviderKeyRequest, RunVerifierSweepRequest, SERVICE_PROTOCOL_SCHEMA_VERSION,
-    StoredReceipt, SubmitAgentRequest, UnpublishAgentRequest, VerificationRecord,
-    VerificationVerdict, VerifyReceiptRequest, build_agent_attestation_payload,
-    build_agent_unpublish_payload,
+    ApproveAgentSubmissionRequest, ArdAgentQuery, ArdAgentRecord, ArdAgentStatus, ArdArtifactMode,
+    ArdCatalogSourceRecord, ArdCatalogSourceStatus, AuthContextQuery, AuthContextRecord,
+    BlockEntityRequest, CreateArdAgentRequest, CreateModerationCaseRequest,
+    CreateProviderOwnershipChallengeRequest, ExecutionReceipt, HealthStatus, InvocationMode,
+    ModerationAction, ModerationCase, ModerationCaseQuery, ModerationStatus, ModerationTargetKind,
+    ProviderAuditEvent, ProviderAuditKind, ProviderHealthRecord, ProviderOwnershipChallenge,
+    ProviderOwnershipOperation, ProviderRecord, ProviderStatus, ProviderTrustRecord,
+    PublishedAgentRecord, PublishedAgentStatus, ReceiptQuery, ReceiptStatus,
+    RegisterAuthContextRequest, RegisterProviderRequest, RejectAgentSubmissionRequest,
+    ResolveModerationCaseRequest, RevokeProviderRequest, RiskLevel, RotateProviderKeyRequest,
+    RunVerifierSweepRequest, SERVICE_PROTOCOL_SCHEMA_VERSION, StoredReceipt, SubmitAgentRequest,
+    SubmitArdCatalogRequest, SubmitArdCatalogResponse, UnpublishAgentRequest,
+    UpdateArdAgentRequest, VerificationRecord, VerificationVerdict, VerifyReceiptRequest,
+    build_agent_attestation_payload, build_agent_unpublish_payload,
 };
 
 #[derive(Debug, Error)]
@@ -63,10 +65,18 @@ pub enum RegistryError {
     ModerationCaseNotFound(Uuid),
     #[error("agent submission `{0}` not found")]
     AgentSubmissionNotFound(Uuid),
+    #[error("ARD agent `{0}` not found")]
+    ArdAgentNotFound(Uuid),
+    #[error("ARD catalog source `{0}` not found")]
+    ArdCatalogSourceNotFound(String),
     #[error("invalid provider record: {0}")]
     InvalidProvider(String),
     #[error("invalid agent record: {0}")]
     InvalidAgent(String),
+    #[error("invalid ARD agent record: {0}")]
+    InvalidArdAgent(String),
+    #[error("invalid ARD catalog source: {0}")]
+    InvalidArdCatalogSource(String),
     #[error("invalid auth context: {0}")]
     InvalidAuthContext(String),
     #[error("invalid verification request: {0}")]
@@ -94,6 +104,8 @@ pub struct RegistryState {
     pub moderation_cases: HashMap<Uuid, ModerationCase>,
     pub agent_submissions: HashMap<Uuid, AgentSubmissionRecord>,
     pub published_agents: HashMap<String, PublishedAgentRecord>,
+    pub ard_agents: HashMap<Uuid, ArdAgentRecord>,
+    pub ard_catalog_sources: HashMap<String, ArdCatalogSourceRecord>,
     /// Attestation nonces that have been consumed by a successful submission,
     /// keyed by `(attester_did, nonce)`. Used to reject replay of the same
     /// signed submission. Entries can be evicted once
@@ -318,6 +330,8 @@ const SERVICE_TABLES: &[&str] = &[
     "moderation_cases",
     "agent_submissions",
     "published_agents",
+    "ard_agents",
+    "ard_catalog_sources",
     "consumed_attestation_nonces",
 ];
 
@@ -505,6 +519,34 @@ impl PostgresRegistryStore {
                 )"#
             ),
             format!(
+                r#"CREATE TABLE IF NOT EXISTS "{schema}"."ard_agents" (
+                    ard_agent_id UUID PRIMARY KEY,
+                    identifier TEXT NOT NULL,
+                    publisher_domain TEXT NOT NULL,
+                    artifact_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    record_json JSONB NOT NULL
+                )"#
+            ),
+            format!(
+                r#"CREATE INDEX IF NOT EXISTS "{schema}_ard_agents_identifier_idx" ON "{schema}"."ard_agents" (identifier)"#
+            ),
+            format!(
+                r#"CREATE INDEX IF NOT EXISTS "{schema}_ard_agents_publisher_idx" ON "{schema}"."ard_agents" (publisher_domain)"#
+            ),
+            format!(
+                r#"CREATE TABLE IF NOT EXISTS "{schema}"."ard_catalog_sources" (
+                    publisher_domain TEXT PRIMARY KEY,
+                    catalog_url TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    record_json JSONB NOT NULL
+                )"#
+            ),
+            format!(
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."consumed_attestation_nonces" (
                     key TEXT PRIMARY KEY,
                     attester_did TEXT NOT NULL,
@@ -635,6 +677,18 @@ impl PostgresRegistryStore {
             format!(
                 r#"UPDATE "{schema}"."published_agents"
                    SET created_at = COALESCE((record_json->>'approved_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."ard_agents"
+                   SET created_at = COALESCE((record_json->>'created_at')::TIMESTAMPTZ, created_at),
+                       updated_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, updated_at)
+                   WHERE created_at = updated_at"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."ard_catalog_sources"
+                   SET created_at = COALESCE((record_json->>'created_at')::TIMESTAMPTZ, created_at),
                        updated_at = COALESCE((record_json->>'updated_at')::TIMESTAMPTZ, updated_at)
                    WHERE created_at = updated_at"#
             ),
@@ -834,6 +888,31 @@ impl RegistryStore for PostgresRegistryStore {
             state
                 .published_agents
                 .insert(record.agent_id.clone(), record);
+        }
+
+        for row in sqlx::query(&format!(
+            r#"SELECT record_json FROM "{}"."ard_agents""#,
+            self.schema
+        ))
+        .fetch_all(&self.pool)
+        .await?
+        {
+            let record: ArdAgentRecord = serde_json::from_value(row.try_get("record_json")?)?;
+            state.ard_agents.insert(record.ard_agent_id, record);
+        }
+
+        for row in sqlx::query(&format!(
+            r#"SELECT record_json FROM "{}"."ard_catalog_sources""#,
+            self.schema
+        ))
+        .fetch_all(&self.pool)
+        .await?
+        {
+            let record: ArdCatalogSourceRecord =
+                serde_json::from_value(row.try_get("record_json")?)?;
+            state
+                .ard_catalog_sources
+                .insert(record.publisher_domain.clone(), record);
         }
 
         for row in sqlx::query(&format!(
@@ -1194,6 +1273,52 @@ impl RegistryStore for PostgresRegistryStore {
             .await?;
         }
 
+        for record in state.ard_agents.values() {
+            sqlx::query(&format!(
+                r#"INSERT INTO "{}"."ard_agents" (ard_agent_id, identifier, publisher_domain, artifact_type, status, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                   ON CONFLICT (ard_agent_id) DO UPDATE SET
+                     identifier = EXCLUDED.identifier,
+                     publisher_domain = EXCLUDED.publisher_domain,
+                     artifact_type = EXCLUDED.artifact_type,
+                     status = EXCLUDED.status,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
+                self.schema
+            ))
+            .bind(record.ard_agent_id)
+            .bind(&record.identifier)
+            .bind(&record.publisher_domain)
+            .bind(&record.artifact_type)
+            .bind(format!("{:?}", record.status))
+            .bind(record.created_at)
+            .bind(record.updated_at)
+            .bind(serde_json::to_value(record)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for record in state.ard_catalog_sources.values() {
+            sqlx::query(&format!(
+                r#"INSERT INTO "{}"."ard_catalog_sources" (publisher_domain, catalog_url, status, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   ON CONFLICT (publisher_domain) DO UPDATE SET
+                     catalog_url = EXCLUDED.catalog_url,
+                     status = EXCLUDED.status,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
+                self.schema
+            ))
+            .bind(&record.publisher_domain)
+            .bind(&record.catalog_url)
+            .bind(format!("{:?}", record.status))
+            .bind(record.created_at)
+            .bind(record.updated_at)
+            .bind(serde_json::to_value(record)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         for record in state.consumed_attestation_nonces.values() {
             let key = ConsumedAttestationNonce::key(&record.attester_did, &record.nonce);
             let created_at = unix_ms_to_datetime(record.consumed_at_ms);
@@ -1345,6 +1470,26 @@ impl RegistryStore for PostgresRegistryStore {
             "published_agents",
             "agent_id",
             state.published_agents.keys().cloned().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_uuid_rows(
+            &mut tx,
+            &self.schema,
+            "ard_agents",
+            "ard_agent_id",
+            state.ard_agents.keys().copied().collect::<Vec<_>>(),
+        )
+        .await?;
+        delete_stale_text_rows(
+            &mut tx,
+            &self.schema,
+            "ard_catalog_sources",
+            "publisher_domain",
+            state
+                .ard_catalog_sources
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
         )
         .await?;
         delete_stale_text_rows(
@@ -2746,6 +2891,290 @@ impl ServiceRegistry {
         Ok(record)
     }
 
+    pub async fn create_ard_agent(
+        &self,
+        request: CreateArdAgentRequest,
+    ) -> Result<ArdAgentRecord, RegistryError> {
+        let now = Utc::now();
+        let record = ArdAgentRecord {
+            ard_agent_id: Uuid::new_v4(),
+            identifier: request.identifier,
+            publisher_domain: request.publisher_domain,
+            display_name: request.display_name,
+            description: request.description,
+            artifact_type: request.artifact_type,
+            artifact_mode: request.artifact_mode,
+            artifact_url: request.artifact_url,
+            artifact_data: request.artifact_data,
+            capabilities: normalize_string_list(request.capabilities),
+            representative_queries: normalize_string_list(request.representative_queries),
+            trust_identity_type: normalize_optional_string(request.trust_identity_type),
+            trust_identity: normalize_optional_string(request.trust_identity),
+            trust_manifest: request.trust_manifest,
+            version: request.version,
+            tags: normalize_string_list(request.tags),
+            status: request.status.unwrap_or(ArdAgentStatus::Draft),
+            created_at: now,
+            updated_at: now,
+        };
+        validate_ard_agent_record(&record)?;
+        let mut state = self.load_state().await?;
+        state.ard_agents.insert(record.ard_agent_id, record.clone());
+        self.save_state(&state).await?;
+        Ok(record)
+    }
+
+    pub async fn list_ard_agents(
+        &self,
+        query: &ArdAgentQuery,
+    ) -> Result<Vec<ArdAgentRecord>, RegistryError> {
+        let (items, _) = self.list_ard_agents_page(query, usize::MAX, 0).await?;
+        Ok(items)
+    }
+
+    pub async fn list_ard_agents_page(
+        &self,
+        query: &ArdAgentQuery,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ArdAgentRecord>, usize), RegistryError> {
+        let search = query.q.as_ref().map(|value| value.trim().to_lowercase());
+        let mut items = self
+            .load_state()
+            .await?
+            .ard_agents
+            .into_values()
+            .filter(|record| {
+                query
+                    .status
+                    .as_ref()
+                    .is_none_or(|status| &record.status == status)
+            })
+            .filter(|record| {
+                query
+                    .publisher_domain
+                    .as_deref()
+                    .is_none_or(|domain| record.publisher_domain == domain)
+            })
+            .filter(|record| {
+                query
+                    .artifact_type
+                    .as_deref()
+                    .is_none_or(|artifact_type| record.artifact_type == artifact_type)
+            })
+            .filter(|record| {
+                search.as_ref().is_none_or(|query| {
+                    ard_agent_search_values(record)
+                        .iter()
+                        .any(|value| value.to_lowercase().contains(query))
+                })
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .reverse()
+                .then_with(|| left.display_name.cmp(&right.display_name))
+        });
+        let known_count = items.len();
+        let page = items.into_iter().skip(offset).take(limit).collect();
+        Ok((page, known_count))
+    }
+
+    pub async fn get_ard_agent(&self, ard_agent_id: Uuid) -> Result<ArdAgentRecord, RegistryError> {
+        self.load_state()
+            .await?
+            .ard_agents
+            .get(&ard_agent_id)
+            .cloned()
+            .ok_or(RegistryError::ArdAgentNotFound(ard_agent_id))
+    }
+
+    pub async fn update_ard_agent(
+        &self,
+        ard_agent_id: Uuid,
+        request: UpdateArdAgentRequest,
+    ) -> Result<ArdAgentRecord, RegistryError> {
+        let mut state = self.load_state().await?;
+        let record = state
+            .ard_agents
+            .get_mut(&ard_agent_id)
+            .ok_or(RegistryError::ArdAgentNotFound(ard_agent_id))?;
+        if let Some(value) = request.identifier {
+            record.identifier = value;
+        }
+        if let Some(value) = request.publisher_domain {
+            record.publisher_domain = value;
+        }
+        if let Some(value) = request.display_name {
+            record.display_name = value;
+        }
+        if let Some(value) = request.description {
+            record.description = value;
+        }
+        if let Some(value) = request.artifact_type {
+            record.artifact_type = value;
+        }
+        if let Some(value) = request.artifact_mode {
+            record.artifact_mode = value;
+        }
+        if let Some(value) = request.artifact_url {
+            record.artifact_url = normalize_optional_string(value);
+        }
+        if let Some(value) = request.artifact_data {
+            record.artifact_data = value;
+        }
+        if let Some(value) = request.capabilities {
+            record.capabilities = normalize_string_list(value);
+        }
+        if let Some(value) = request.representative_queries {
+            record.representative_queries = normalize_string_list(value);
+        }
+        if let Some(value) = request.trust_identity_type {
+            record.trust_identity_type = normalize_optional_string(value);
+        }
+        if let Some(value) = request.trust_identity {
+            record.trust_identity = normalize_optional_string(value);
+        }
+        if let Some(value) = request.trust_manifest {
+            record.trust_manifest = value;
+        }
+        if let Some(value) = request.version {
+            record.version = value;
+        }
+        if let Some(value) = request.tags {
+            record.tags = normalize_string_list(value);
+        }
+        if let Some(value) = request.status {
+            record.status = value;
+        }
+        record.updated_at = Utc::now();
+        validate_ard_agent_record(record)?;
+        let record = record.clone();
+        self.save_state(&state).await?;
+        Ok(record)
+    }
+
+    pub async fn delete_ard_agent(
+        &self,
+        ard_agent_id: Uuid,
+    ) -> Result<ArdAgentRecord, RegistryError> {
+        let mut state = self.load_state().await?;
+        let record = state
+            .ard_agents
+            .remove(&ard_agent_id)
+            .ok_or(RegistryError::ArdAgentNotFound(ard_agent_id))?;
+        self.save_state(&state).await?;
+        Ok(record)
+    }
+
+    pub async fn submit_ard_catalog(
+        &self,
+        request: SubmitArdCatalogRequest,
+    ) -> Result<SubmitArdCatalogResponse, RegistryError> {
+        let publisher_domain = normalize_publisher_domain(&request.publisher_domain)?;
+        let catalog_url = normalize_catalog_url(&publisher_domain, request.catalog_url)?;
+        let now = Utc::now();
+        let mut state = self.load_state().await?;
+        let record = state
+            .ard_catalog_sources
+            .entry(publisher_domain.clone())
+            .and_modify(|record| {
+                record.catalog_url = catalog_url.clone();
+                record.status = ArdCatalogSourceStatus::Pending;
+                record.updated_at = now;
+                record.last_error = None;
+            })
+            .or_insert_with(|| ArdCatalogSourceRecord {
+                publisher_domain: publisher_domain.clone(),
+                catalog_url: catalog_url.clone(),
+                status: ArdCatalogSourceStatus::Pending,
+                created_at: now,
+                updated_at: now,
+                last_crawled_at: None,
+                last_error: None,
+            })
+            .clone();
+        validate_ard_catalog_source(&record)?;
+        state
+            .ard_catalog_sources
+            .insert(publisher_domain, record.clone());
+        self.save_state(&state).await?;
+        Ok(SubmitArdCatalogResponse {
+            source: (&record).into(),
+        })
+    }
+
+    pub async fn sync_all_ard_catalog_sources(&self) -> Result<(), RegistryError> {
+        let sources = self
+            .load_state()
+            .await?
+            .ard_catalog_sources
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for source in sources {
+            self.sync_ard_catalog_source(&source.publisher_domain)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn sync_ard_catalog_source(
+        &self,
+        publisher_domain: &str,
+    ) -> Result<(), RegistryError> {
+        let publisher_domain = normalize_publisher_domain(publisher_domain)?;
+        let source = self
+            .load_state()
+            .await?
+            .ard_catalog_sources
+            .get(&publisher_domain)
+            .cloned()
+            .ok_or_else(|| RegistryError::ArdCatalogSourceNotFound(publisher_domain.clone()))?;
+        let now = Utc::now();
+        let fetch_result = fetch_ard_catalog(&source.catalog_url).await;
+        let mut state = self.load_state().await?;
+        match fetch_result {
+            Ok(catalog) => {
+                let records = parse_ard_catalog_records(&publisher_domain, catalog, &state, now)?;
+                let incoming_ids = records
+                    .iter()
+                    .map(|record| record.ard_agent_id)
+                    .collect::<std::collections::HashSet<_>>();
+                state.ard_agents.retain(|_, record| {
+                    record.publisher_domain != publisher_domain
+                        || incoming_ids.contains(&record.ard_agent_id)
+                });
+                for record in records {
+                    state.ard_agents.insert(record.ard_agent_id, record);
+                }
+                let source = state
+                    .ard_catalog_sources
+                    .get_mut(&publisher_domain)
+                    .ok_or_else(|| {
+                        RegistryError::ArdCatalogSourceNotFound(publisher_domain.clone())
+                    })?;
+                source.status = ArdCatalogSourceStatus::Active;
+                source.updated_at = now;
+                source.last_crawled_at = Some(now);
+                source.last_error = None;
+            }
+            Err(error) => {
+                let source = state
+                    .ard_catalog_sources
+                    .get_mut(&publisher_domain)
+                    .ok_or_else(|| {
+                        RegistryError::ArdCatalogSourceNotFound(publisher_domain.clone())
+                    })?;
+                source.updated_at = now;
+                source.last_crawled_at = Some(now);
+                source.last_error = Some(error.to_string());
+            }
+        }
+        self.save_state(&state).await
+    }
+
     pub async fn register_auth_context(
         &self,
         request: RegisterAuthContextRequest,
@@ -2925,6 +3354,318 @@ fn validate_provider_record(provider: &ProviderRecord) -> Result<(), RegistryErr
     }
     validate_provider_did(&provider.provider_did)?;
     Ok(())
+}
+
+fn validate_ard_agent_record(record: &ArdAgentRecord) -> Result<(), RegistryError> {
+    if record.publisher_domain.trim().is_empty() {
+        return Err(RegistryError::InvalidArdAgent(
+            "publisher_domain must not be empty".to_owned(),
+        ));
+    }
+    if record.identifier.trim().is_empty() {
+        return Err(RegistryError::InvalidArdAgent(
+            "identifier must not be empty".to_owned(),
+        ));
+    }
+    let expected_prefix = format!("urn:air:{}:", record.publisher_domain.trim());
+    if !record.identifier.starts_with(&expected_prefix) {
+        return Err(RegistryError::InvalidArdAgent(format!(
+            "identifier must start with `{expected_prefix}`"
+        )));
+    }
+    if record.display_name.trim().is_empty() {
+        return Err(RegistryError::InvalidArdAgent(
+            "display_name must not be empty".to_owned(),
+        ));
+    }
+    if record.artifact_type.trim().is_empty() {
+        return Err(RegistryError::InvalidArdAgent(
+            "artifact_type must not be empty".to_owned(),
+        ));
+    }
+    if record.version.trim().is_empty() {
+        return Err(RegistryError::InvalidArdAgent(
+            "version must not be empty".to_owned(),
+        ));
+    }
+    match record.artifact_mode {
+        ArdArtifactMode::Url => {
+            if record
+                .artifact_url
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(RegistryError::InvalidArdAgent(
+                    "artifact_url is required when artifact_mode is url".to_owned(),
+                ));
+            }
+            if record.artifact_data.is_some() {
+                return Err(RegistryError::InvalidArdAgent(
+                    "artifact_data must be empty when artifact_mode is url".to_owned(),
+                ));
+            }
+        }
+        ArdArtifactMode::InlineJson => {
+            if record.artifact_data.is_none() {
+                return Err(RegistryError::InvalidArdAgent(
+                    "artifact_data is required when artifact_mode is inline_json".to_owned(),
+                ));
+            }
+            if record.artifact_url.is_some() {
+                return Err(RegistryError::InvalidArdAgent(
+                    "artifact_url must be empty when artifact_mode is inline_json".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_ard_catalog_source(record: &ArdCatalogSourceRecord) -> Result<(), RegistryError> {
+    normalize_publisher_domain(&record.publisher_domain)?;
+    normalize_catalog_url(&record.publisher_domain, Some(record.catalog_url.clone()))?;
+    Ok(())
+}
+
+fn normalize_publisher_domain(value: &str) -> Result<String, RegistryError> {
+    let domain = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return Err(RegistryError::InvalidArdCatalogSource(
+            "publisher_domain must not be empty".to_owned(),
+        ));
+    }
+    if domain.contains('/') || domain.contains(':') || domain.contains(char::is_whitespace) {
+        return Err(RegistryError::InvalidArdCatalogSource(
+            "publisher_domain must be a bare domain".to_owned(),
+        ));
+    }
+    if !domain.contains('.') {
+        return Err(RegistryError::InvalidArdCatalogSource(
+            "publisher_domain must contain a dot".to_owned(),
+        ));
+    }
+    Ok(domain)
+}
+
+fn normalize_catalog_url(
+    publisher_domain: &str,
+    value: Option<String>,
+) -> Result<String, RegistryError> {
+    let catalog_url = value
+        .map(|item| item.trim().to_owned())
+        .filter(|item| !item.is_empty())
+        .unwrap_or_else(|| format!("https://{publisher_domain}/.well-known/ai-catalog.json"));
+    if !catalog_url.starts_with("https://") {
+        return Err(RegistryError::InvalidArdCatalogSource(
+            "catalog_url must use https".to_owned(),
+        ));
+    }
+    let host = catalog_url
+        .trim_start_matches("https://")
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host != publisher_domain {
+        return Err(RegistryError::InvalidArdCatalogSource(
+            "catalog_url host must match publisher_domain".to_owned(),
+        ));
+    }
+    Ok(catalog_url)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ArdCatalogDocument {
+    #[serde(default)]
+    publisher: Option<ArdCatalogPublisher>,
+    #[serde(default)]
+    agents: Vec<ArdCatalogAgent>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ArdCatalogPublisher {
+    #[serde(default)]
+    domain: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ArdCatalogAgent {
+    #[serde(default)]
+    identifier: Option<String>,
+    #[serde(default, alias = "name")]
+    display_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    artifact: Option<ArdCatalogArtifact>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default, alias = "representativeQueries")]
+    representative_queries: Vec<String>,
+    #[serde(default)]
+    trust: Option<ArdCatalogTrust>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ArdCatalogArtifact {
+    #[serde(default, rename = "type")]
+    artifact_type: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ArdCatalogTrust {
+    #[serde(default)]
+    identity_type: Option<String>,
+    #[serde(default)]
+    identity: Option<String>,
+    #[serde(default)]
+    manifest: Option<serde_json::Value>,
+}
+
+async fn fetch_ard_catalog(catalog_url: &str) -> Result<ArdCatalogDocument, RegistryError> {
+    let response = reqwest::get(catalog_url)
+        .await
+        .map_err(|error| RegistryError::InvalidArdCatalogSource(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(RegistryError::InvalidArdCatalogSource(format!(
+            "catalog fetch returned {}",
+            response.status()
+        )));
+    }
+    response
+        .json::<ArdCatalogDocument>()
+        .await
+        .map_err(|error| RegistryError::InvalidArdCatalogSource(error.to_string()))
+}
+
+fn parse_ard_catalog_records(
+    publisher_domain: &str,
+    catalog: ArdCatalogDocument,
+    state: &RegistryState,
+    now: DateTime<Utc>,
+) -> Result<Vec<ArdAgentRecord>, RegistryError> {
+    if let Some(domain) = catalog
+        .publisher
+        .as_ref()
+        .and_then(|publisher| publisher.domain.as_deref())
+    {
+        let normalized = normalize_publisher_domain(domain)?;
+        if normalized != publisher_domain {
+            return Err(RegistryError::InvalidArdCatalogSource(
+                "catalog publisher.domain must match source publisher_domain".to_owned(),
+            ));
+        }
+    }
+    let mut records = Vec::with_capacity(catalog.agents.len());
+    for agent in catalog.agents {
+        let identifier = agent
+            .identifier
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                RegistryError::InvalidArdCatalogSource(
+                    "catalog agent.identifier is required".to_owned(),
+                )
+            })?;
+        let artifact = agent.artifact.ok_or_else(|| {
+            RegistryError::InvalidArdCatalogSource("catalog agent.artifact is required".to_owned())
+        })?;
+        let artifact_type = artifact
+            .artifact_type
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                RegistryError::InvalidArdCatalogSource(
+                    "catalog agent.artifact.type is required".to_owned(),
+                )
+            })?;
+        let existing = state.ard_agents.values().find(|record| {
+            record.publisher_domain == publisher_domain && record.identifier == identifier
+        });
+        let trust = agent.trust;
+        let record = ArdAgentRecord {
+            ard_agent_id: existing
+                .map(|record| record.ard_agent_id)
+                .unwrap_or_else(Uuid::new_v4),
+            identifier,
+            publisher_domain: publisher_domain.to_owned(),
+            display_name: agent
+                .display_name
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "ARD Agent".to_owned()),
+            description: agent.description.unwrap_or_default(),
+            artifact_type,
+            artifact_mode: if artifact.url.is_some() {
+                ArdArtifactMode::Url
+            } else {
+                ArdArtifactMode::InlineJson
+            },
+            artifact_url: normalize_optional_string(artifact.url),
+            artifact_data: artifact.data,
+            capabilities: normalize_string_list(agent.capabilities),
+            representative_queries: normalize_string_list(agent.representative_queries),
+            trust_identity_type: trust
+                .as_ref()
+                .and_then(|value| normalize_optional_string(value.identity_type.clone())),
+            trust_identity: trust
+                .as_ref()
+                .and_then(|value| normalize_optional_string(value.identity.clone())),
+            trust_manifest: trust.and_then(|value| value.manifest),
+            version: agent.version.unwrap_or_else(|| "0.1.0".to_owned()),
+            tags: normalize_string_list(agent.tags),
+            status: ArdAgentStatus::Published,
+            created_at: existing.map(|record| record.created_at).unwrap_or(now),
+            updated_at: now,
+        };
+        validate_ard_agent_record(&record)?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn normalize_string_list(values: Vec<String>) -> Vec<String> {
+    let mut items = values
+        .into_iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    items.sort();
+    items.dedup();
+    items
+}
+
+fn ard_agent_search_values(record: &ArdAgentRecord) -> Vec<String> {
+    [
+        vec![
+            record.identifier.clone(),
+            record.publisher_domain.clone(),
+            record.display_name.clone(),
+            record.description.clone(),
+            record.artifact_type.clone(),
+            record.version.clone(),
+            format!("{:?}", record.status),
+        ],
+        record.capabilities.clone(),
+        record.representative_queries.clone(),
+        record.tags.clone(),
+    ]
+    .concat()
 }
 
 fn validate_provider_did(provider_did: &str) -> Result<(), RegistryError> {
@@ -4352,6 +5093,118 @@ mod tests {
             .expect("published agent should exist");
         assert_eq!(published.status, PublishedAgentStatus::Approved);
         assert_eq!(published.reviewed_by, "auto-approve");
+    }
+
+    #[tokio::test]
+    async fn ard_agent_crud_filters_and_validates_records() {
+        let registry = ServiceRegistry::in_memory();
+        let created = registry
+            .create_ard_agent(CreateArdAgentRequest {
+                identifier: "urn:air:example.com:support-agent".to_owned(),
+                publisher_domain: "example.com".to_owned(),
+                display_name: "Support Agent".to_owned(),
+                description: "Handles customer support requests".to_owned(),
+                artifact_type: "application/a2a-agent-card+json".to_owned(),
+                artifact_mode: ArdArtifactMode::Url,
+                artifact_url: Some("https://agent.example.com/ai-catalog.json".to_owned()),
+                artifact_data: None,
+                capabilities: vec!["tickets.create".to_owned(), "tickets.create".to_owned()],
+                representative_queries: vec!["open a ticket".to_owned()],
+                trust_identity_type: Some("did".to_owned()),
+                trust_identity: Some("did:web:example.com".to_owned()),
+                trust_manifest: None,
+                version: "0.1.0".to_owned(),
+                tags: vec!["support".to_owned()],
+                status: Some(ArdAgentStatus::Draft),
+            })
+            .await
+            .expect("ARD agent should create");
+
+        assert_eq!(created.status, ArdAgentStatus::Draft);
+        assert_eq!(created.capabilities, vec!["tickets.create"]);
+
+        let listed = registry
+            .list_ard_agents(&ArdAgentQuery {
+                q: Some("support".to_owned()),
+                ..ArdAgentQuery::default()
+            })
+            .await
+            .expect("ARD agents should list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].ard_agent_id, created.ard_agent_id);
+
+        let updated = registry
+            .update_ard_agent(
+                created.ard_agent_id,
+                UpdateArdAgentRequest {
+                    status: Some(ArdAgentStatus::Published),
+                    artifact_url: Some(None),
+                    artifact_mode: Some(ArdArtifactMode::InlineJson),
+                    artifact_data: Some(Some(json!({
+                        "name": "Support Agent"
+                    }))),
+                    ..UpdateArdAgentRequest::default()
+                },
+            )
+            .await
+            .expect("ARD agent should update");
+        assert_eq!(updated.status, ArdAgentStatus::Published);
+        assert!(updated.artifact_url.is_none());
+        assert!(updated.artifact_data.is_some());
+
+        let published = registry
+            .list_ard_agents(&ArdAgentQuery {
+                status: Some(ArdAgentStatus::Published),
+                publisher_domain: Some("example.com".to_owned()),
+                artifact_type: Some("application/a2a-agent-card+json".to_owned()),
+                q: Some("tickets".to_owned()),
+                ..ArdAgentQuery::default()
+            })
+            .await
+            .expect("filtered ARD agents should list");
+        assert_eq!(published.len(), 1);
+
+        let deleted = registry
+            .delete_ard_agent(created.ard_agent_id)
+            .await
+            .expect("ARD agent should delete");
+        assert_eq!(deleted.ard_agent_id, created.ard_agent_id);
+
+        let err = registry
+            .get_ard_agent(created.ard_agent_id)
+            .await
+            .expect_err("deleted ARD agent should be missing");
+        assert!(matches!(err, RegistryError::ArdAgentNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn ard_catalog_submission_is_idempotent_by_domain() {
+        let registry = ServiceRegistry::in_memory();
+        let submitted = registry
+            .submit_ard_catalog(SubmitArdCatalogRequest {
+                publisher_domain: "Example.COM".to_owned(),
+                catalog_url: None,
+            })
+            .await
+            .expect("ARD catalog should submit");
+        assert_eq!(submitted.source.publisher_domain, "example.com");
+        assert_eq!(
+            submitted.source.catalog_url,
+            "https://example.com/.well-known/ai-catalog.json"
+        );
+
+        let updated = registry
+            .submit_ard_catalog(SubmitArdCatalogRequest {
+                publisher_domain: "example.com".to_owned(),
+                catalog_url: Some("https://example.com/catalogs/ai-catalog.json".to_owned()),
+            })
+            .await
+            .expect("ARD catalog source should update");
+        assert_eq!(
+            updated.source.catalog_url,
+            "https://example.com/catalogs/ai-catalog.json"
+        );
+        assert_eq!(updated.source.status, ArdCatalogSourceStatus::Pending);
     }
 
     #[tokio::test]

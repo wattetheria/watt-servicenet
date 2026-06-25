@@ -477,6 +477,174 @@ async fn health_endpoint_returns_ok() {
 }
 
 #[tokio::test]
+async fn ard_agent_endpoints_support_crud() {
+    let app = build_local_app(Arc::new(ServiceRegistry::in_memory()));
+    let create_payload = serde_json::json!({
+        "identifier": "urn:air:example.com:support-agent",
+        "publisher_domain": "example.com",
+        "display_name": "Support Agent",
+        "description": "Handles customer support requests",
+        "artifact_type": "application/a2a-agent-card+json",
+        "artifact_mode": "url",
+        "artifact_url": "https://agent.example.com/ai-catalog.json",
+        "capabilities": ["tickets.create"],
+        "representative_queries": ["open a ticket"],
+        "trust_identity_type": "did",
+        "trust_identity": "did:web:example.com",
+        "version": "0.1.0",
+        "tags": ["support"],
+        "status": "draft"
+    });
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ard/agents")
+                .header("content-type", "application/json")
+                .body(Body::from(create_payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("ARD create should respond");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created_json = response_json(created).await;
+    let ard_agent_id = created_json["ard_agent_id"]
+        .as_str()
+        .expect("ARD agent id should exist")
+        .to_owned();
+    assert_eq!(created_json["status"], "draft");
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/ard/agents?q=support&status=draft")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("ARD list should respond");
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_json = response_json(list).await;
+    assert_eq!(list_json["items"][0]["ard_agent_id"], ard_agent_id);
+    assert_eq!(list_json["count"], 1);
+    assert_eq!(list_json["limit"], 50);
+    assert_eq!(list_json["offset"], 0);
+    assert_eq!(list_json["known_count"], 1);
+    assert_eq!(list_json["has_more"], false);
+
+    let get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/ard/agents/{ard_agent_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("ARD get should respond");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let updated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/ard/agents/{ard_agent_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "status": "published" }).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("ARD update should respond");
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated_json = response_json(updated).await;
+    assert_eq!(updated_json["status"], "published");
+
+    let deleted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/ard/agents/{ard_agent_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("ARD delete should respond");
+    assert_eq!(deleted.status(), StatusCode::OK);
+
+    let missing = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/ard/agents/{ard_agent_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("ARD missing get should respond");
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn ard_catalog_submission_is_idempotent_by_domain() {
+    let app = build_local_app(Arc::new(ServiceRegistry::in_memory()));
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ard/catalog-submissions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "publisher_domain": "example.com"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("ARD catalog submit should respond");
+    assert_eq!(submit.status(), StatusCode::CREATED);
+    let submit_json = response_json(submit).await;
+    assert_eq!(
+        submit_json["source"]["catalog_url"].as_str(),
+        Some("https://example.com/.well-known/ai-catalog.json")
+    );
+    assert!(submit_json.get("manage_token").is_none());
+
+    let updated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ard/catalog-submissions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "publisher_domain": "example.com",
+                        "catalog_url": "https://example.com/catalogs/ai-catalog.json"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("ARD catalog update should respond");
+    assert_eq!(updated.status(), StatusCode::CREATED);
+    let updated_json = response_json(updated).await;
+    assert_eq!(
+        updated_json["source"]["catalog_url"].as_str(),
+        Some("https://example.com/catalogs/ai-catalog.json")
+    );
+}
+
+#[tokio::test]
 async fn provider_endpoints_register_list_and_revoke() {
     let app = build_local_app(Arc::new(ServiceRegistry::in_memory()));
 

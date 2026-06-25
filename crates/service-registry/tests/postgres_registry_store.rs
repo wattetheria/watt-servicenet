@@ -147,6 +147,7 @@ fn registry_tables() -> Vec<String> {
         "moderation_cases",
         "agent_submissions",
         "published_agents",
+        "ard_catalog_sources",
         "consumed_attestation_nonces",
     ]
     .into_iter()
