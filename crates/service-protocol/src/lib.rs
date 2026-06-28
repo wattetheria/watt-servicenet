@@ -112,6 +112,14 @@ pub struct ExecutionReceipt {
     pub request_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_attestation: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_issuer_did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_signed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_signature: Option<String>,
     pub started_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,

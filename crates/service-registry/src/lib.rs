@@ -3606,10 +3606,13 @@ fn validate_did_document_alias(
             "agent_card.didDocument.alsoKnownAs must be an array".to_owned(),
         )
     })?;
-    if aliases
-        .iter()
-        .any(|alias| alias.as_str() == Some(service_address))
-    {
+    if aliases.iter().any(|alias| {
+        alias
+            .as_str()
+            .and_then(|value| normalize_service_address(value).ok())
+            .as_deref()
+            == Some(service_address)
+    }) {
         return Ok(());
     }
     Err(RegistryError::InvalidAgent(
@@ -3746,6 +3749,7 @@ fn validate_did_document_service_endpoint_string(
                 "agent_card.didDocument.serviceEndpoint declares a service_address but request.service_address is missing".to_owned(),
             ));
         };
+        let address = normalize_did_document_service_address(address, "serviceEndpoint")?;
         if address == service_address {
             return Ok(());
         }
@@ -3802,6 +3806,10 @@ fn validate_did_document_service_endpoint_object(
                 "agent_card.didDocument.serviceEndpoint.serviceAddress is set but request.service_address is missing".to_owned(),
             ));
         };
+        let endpoint_service_address = normalize_did_document_service_address(
+            endpoint_service_address,
+            "serviceEndpoint.serviceAddress",
+        )?;
         if endpoint_service_address != service_address {
             return Err(RegistryError::InvalidAgent(
                 "agent_card.didDocument.serviceEndpoint.serviceAddress does not match request.service_address".to_owned(),
@@ -3821,6 +3829,18 @@ fn validate_did_document_service_endpoint_object(
         validate_did_document_service_endpoint_string(agent_id, service_address, address)?;
     }
     Ok(())
+}
+
+fn normalize_did_document_service_address(
+    value: &str,
+    field: &str,
+) -> Result<String, RegistryError> {
+    normalize_service_address(value).map_err(|error| match error {
+        RegistryError::InvalidAgent(message) => RegistryError::InvalidAgent(format!(
+            "agent_card.didDocument.{field} is not a valid service_address: {message}"
+        )),
+        other => other,
+    })
 }
 
 fn validate_submit_agent_request(
@@ -4591,6 +4611,10 @@ mod tests {
                 verification: VerificationVerdict::Pending,
                 request_digest: "req".to_owned(),
                 result_digest: Some("res".to_owned()),
+                invocation_attestation: None,
+                receipt_issuer_did: None,
+                receipt_signed_at_ms: None,
+                receipt_signature: None,
                 started_at: Utc::now(),
                 completed_at: Some(Utc::now()),
                 cost_units: Some(5),
@@ -4826,6 +4850,41 @@ mod tests {
         assert_eq!(
             published.service_address.as_deref(),
             Some("normalized@wattetheria")
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_agent_accepts_mixed_case_did_document_service_address_references() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let mut request = demo_agent_submission("mixed-case-did-document-agent");
+        request.service_address = Some("mixed-case@wattetheria".to_owned());
+        attach_lightweight_servicenet_did_document(
+            &mut request,
+            "Mixed-Case@Wattetheria",
+            "wattetheria://servicenet/Mixed-Case@Wattetheria",
+        );
+        request.service_address = Some("  Mixed-Case@Wattetheria  ".to_owned());
+
+        let submission = registry
+            .submit_agent(request)
+            .await
+            .expect("mixed-case didDocument service references should normalize");
+
+        assert_eq!(
+            submission.service_address.as_deref(),
+            Some("mixed-case@wattetheria")
+        );
+        let published = registry
+            .get_published_agent("mixed-case-did-document-agent")
+            .await
+            .expect("published agent should exist");
+        assert_eq!(
+            published.service_address.as_deref(),
+            Some("mixed-case@wattetheria")
         );
     }
 
@@ -5347,6 +5406,10 @@ mod tests {
                 verification: VerificationVerdict::Pending,
                 request_digest: "req".to_owned(),
                 result_digest: Some("res".to_owned()),
+                invocation_attestation: None,
+                receipt_issuer_did: None,
+                receipt_signed_at_ms: None,
+                receipt_signature: None,
                 started_at: Utc::now(),
                 completed_at: Some(Utc::now()),
                 cost_units: Some(1),

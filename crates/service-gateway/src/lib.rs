@@ -1,11 +1,14 @@
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use thiserror::Error;
 use uuid::Uuid;
 use watt_did::{Did, DidKey, DidKeyPublicKey};
@@ -18,6 +21,7 @@ use watt_servicenet_protocol::{
 use watt_servicenet_registry::{RegistryError, ServiceRegistry};
 
 const DEFAULT_SERVICENET_CONTEXT_NETWORK_ID: &str = "mainnet:watt-etheria";
+const INVOCATION_REPLAY_MAX_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -39,6 +43,8 @@ pub struct GatewayService {
     registry: Arc<ServiceRegistry>,
     http_client: reqwest::Client,
     policy: GatewayPolicyConfig,
+    replay_cache: Arc<Mutex<HashMap<String, u64>>>,
+    receipt_signer: ReceiptSigner,
 }
 
 struct PreparedInvocation {
@@ -49,6 +55,7 @@ struct PreparedInvocation {
     cost_units: Option<u32>,
     request_digest: String,
     caller_context: InvocationCallerContext,
+    envelope_security: VerifiedAgentEnvelopeSecurity,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -57,6 +64,21 @@ struct InvocationCallerContext {
     caller_public_id: Option<String>,
     caller_display_name: Option<String>,
     caller_node_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct ReceiptSigner {
+    issuer_did: String,
+    signing_key: Arc<SigningKey>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VerifiedAgentEnvelopeSecurity {
+    source_agent_id: String,
+    nonce: Option<String>,
+    issued_at_ms: Option<u64>,
+    expires_at_ms: Option<u64>,
+    request_digest: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,6 +119,37 @@ impl InvocationCallerContext {
                 "wattetheria:servicenet:{caller_agent_id}:{callee_agent_id}:{DEFAULT_SERVICENET_CONTEXT_NETWORK_ID}"
             )
         })
+    }
+}
+
+impl ReceiptSigner {
+    fn ephemeral() -> Self {
+        let mut seed_material = Vec::new();
+        seed_material.extend_from_slice(Uuid::new_v4().as_bytes());
+        seed_material.extend_from_slice(
+            &Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+                .to_be_bytes(),
+        );
+        let digest = Sha256::digest(seed_material);
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&digest);
+        let signing_key = SigningKey::from_bytes(&seed);
+        let issuer_did = did_from_ed25519_public_key(&signing_key.verifying_key().to_bytes());
+        Self {
+            issuer_did,
+            signing_key: Arc::new(signing_key),
+        }
+    }
+
+    fn sign_value(&self, value: &Value) -> Result<String, GatewayError> {
+        let payload = serde_jcs::to_vec(value).map_err(|error| {
+            GatewayError::Execution(format!(
+                "canonicalize receipt signature payload failed: {error}"
+            ))
+        })?;
+        Ok(STANDARD.encode(self.signing_key.sign(&payload).to_bytes()))
     }
 }
 
@@ -266,6 +319,8 @@ impl GatewayService {
             registry,
             http_client: reqwest::Client::new(),
             policy,
+            replay_cache: Arc::new(Mutex::new(HashMap::new())),
+            receipt_signer: ReceiptSigner::ephemeral(),
         }
     }
 
@@ -294,24 +349,30 @@ impl GatewayService {
         let prepared = self.prepare_invocation(agent_id, &request).await?;
         let receipt_id = Uuid::new_v4();
         let started_at = Utc::now();
+        let mut execution_receipt = ExecutionReceipt {
+            receipt_id,
+            agent_id: prepared.record.agent_id.clone(),
+            provider_id: prepared.record.provider_id.clone(),
+            caller_agent_id: prepared.caller_context.caller_agent_id.clone(),
+            caller_public_id: prepared.caller_context.caller_public_id.clone(),
+            caller_display_name: prepared.caller_context.caller_display_name.clone(),
+            caller_node_id: prepared.caller_context.caller_node_id.clone(),
+            invoke_mode: InvocationMode::Async,
+            status: ReceiptStatus::Running,
+            verification: VerificationVerdict::NotRequired,
+            request_digest: prepared.request_digest.clone(),
+            result_digest: None,
+            invocation_attestation: None,
+            receipt_issuer_did: None,
+            receipt_signed_at_ms: None,
+            receipt_signature: None,
+            started_at,
+            completed_at: None,
+            cost_units: prepared.cost_units,
+        };
+        self.attach_receipt_security(&mut execution_receipt, &prepared)?;
         let running = StoredReceipt {
-            receipt: ExecutionReceipt {
-                receipt_id,
-                agent_id: prepared.record.agent_id.clone(),
-                provider_id: prepared.record.provider_id.clone(),
-                caller_agent_id: prepared.caller_context.caller_agent_id.clone(),
-                caller_public_id: prepared.caller_context.caller_public_id.clone(),
-                caller_display_name: prepared.caller_context.caller_display_name.clone(),
-                caller_node_id: prepared.caller_context.caller_node_id.clone(),
-                invoke_mode: InvocationMode::Async,
-                status: ReceiptStatus::Running,
-                verification: VerificationVerdict::NotRequired,
-                request_digest: prepared.request_digest.clone(),
-                result_digest: None,
-                started_at,
-                completed_at: None,
-                cost_units: prepared.cost_units,
-            },
+            receipt: execution_receipt,
             output: None,
             stderr: None,
         };
@@ -367,21 +428,22 @@ impl GatewayService {
             .get_published_agent(agent_id)
             .await
             .map_err(map_registry_error)?;
+        let normalized_settlement = normalize_settlement_request(request.settlement.as_ref())?;
+        let request_digest = invocation_request_digest(request, normalized_settlement.as_ref())?;
+        let envelope_security = verify_agent_envelope_signature(request)?;
+        self.enforce_invocation_replay_protection(request, &envelope_security)?;
         let auth_token = self
             .resolve_agent_auth_context(&record, request.auth_context_id)
             .await?
             .or(request.auth_token.clone());
-        verify_agent_envelope_signature(request)?;
         self.enforce_agent_preflight(&record, request, auth_token.as_deref())
             .await?;
         let adapter = a2a_adapter(record.deployment.endpoint.interaction_protocol);
-        let normalized_settlement = normalize_settlement_request(request.settlement.as_ref())?;
         let agent_cost_units = agent_cost_units(&record.agent_card);
         let cost_units = request
             .max_cost_units
             .and(agent_cost_units)
             .or(agent_cost_units);
-        let request_digest = invocation_request_digest(request, normalized_settlement.as_ref())?;
         Ok(PreparedInvocation {
             record,
             auth_token,
@@ -390,6 +452,7 @@ impl GatewayService {
             cost_units,
             request_digest,
             caller_context: invocation_caller_context(request),
+            envelope_security,
         })
     }
 
@@ -424,28 +487,34 @@ impl GatewayService {
         let completed_at = Utc::now();
         let receipt_output = stored_invocation_output(&response);
 
+        let mut execution_receipt = ExecutionReceipt {
+            receipt_id,
+            agent_id: prepared.record.agent_id.clone(),
+            provider_id: prepared.record.provider_id.clone(),
+            caller_agent_id: prepared.caller_context.caller_agent_id.clone(),
+            caller_public_id: prepared.caller_context.caller_public_id.clone(),
+            caller_display_name: prepared.caller_context.caller_display_name.clone(),
+            caller_node_id: prepared.caller_context.caller_node_id.clone(),
+            invoke_mode,
+            status: ReceiptStatus::Succeeded,
+            verification: verification_for_risk(&prepared.record.review.risk_level),
+            request_digest: prepared.request_digest.clone(),
+            result_digest: receipt_output
+                .as_ref()
+                .map(digest_value)
+                .transpose()
+                .map_err(|err| GatewayError::Execution(err.to_string()))?,
+            invocation_attestation: None,
+            receipt_issuer_did: None,
+            receipt_signed_at_ms: None,
+            receipt_signature: None,
+            started_at,
+            completed_at: Some(completed_at),
+            cost_units: prepared.cost_units,
+        };
+        self.attach_receipt_security(&mut execution_receipt, &prepared)?;
         let receipt = StoredReceipt {
-            receipt: ExecutionReceipt {
-                receipt_id,
-                agent_id: prepared.record.agent_id.clone(),
-                provider_id: prepared.record.provider_id.clone(),
-                caller_agent_id: prepared.caller_context.caller_agent_id.clone(),
-                caller_public_id: prepared.caller_context.caller_public_id.clone(),
-                caller_display_name: prepared.caller_context.caller_display_name.clone(),
-                caller_node_id: prepared.caller_context.caller_node_id.clone(),
-                invoke_mode,
-                status: ReceiptStatus::Succeeded,
-                verification: verification_for_risk(&prepared.record.review.risk_level),
-                request_digest: prepared.request_digest,
-                result_digest: receipt_output
-                    .as_ref()
-                    .map(digest_value)
-                    .transpose()
-                    .map_err(|err| GatewayError::Execution(err.to_string()))?,
-                started_at,
-                completed_at: Some(completed_at),
-                cost_units: prepared.cost_units,
-            },
+            receipt: execution_receipt,
             output: receipt_output,
             stderr: None,
         };
@@ -462,6 +531,89 @@ impl GatewayService {
         ))
     }
 
+    fn enforce_invocation_replay_protection(
+        &self,
+        request: &InvokeAgentRequest,
+        security: &VerifiedAgentEnvelopeSecurity,
+    ) -> Result<(), GatewayError> {
+        let Some(nonce) = security.nonce.as_deref() else {
+            return Ok(());
+        };
+        let issued_at_ms = security.issued_at_ms.ok_or_else(|| {
+            GatewayError::Rejected(
+                "agent_envelope.extensions.issued_at_ms is required when nonce is set".to_owned(),
+            )
+        })?;
+        let expires_at_ms = security.expires_at_ms.ok_or_else(|| {
+            GatewayError::Rejected(
+                "agent_envelope.extensions.expires_at_ms is required when nonce is set".to_owned(),
+            )
+        })?;
+        let request_digest = security.request_digest.as_deref().ok_or_else(|| {
+            GatewayError::Rejected(
+                "agent_envelope.extensions.request_digest is required when nonce is set".to_owned(),
+            )
+        })?;
+        let expected_digest = invocation_envelope_request_digest(request)?;
+        if request_digest != expected_digest {
+            return Err(GatewayError::Rejected(
+                "agent_envelope.extensions.request_digest does not match invocation request"
+                    .to_owned(),
+            ));
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        let issued_at = issued_at_ms as i64;
+        let expires_at = expires_at_ms as i64;
+        if issued_at - now_ms > INVOCATION_REPLAY_MAX_CLOCK_SKEW_MS {
+            return Err(GatewayError::Rejected(
+                "agent_envelope.extensions.issued_at_ms is too far in the future".to_owned(),
+            ));
+        }
+        if expires_at <= issued_at {
+            return Err(GatewayError::Rejected(
+                "agent_envelope.extensions.expires_at_ms must be greater than issued_at_ms"
+                    .to_owned(),
+            ));
+        }
+        if expires_at + INVOCATION_REPLAY_MAX_CLOCK_SKEW_MS < now_ms {
+            return Err(GatewayError::Rejected(
+                "agent_envelope.extensions.expires_at_ms has already passed".to_owned(),
+            ));
+        }
+
+        let mut cache = self.replay_cache.lock().map_err(|_| {
+            GatewayError::Execution("invocation replay cache lock poisoned".to_owned())
+        })?;
+        let cutoff = now_ms.max(0) as u64;
+        cache.retain(|_, expires_at_ms| *expires_at_ms >= cutoff);
+        let key = format!("{}:{nonce}", security.source_agent_id);
+        if cache.contains_key(&key) {
+            return Err(GatewayError::Rejected(
+                "agent_envelope nonce has already been used; refusing to replay".to_owned(),
+            ));
+        }
+        cache.insert(key, expires_at_ms);
+        Ok(())
+    }
+
+    fn attach_receipt_security(
+        &self,
+        receipt: &mut ExecutionReceipt,
+        prepared: &PreparedInvocation,
+    ) -> Result<(), GatewayError> {
+        receipt.invocation_attestation = Some(invocation_attestation(receipt, prepared)?);
+        self.sign_receipt(receipt)
+    }
+
+    fn sign_receipt(&self, receipt: &mut ExecutionReceipt) -> Result<(), GatewayError> {
+        receipt.receipt_issuer_did = Some(self.receipt_signer.issuer_did.clone());
+        receipt.receipt_signed_at_ms = Some(Utc::now().timestamp_millis().max(0) as u64);
+        receipt.receipt_signature = None;
+        let payload = receipt_signature_payload(receipt)?;
+        receipt.receipt_signature = Some(self.receipt_signer.sign_value(&payload)?);
+        Ok(())
+    }
+
     async fn record_failed_invocation(
         &self,
         receipt_id: Uuid,
@@ -474,6 +626,18 @@ impl GatewayService {
             .map_err(map_registry_error)?;
         stored.receipt.status = ReceiptStatus::Failed;
         stored.receipt.completed_at = Some(Utc::now());
+        let status = stored.receipt.status.clone();
+        let result_digest = stored.receipt.result_digest.clone();
+        if let Some(attestation) = stored
+            .receipt
+            .invocation_attestation
+            .as_mut()
+            .and_then(Value::as_object_mut)
+        {
+            attestation.insert("status".to_owned(), serde_json::json!(status));
+            attestation.insert("result_digest".to_owned(), serde_json::json!(result_digest));
+        }
+        self.sign_receipt(&mut stored.receipt)?;
         stored.stderr = Some(error);
         self.registry
             .record_receipt(&stored)
@@ -782,7 +946,9 @@ fn invocation_caller_context(request: &InvokeAgentRequest) -> InvocationCallerCo
     }
 }
 
-fn verify_agent_envelope_signature(request: &InvokeAgentRequest) -> Result<(), GatewayError> {
+fn verify_agent_envelope_signature(
+    request: &InvokeAgentRequest,
+) -> Result<VerifiedAgentEnvelopeSecurity, GatewayError> {
     let envelope = request
         .agent_envelope
         .as_ref()
@@ -808,6 +974,7 @@ fn verify_agent_envelope_signature(request: &InvokeAgentRequest) -> Result<(), G
             GatewayError::Rejected(format!("invalid agent_envelope.extensions: {error}"))
         })?;
     verify_source_agent_card(envelope, &source_agent_id)?;
+    let verified_source_agent_id = source_agent_id.clone();
     let source_agent_id = Some(source_agent_id);
     let transport_profile = json_string_at(envelope, &["transport_profile"]);
     let target_agent_id = json_string_at(envelope, &["target_agent_id"]);
@@ -834,7 +1001,13 @@ fn verify_agent_envelope_signature(request: &InvokeAgentRequest) -> Result<(), G
             ))
         },
     )?;
-    Ok(())
+    Ok(VerifiedAgentEnvelopeSecurity {
+        source_agent_id: verified_source_agent_id,
+        nonce: json_string_at(envelope, &["extensions", "nonce"]),
+        issued_at_ms: json_u64_at(envelope, &["extensions", "issued_at_ms"]),
+        expires_at_ms: json_u64_at(envelope, &["extensions", "expires_at_ms"]),
+        request_digest: json_string_at(envelope, &["extensions", "request_digest"]),
+    })
 }
 
 fn verify_source_agent_card(envelope: &Value, source_agent_id: &str) -> Result<(), GatewayError> {
@@ -937,6 +1110,13 @@ fn canonical_value_hash(value: &Value) -> Result<String, GatewayError> {
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+fn did_from_ed25519_public_key(public_key: &[u8; 32]) -> String {
+    format!(
+        "did:key:z{}",
+        bs58::encode([[0xed, 0x01].as_slice(), public_key.as_slice()].concat()).into_string()
+    )
+}
+
 fn json_string_at(value: &Value, path: &[&str]) -> Option<String> {
     let mut current = value;
     for segment in path {
@@ -947,6 +1127,32 @@ fn json_string_at(value: &Value, path: &[&str]) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn json_u64_at(value: &Value, path: &[&str]) -> Option<u64> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(segment)?;
+    }
+    current.as_u64()
+}
+
+fn invocation_envelope_message(request: &InvokeAgentRequest) -> Result<Value, GatewayError> {
+    let mut message = serde_json::to_value(request).map_err(|error| {
+        GatewayError::Execution(format!("serialize invocation request failed: {error}"))
+    })?;
+    if let Some(object) = message.as_object_mut() {
+        object.remove("auth_token");
+        object.remove("auth_context_id");
+        object.remove("agent_envelope");
+    }
+    Ok(message)
+}
+
+fn invocation_envelope_request_digest(
+    request: &InvokeAgentRequest,
+) -> Result<String, GatewayError> {
+    canonical_value_hash(&invocation_envelope_message(request)?)
 }
 
 fn normalize_settlement_request(
@@ -962,6 +1168,45 @@ fn normalize_settlement_request(
             })
         })
         .transpose()
+}
+
+fn invocation_attestation(
+    receipt: &ExecutionReceipt,
+    prepared: &PreparedInvocation,
+) -> Result<Value, GatewayError> {
+    let record = &prepared.record;
+    Ok(serde_json::json!({
+        "profile": "wattetheria.secure_agent_invocation.v1",
+        "agent_id": record.agent_id,
+        "service_address": record.service_address,
+        "provider_id": record.provider_id,
+        "endpoint_url": record.deployment.endpoint.url,
+        "agent_card_digest": canonical_value_hash(&record.agent_card)?,
+        "deployment_digest": digest_value(&serde_json::json!(record.deployment))
+            .map_err(|error| GatewayError::Execution(error.to_string()))?,
+        "published_record_digest": digest_value(&serde_json::json!(record))
+            .map_err(|error| GatewayError::Execution(error.to_string()))?,
+        "request_digest": receipt.request_digest,
+        "result_digest": receipt.result_digest,
+        "caller_agent_id": receipt.caller_agent_id,
+        "caller_public_id": receipt.caller_public_id,
+        "caller_node_id": receipt.caller_node_id,
+        "invoke_mode": receipt.invoke_mode,
+        "status": receipt.status,
+        "envelope_nonce": prepared.envelope_security.nonce,
+        "envelope_issued_at_ms": prepared.envelope_security.issued_at_ms,
+        "envelope_expires_at_ms": prepared.envelope_security.expires_at_ms,
+        "envelope_request_digest": prepared.envelope_security.request_digest,
+    }))
+}
+
+fn receipt_signature_payload(receipt: &ExecutionReceipt) -> Result<Value, GatewayError> {
+    let mut payload = serde_json::to_value(receipt)
+        .map_err(|error| GatewayError::Execution(format!("serialize receipt failed: {error}")))?;
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("receipt_signature");
+    }
+    Ok(payload)
 }
 
 fn build_invoke_agent_response(
@@ -1199,6 +1444,54 @@ mod tests {
         });
         let extensions = serde_json::json!({
             "caller_public_id": "pub_caller"
+        });
+        let message_json = serde_json::to_string(&message).expect("message should serialize");
+        let extensions_json =
+            Some(serde_json::to_string(&extensions).expect("extensions should serialize"));
+        let payload = SignedAgentEnvelopePayload {
+            protocol: "google_a2a",
+            transport_profile: transport_profile.as_ref(),
+            source_agent_id: Some(&source_agent_id),
+            target_agent_id: target_agent_id.as_ref(),
+            source_node_id: source_node_id.as_ref(),
+            target_node_id: None,
+            capability: capability.as_ref(),
+            source_agent_card_hash: source_agent_card_hash.as_ref(),
+            message_json: &message_json,
+            extensions_json: extensions_json.as_ref(),
+        };
+        serde_json::json!({
+            "protocol": "google_a2a",
+            "transport_profile": transport_profile,
+            "source_agent_id": source_agent_id,
+            "target_agent_id": target_agent_id,
+            "source_node_id": source_node_id,
+            "capability": capability,
+            "source_agent_card": source_agent_card,
+            "message": message,
+            "extensions": extensions,
+            "signature": sign_payload(&payload, &signing_key)
+        })
+    }
+
+    fn signed_agent_envelope_for_request(request: &InvokeAgentRequest, nonce: &str) -> Value {
+        let signing_key = caller_signing_key();
+        let source_agent_id = did_from_signing_key(&signing_key);
+        let transport_profile = Some("wattswarm_mesh".to_owned());
+        let target_agent_id = Some("stripe-agent".to_owned());
+        let source_node_id = Some("node-caller".to_owned());
+        let capability = Some("servicenet.agents.invoke".to_owned());
+        let source_agent_card = signed_source_agent_card(&signing_key);
+        let source_agent_card_hash = json_string_at(&source_agent_card, &["card_hash"]);
+        let message = invocation_envelope_message(request).expect("message should build");
+        let issued_at_ms = Utc::now().timestamp_millis().max(0) as u64;
+        let extensions = serde_json::json!({
+            "caller_public_id": "pub_caller",
+            "nonce": nonce,
+            "issued_at_ms": issued_at_ms,
+            "expires_at_ms": issued_at_ms + 300_000,
+            "request_digest": invocation_envelope_request_digest(request)
+                .expect("request digest should build")
         });
         let message_json = serde_json::to_string(&message).expect("message should serialize");
         let extensions_json =
@@ -1496,6 +1789,53 @@ mod tests {
             .expect("receipts should load");
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].receipt.invoke_mode, InvocationMode::Sync);
+        assert!(receipts[0].receipt.invocation_attestation.is_some());
+        assert!(
+            receipts[0]
+                .receipt
+                .receipt_issuer_did
+                .as_deref()
+                .is_some_and(|value| value.starts_with("did:key:"))
+        );
+        assert!(receipts[0].receipt.receipt_signed_at_ms.is_some());
+        assert!(
+            receipts[0]
+                .receipt
+                .receipt_signature
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_agent_rejects_replayed_agent_envelope_nonce() {
+        let (_registry, gateway) = approved_gateway().await;
+        let mut request = InvokeAgentRequest {
+            task_id: None,
+            context_id: None,
+            message: Some("Create payment link".to_owned()),
+            input: serde_json::json!({"amount": 42}),
+            skill_id: None,
+            settlement: None,
+            auth_token: Some("secret-token".to_owned()),
+            auth_context_id: None,
+            region: Some("AU".to_owned()),
+            confirm_risky: true,
+            max_cost_units: Some(10),
+            agent_envelope: None,
+        };
+        let envelope = signed_agent_envelope_for_request(&request, "nonce-replay-1");
+        request.agent_envelope = Some(envelope.clone());
+        gateway
+            .invoke_agent("stripe-agent", request.clone())
+            .await
+            .expect("first invoke should succeed");
+
+        let err = gateway
+            .invoke_agent("stripe-agent", request)
+            .await
+            .expect_err("replayed invoke should fail");
+        assert!(err.to_string().contains("nonce has already been used"));
     }
 
     #[tokio::test]
