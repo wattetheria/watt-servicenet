@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use watt_servicenet_protocol::{
     ProviderRecord, ProviderStatus, PublishedAgentRecord, PublishedAgentStatus,
 };
@@ -32,6 +33,7 @@ pub use wattswarm_network_transport_core::{
 
 pub const PROVIDER_FEED_KEY: &str = "provider_record";
 pub const PUBLISHED_AGENT_FEED_KEY: &str = "published_agent_record";
+const SERVICE_NETWORK_BACKFILL_TIMEOUT: Duration = Duration::from_secs(30);
 const NODE_SEED_FILE: &str = "node_seed.hex";
 const CONTACT_MATERIAL_FILE: &str = "peer_transport_contacts.json";
 const STATE_LOCK_FILE: &str = ".servicenet-p2p.lock";
@@ -354,6 +356,7 @@ impl ServiceNetworkRuntime {
                 feed_key: Some(PROVIDER_FEED_KEY.to_owned()),
                 known_event_ids: Vec::new(),
             },
+            SERVICE_NETWORK_BACKFILL_TIMEOUT,
         )
     }
 
@@ -413,6 +416,7 @@ impl ServiceNetworkRuntime {
                 feed_key: Some(PUBLISHED_AGENT_FEED_KEY.to_owned()),
                 known_event_ids: Vec::new(),
             },
+            SERVICE_NETWORK_BACKFILL_TIMEOUT,
         )
     }
 

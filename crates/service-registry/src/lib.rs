@@ -3564,6 +3564,265 @@ fn validate_service_address_unique(
     Ok(())
 }
 
+fn validate_agent_card_did_document(
+    provider_did: &str,
+    agent_id: &str,
+    service_address: Option<&str>,
+    agent_card: &serde_json::Value,
+) -> Result<(), RegistryError> {
+    let Some(document) = agent_card
+        .get("didDocument")
+        .or_else(|| agent_card.get("did_document"))
+    else {
+        return Err(RegistryError::InvalidAgent(
+            "agent_card.didDocument is required".to_owned(),
+        ));
+    };
+    if !document.is_object() {
+        return Err(RegistryError::InvalidAgent(
+            "agent_card.didDocument must be an object".to_owned(),
+        ));
+    }
+    if let Some(service_address) = service_address {
+        validate_did_document_alias(document, service_address)?;
+    }
+    validate_did_document_services(provider_did, agent_id, service_address, document)
+}
+
+fn validate_did_document_alias(
+    document: &serde_json::Value,
+    service_address: &str,
+) -> Result<(), RegistryError> {
+    let aliases = document
+        .get("alsoKnownAs")
+        .or_else(|| document.get("also_known_as"))
+        .ok_or_else(|| {
+            RegistryError::InvalidAgent(
+                "agent_card.didDocument.alsoKnownAs must include service_address".to_owned(),
+            )
+        })?;
+    let aliases = aliases.as_array().ok_or_else(|| {
+        RegistryError::InvalidAgent(
+            "agent_card.didDocument.alsoKnownAs must be an array".to_owned(),
+        )
+    })?;
+    if aliases
+        .iter()
+        .any(|alias| alias.as_str() == Some(service_address))
+    {
+        return Ok(());
+    }
+    Err(RegistryError::InvalidAgent(
+        "agent_card.didDocument.alsoKnownAs must include service_address".to_owned(),
+    ))
+}
+
+fn validate_did_document_services(
+    provider_did: &str,
+    agent_id: &str,
+    service_address: Option<&str>,
+    document: &serde_json::Value,
+) -> Result<(), RegistryError> {
+    let Some(services) = document.get("service") else {
+        return Ok(());
+    };
+    let services = services.as_array().ok_or_else(|| {
+        RegistryError::InvalidAgent("agent_card.didDocument.service must be an array".to_owned())
+    })?;
+    for service in services {
+        validate_did_document_service(provider_did, agent_id, service_address, service)?;
+    }
+    Ok(())
+}
+
+fn validate_did_document_service(
+    provider_did: &str,
+    agent_id: &str,
+    service_address: Option<&str>,
+    service: &serde_json::Value,
+) -> Result<(), RegistryError> {
+    let is_servicenet_service = did_document_service_type_is_servicenet(service)
+        || did_document_service_endpoint_is_servicenet(service);
+    if !is_servicenet_service {
+        return Ok(());
+    }
+    let endpoint = service
+        .get("serviceEndpoint")
+        .or_else(|| service.get("service_endpoint"))
+        .ok_or_else(|| {
+            RegistryError::InvalidAgent(
+                "agent_card.didDocument.service[].serviceEndpoint is required".to_owned(),
+            )
+        })?;
+    validate_did_document_service_endpoint(provider_did, agent_id, service_address, endpoint)
+}
+
+fn did_document_service_type_is_servicenet(service: &serde_json::Value) -> bool {
+    let Some(service_type) = service.get("type") else {
+        return false;
+    };
+    match service_type {
+        serde_json::Value::String(value) => is_servicenet_service_type(value),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(is_servicenet_service_type),
+        _ => false,
+    }
+}
+
+fn is_servicenet_service_type(value: &str) -> bool {
+    matches!(
+        value,
+        "WattetheriaServiceNetAgent" | "WattetheriaServiceEndpoint"
+    )
+}
+
+fn did_document_service_endpoint_is_servicenet(service: &serde_json::Value) -> bool {
+    let Some(endpoint) = service
+        .get("serviceEndpoint")
+        .or_else(|| service.get("service_endpoint"))
+    else {
+        return false;
+    };
+    match endpoint {
+        serde_json::Value::String(value) => {
+            value.starts_with("wattetheria://servicenet/")
+                || (value.starts_with("wattetheria://") && value.contains("/service/"))
+        }
+        serde_json::Value::Object(object) => {
+            object
+                .get("transport")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|transport| transport == "servicenet")
+                || object.contains_key("serviceAddress")
+                || object.contains_key("agentId")
+                || object.contains_key("providerDid")
+        }
+        _ => false,
+    }
+}
+
+fn validate_did_document_service_endpoint(
+    provider_did: &str,
+    agent_id: &str,
+    service_address: Option<&str>,
+    endpoint: &serde_json::Value,
+) -> Result<(), RegistryError> {
+    match endpoint {
+        serde_json::Value::String(endpoint) => {
+            validate_did_document_service_endpoint_string(agent_id, service_address, endpoint)
+        }
+        serde_json::Value::Object(endpoint) => validate_did_document_service_endpoint_object(
+            provider_did,
+            agent_id,
+            service_address,
+            endpoint,
+        ),
+        _ => Err(RegistryError::InvalidAgent(
+            "agent_card.didDocument.service[].serviceEndpoint must be a string or object"
+                .to_owned(),
+        )),
+    }
+}
+
+fn validate_did_document_service_endpoint_string(
+    agent_id: &str,
+    service_address: Option<&str>,
+    endpoint: &str,
+) -> Result<(), RegistryError> {
+    if let Some(address) = endpoint.strip_prefix("wattetheria://servicenet/agents/") {
+        if address == agent_id {
+            return Ok(());
+        }
+        return Err(RegistryError::InvalidAgent(
+            "agent_card.didDocument.serviceEndpoint agent_id does not match request.agent_id"
+                .to_owned(),
+        ));
+    }
+    if let Some(address) = endpoint.strip_prefix("wattetheria://servicenet/") {
+        let Some(service_address) = service_address else {
+            return Err(RegistryError::InvalidAgent(
+                "agent_card.didDocument.serviceEndpoint declares a service_address but request.service_address is missing".to_owned(),
+            ));
+        };
+        if address == service_address {
+            return Ok(());
+        }
+        return Err(RegistryError::InvalidAgent(
+            "agent_card.didDocument.serviceEndpoint service_address does not match request.service_address".to_owned(),
+        ));
+    }
+    if endpoint.starts_with("wattetheria://")
+        && let Some((_, endpoint_agent_id)) = endpoint.rsplit_once("/service/")
+    {
+        if endpoint_agent_id == agent_id {
+            return Ok(());
+        }
+        return Err(RegistryError::InvalidAgent(
+            "agent_card.didDocument.serviceEndpoint agent_id does not match request.agent_id"
+                .to_owned(),
+        ));
+    }
+    Err(RegistryError::InvalidAgent(
+        "agent_card.didDocument.serviceEndpoint must use a Wattetheria ServiceNet address"
+            .to_owned(),
+    ))
+}
+
+fn validate_did_document_service_endpoint_object(
+    provider_did: &str,
+    agent_id: &str,
+    service_address: Option<&str>,
+    endpoint: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), RegistryError> {
+    if let Some(transport) = endpoint
+        .get("transport")
+        .and_then(serde_json::Value::as_str)
+        && transport != "servicenet"
+    {
+        return Err(RegistryError::InvalidAgent(
+            "agent_card.didDocument.serviceEndpoint.transport must be servicenet".to_owned(),
+        ));
+    }
+    if let Some(endpoint_agent_id) = endpoint.get("agentId").and_then(serde_json::Value::as_str)
+        && endpoint_agent_id != agent_id
+    {
+        return Err(RegistryError::InvalidAgent(
+            "agent_card.didDocument.serviceEndpoint.agentId does not match request.agent_id"
+                .to_owned(),
+        ));
+    }
+    if let Some(endpoint_service_address) = endpoint
+        .get("serviceAddress")
+        .and_then(serde_json::Value::as_str)
+    {
+        let Some(service_address) = service_address else {
+            return Err(RegistryError::InvalidAgent(
+                "agent_card.didDocument.serviceEndpoint.serviceAddress is set but request.service_address is missing".to_owned(),
+            ));
+        };
+        if endpoint_service_address != service_address {
+            return Err(RegistryError::InvalidAgent(
+                "agent_card.didDocument.serviceEndpoint.serviceAddress does not match request.service_address".to_owned(),
+            ));
+        }
+    }
+    if let Some(endpoint_provider_did) = endpoint
+        .get("providerDid")
+        .and_then(serde_json::Value::as_str)
+        && endpoint_provider_did != provider_did
+    {
+        return Err(RegistryError::InvalidAgent(
+            "agent_card.didDocument.serviceEndpoint.providerDid does not match provider.provider_did".to_owned(),
+        ));
+    }
+    if let Some(address) = endpoint.get("address").and_then(serde_json::Value::as_str) {
+        validate_did_document_service_endpoint_string(agent_id, service_address, address)?;
+    }
+    Ok(())
+}
+
 fn validate_submit_agent_request(
     request: &SubmitAgentRequest,
     state: &RegistryState,
@@ -3609,6 +3868,12 @@ fn validate_submit_agent_request(
         ));
     }
     validate_agent_card(&request.agent_card)?;
+    validate_agent_card_did_document(
+        &provider.provider_did,
+        &request.agent_id,
+        request.service_address.as_deref(),
+        &request.agent_card,
+    )?;
     validate_agent_deployment(&request.deployment)?;
     validate_agent_review_profile(&request.review)?;
     validate_agent_attestations(request, provider)?;
@@ -3646,6 +3911,12 @@ fn validate_published_agent(
         return Err(RegistryError::ProviderBlocked(provider_id.to_owned()));
     }
     validate_agent_card(agent_card)?;
+    validate_agent_card_did_document(
+        &provider.provider_did,
+        agent_id,
+        service_address,
+        agent_card,
+    )?;
     validate_agent_deployment(deployment)?;
     validate_agent_review_profile(review)?;
     Ok(())
@@ -4153,10 +4424,11 @@ mod tests {
     }
 
     fn demo_agent_submission(agent_id: &str) -> SubmitAgentRequest {
+        let service_address = format!("{agent_id}@wattetheria");
         let mut request = SubmitAgentRequest {
             provider_id: "provider-1".to_owned(),
             agent_id: agent_id.to_owned(),
-            service_address: Some(format!("{agent_id}@wattetheria")),
+            service_address: Some(service_address.clone()),
             version: "0.1.0".to_owned(),
             agent_card: json!({
                 "name": "Stripe Agent",
@@ -4198,9 +4470,30 @@ mod tests {
                 expires_at_ms: None,
             },
         };
+        let endpoint = format!("wattetheria://servicenet/{service_address}");
+        attach_lightweight_servicenet_did_document(&mut request, &service_address, &endpoint);
         let provider_key = provider_signing_key();
         sign_submission_attestation(&mut request, &provider_key, None, None);
         request
+    }
+
+    fn attach_lightweight_servicenet_did_document(
+        request: &mut SubmitAgentRequest,
+        alias: &str,
+        endpoint: &str,
+    ) {
+        let provider = demo_provider();
+        request.agent_card["didDocument"] = json!({
+            "id": provider.provider_did,
+            "alsoKnownAs": [alias],
+            "service": [{
+                "id": "#servicenet-agent",
+                "type": "WattetheriaServiceNetAgent",
+                "serviceEndpoint": endpoint
+            }]
+        });
+        let provider_key = provider_signing_key();
+        sign_submission_attestation(request, &provider_key, None, None);
     }
 
     fn wallet_backed_provider_and_agent_submission(
@@ -4378,6 +4671,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_agent_accepts_matching_servicenet_did_document() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let mut request = demo_agent_submission("did-agent");
+        let service_address = request.service_address.clone().expect("service address");
+        let endpoint = format!("wattetheria://servicenet/{service_address}");
+        attach_lightweight_servicenet_did_document(&mut request, &service_address, &endpoint);
+
+        let submission = registry
+            .submit_agent(request)
+            .await
+            .expect("matching didDocument should pass");
+
+        assert_eq!(submission.status, AgentSubmissionStatus::Approved);
+        assert!(submission.agent_card.get("didDocument").is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_agent_rejects_missing_servicenet_did_document() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let mut request = demo_agent_submission("missing-did-agent");
+        request
+            .agent_card
+            .as_object_mut()
+            .expect("agent card object")
+            .remove("didDocument");
+        let provider_key = provider_signing_key();
+        sign_submission_attestation(&mut request, &provider_key, None, None);
+
+        let error = registry
+            .submit_agent(request)
+            .await
+            .expect_err("missing didDocument should fail");
+
+        assert!(
+            error.to_string().contains("didDocument is required"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_agent_rejects_did_document_alias_mismatch() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let mut request = demo_agent_submission("did-alias-agent");
+        let service_address = request.service_address.clone().expect("service address");
+        let endpoint = format!("wattetheria://servicenet/{service_address}");
+        attach_lightweight_servicenet_did_document(
+            &mut request,
+            "other-agent@wattetheria",
+            &endpoint,
+        );
+
+        let error = registry
+            .submit_agent(request)
+            .await
+            .expect_err("mismatched didDocument alias should fail");
+
+        assert!(
+            error.to_string().contains("alsoKnownAs"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_agent_rejects_did_document_endpoint_mismatch() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let mut request = demo_agent_submission("did-endpoint-agent");
+        let service_address = request.service_address.clone().expect("service address");
+        attach_lightweight_servicenet_did_document(
+            &mut request,
+            &service_address,
+            "wattetheria://servicenet/other-agent@wattetheria",
+        );
+
+        let error = registry
+            .submit_agent(request)
+            .await
+            .expect_err("mismatched didDocument endpoint should fail");
+
+        assert!(
+            error.to_string().contains("serviceEndpoint"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn submit_agent_rejects_tampered_payment_binding_from_agent_card_extension() {
         let registry = ServiceRegistry::in_memory();
         let (provider, mut request) =
@@ -4409,8 +4803,11 @@ mod tests {
             .expect("provider should register");
         let mut request = demo_agent_submission("normalized-agent");
         request.service_address = Some("normalized@wattetheria".to_owned());
-        let provider_key = provider_signing_key();
-        sign_submission_attestation(&mut request, &provider_key, None, None);
+        attach_lightweight_servicenet_did_document(
+            &mut request,
+            "normalized@wattetheria",
+            "wattetheria://servicenet/normalized@wattetheria",
+        );
         request.service_address = Some("  Normalized@Wattetheria  ".to_owned());
 
         let submission = registry
@@ -4501,8 +4898,11 @@ mod tests {
 
         let mut second = demo_agent_submission("second-agent");
         second.service_address = Some("first-agent@wattetheria".to_owned());
-        let provider_key = provider_signing_key();
-        sign_submission_attestation(&mut second, &provider_key, None, None);
+        attach_lightweight_servicenet_did_document(
+            &mut second,
+            "first-agent@wattetheria",
+            "wattetheria://servicenet/first-agent@wattetheria",
+        );
         let err = registry
             .submit_agent(second)
             .await

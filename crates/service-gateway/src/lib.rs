@@ -1240,6 +1240,7 @@ mod tests {
     }
 
     fn agent_submission(url_base: &str, endpoint_url: &str) -> SubmitAgentRequest {
+        let provider_did = did_from_signing_key(&provider_signing_key());
         let mut request = SubmitAgentRequest {
             provider_id: "provider-1".to_owned(),
             agent_id: "stripe-agent".to_owned(),
@@ -1255,7 +1256,16 @@ mod tests {
                 "cost": 5,
                 "skills": [{"id": "payments.create_link"}],
                 "securitySchemes": {"oauth2": {"type": "oauth2"}},
-                "security": [{"oauth2": ["payments:write"]}]
+                "security": [{"oauth2": ["payments:write"]}],
+                "didDocument": {
+                    "id": provider_did,
+                    "alsoKnownAs": ["stripe@wattetheria"],
+                    "service": [{
+                        "id": "#servicenet-agent",
+                        "type": "WattetheriaServiceNetAgent",
+                        "serviceEndpoint": "wattetheria://servicenet/stripe@wattetheria"
+                    }]
+                }
             }),
             deployment: AgentDeployment {
                 runtime: "remote_http".to_owned(),

@@ -165,9 +165,11 @@ fn valid_agent_submission_payload_for_agent(
     url_base: &str,
     endpoint_url: &str,
 ) -> serde_json::Value {
+    let service_address = format!("{agent_id}@wattetheria");
     let mut payload = serde_json::json!({
         "provider_id": "provider-local",
         "agent_id": agent_id,
+        "service_address": service_address,
         "version": "0.1.0",
         "agent_card": {
             "name": "Stripe Agent",
@@ -188,7 +190,16 @@ fn valid_agent_submission_payload_for_agent(
             },
             "security": [
                 { "oauth2": ["payments:write"] }
-            ]
+            ],
+            "didDocument": {
+                "id": did_from_signing_key(&provider_signing_key()),
+                "alsoKnownAs": [service_address],
+                "service": [{
+                    "id": "#servicenet-agent",
+                    "type": "WattetheriaServiceNetAgent",
+                    "serviceEndpoint": format!("wattetheria://servicenet/{service_address}")
+                }]
+            }
         },
         "deployment": {
             "runtime": "remote_http",

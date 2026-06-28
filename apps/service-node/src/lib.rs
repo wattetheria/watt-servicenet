@@ -1394,6 +1394,7 @@ mod tests {
         let published: PublishedAgentRecord = serde_json::from_value(serde_json::json!({
             "agent_id": "agent-auto-approved",
             "provider_id": "provider-local",
+            "service_address": "agent-auto-approved@wattetheria",
             "version": "0.1.0",
             "status": "approved",
             "agent_card": {
@@ -1405,7 +1406,16 @@ mod tests {
                 "supportsTask": false,
                 "skills": [{ "id": "demo.run", "name": "Run Demo" }],
                 "securitySchemes": { "none": { "type": "none" } },
-                "security": [{ "none": [] }]
+                "security": [{ "none": [] }],
+                "didDocument": {
+                    "id": "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp",
+                    "alsoKnownAs": ["agent-auto-approved@wattetheria"],
+                    "service": [{
+                        "id": "#servicenet-agent",
+                        "type": "WattetheriaServiceNetAgent",
+                        "serviceEndpoint": "wattetheria://servicenet/agent-auto-approved@wattetheria"
+                    }]
+                }
             },
             "deployment": {
                 "runtime": "remote_http",
@@ -1615,7 +1625,16 @@ mod tests {
                 "supportsTask": false,
                 "skills": [{ "id": "demo.run", "name": "Run Demo" }],
                 "securitySchemes": { "none": { "type": "none" } },
-                "security": [{ "none": [] }]
+                "security": [{ "none": [] }],
+                "didDocument": {
+                    "id": "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp",
+                    "alsoKnownAs": ["agent-auto-approved@wattetheria"],
+                    "service": [{
+                        "id": "#servicenet-agent",
+                        "type": "WattetheriaServiceNetAgent",
+                        "serviceEndpoint": "wattetheria://servicenet/agent-auto-approved@wattetheria"
+                    }]
+                }
             },
             "deployment": {
                 "runtime": "remote_http",
