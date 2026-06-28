@@ -199,26 +199,25 @@ impl A2aAdapter for GoogleA2aAdapter {
         request: &InvokeAgentRequest,
         settlement: Option<&NormalizedSettlementRequest>,
     ) -> Value {
-        let parts = match (&request.message, &request.input) {
-            (Some(message), Value::Null) => vec![serde_json::json!({
+        let mut parts = Vec::new();
+        if let Some(message_text) = invoke_request_message_text(request) {
+            parts.push(serde_json::json!({
                 "kind": "text",
-                "text": message,
-            })],
-            (Some(message), input) => vec![
-                serde_json::json!({
-                    "kind": "text",
-                    "text": message,
-                }),
-                serde_json::json!({
-                    "kind": "data",
-                    "data": input,
-                }),
-            ],
-            (None, input) => vec![serde_json::json!({
+                "text": message_text,
+            }));
+        }
+        if !request.input.is_null() {
+            parts.push(serde_json::json!({
                 "kind": "data",
-                "data": input,
-            })],
-        };
+                "data": request.input.clone(),
+            }));
+        }
+        if parts.is_empty() {
+            parts.push(serde_json::json!({
+                "kind": "data",
+                "data": Value::Null,
+            }));
+        }
 
         let mut map = serde_json::Map::new();
         if let Some(task_id) = &request.task_id {
@@ -556,8 +555,9 @@ impl GatewayService {
             )
         })?;
         validate_signed_invocation_message_matches_request(request, &security.signed_message)?;
-        let expected_digest = canonical_value_hash(&security.signed_message)?;
-        if request_digest != expected_digest {
+        if !request_digest_matches_signed_message(request_digest, &security.signed_message)
+            .map_err(|err| GatewayError::Execution(err.to_string()))?
+        {
             return Err(GatewayError::Rejected(
                 "agent_envelope.extensions.request_digest does not match signed invocation message"
                     .to_owned(),
@@ -932,6 +932,57 @@ fn invocation_request_digest(
         "settlement": normalized_settlement
     }))
     .map_err(|err| GatewayError::Execution(err.to_string()))
+}
+
+fn invoke_request_message_text(request: &InvokeAgentRequest) -> Option<String> {
+    request
+        .message
+        .as_deref()
+        .and_then(non_empty_text)
+        .or_else(|| message_text_from_value(&request.input))
+}
+
+fn message_text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => non_empty_text(text),
+        Value::Object(object) => {
+            for key in ["message", "text", "query", "prompt"] {
+                if let Some(text) = object
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(non_empty_text)
+                {
+                    return Some(text);
+                }
+            }
+            object
+                .get("message")
+                .and_then(a2a_message_text)
+                .or_else(|| a2a_message_text(value))
+        }
+        _ => None,
+    }
+}
+
+fn a2a_message_text(value: &Value) -> Option<String> {
+    value
+        .get("parts")
+        .and_then(Value::as_array)
+        .and_then(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .find_map(non_empty_text)
+        })
+}
+
+fn non_empty_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
 
 fn invocation_caller_context(request: &InvokeAgentRequest) -> InvocationCallerContext {
@@ -1314,6 +1365,21 @@ fn digest_value(value: &Value) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn jcs_sha256_digest_value(value: &Value) -> Result<String> {
+    let bytes = serde_jcs::to_vec(value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn request_digest_matches_signed_message(
+    request_digest: &str,
+    signed_message: &Value,
+) -> Result<bool> {
+    Ok(request_digest == canonical_value_hash(signed_message)?
+        || request_digest == jcs_sha256_digest_value(signed_message)?)
+}
+
 fn classify_a2a_send_error(
     record: &PublishedAgentRecord,
     method: &str,
@@ -1505,7 +1571,7 @@ mod tests {
             "nonce": nonce,
             "issued_at_ms": issued_at_ms,
             "expires_at_ms": issued_at_ms + 300_000,
-            "request_digest": canonical_value_hash(&message).expect("request digest should build")
+            "request_digest": jcs_sha256_digest_value(&message).expect("request digest should build")
         });
         let message_json = serde_json::to_string(&message).expect("message should serialize");
         let extensions_json =
@@ -2355,6 +2421,85 @@ mod tests {
         assert_eq!(
             payload["extensions"]["agent_envelope"]["source_agent_id"].as_str(),
             Some("did:key:zCaller")
+        );
+    }
+
+    #[test]
+    fn google_a2a_adapter_derives_text_from_input_shapes() {
+        let adapter = GoogleA2aAdapter;
+        let payload = adapter.build_send_message_payload(
+            &InvokeAgentRequest {
+                task_id: None,
+                context_id: None,
+                message: None,
+                input: serde_json::json!({"query": "Recommend dishes"}),
+                skill_id: None,
+                settlement: None,
+                auth_token: None,
+                auth_context_id: None,
+                region: None,
+                confirm_risky: false,
+                max_cost_units: None,
+                agent_envelope: None,
+            },
+            None,
+        );
+        assert_eq!(
+            payload["message"]["parts"][0]["text"].as_str(),
+            Some("Recommend dishes")
+        );
+        assert_eq!(
+            payload["message"]["parts"][1]["data"]["query"].as_str(),
+            Some("Recommend dishes")
+        );
+
+        let payload = adapter.build_send_message_payload(
+            &InvokeAgentRequest {
+                task_id: None,
+                context_id: None,
+                message: None,
+                input: serde_json::json!("plain user prompt"),
+                skill_id: None,
+                settlement: None,
+                auth_token: None,
+                auth_context_id: None,
+                region: None,
+                confirm_risky: false,
+                max_cost_units: None,
+                agent_envelope: None,
+            },
+            None,
+        );
+        assert_eq!(
+            payload["message"]["parts"][0]["text"].as_str(),
+            Some("plain user prompt")
+        );
+
+        let payload = adapter.build_send_message_payload(
+            &InvokeAgentRequest {
+                task_id: None,
+                context_id: None,
+                message: None,
+                input: serde_json::json!({
+                    "message": {
+                        "role": "user",
+                        "parts": [{"kind": "text", "text": "A2A user prompt"}]
+                    }
+                }),
+                skill_id: None,
+                settlement: None,
+                auth_token: None,
+                auth_context_id: None,
+                region: None,
+                confirm_risky: false,
+                max_cost_units: None,
+                agent_envelope: None,
+            },
+            None,
+        );
+        assert_eq!(
+            payload["message"]["parts"][0]["text"].as_str(),
+            Some("A2A user prompt")
         );
     }
 }
