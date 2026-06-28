@@ -75,6 +75,7 @@ struct ReceiptSigner {
 #[derive(Debug, Clone, Default)]
 struct VerifiedAgentEnvelopeSecurity {
     source_agent_id: String,
+    signed_message: Value,
     nonce: Option<String>,
     issued_at_ms: Option<u64>,
     expires_at_ms: Option<u64>,
@@ -554,10 +555,11 @@ impl GatewayService {
                 "agent_envelope.extensions.request_digest is required when nonce is set".to_owned(),
             )
         })?;
-        let expected_digest = invocation_envelope_request_digest(request)?;
+        validate_signed_invocation_message_matches_request(request, &security.signed_message)?;
+        let expected_digest = canonical_value_hash(&security.signed_message)?;
         if request_digest != expected_digest {
             return Err(GatewayError::Rejected(
-                "agent_envelope.extensions.request_digest does not match invocation request"
+                "agent_envelope.extensions.request_digest does not match signed invocation message"
                     .to_owned(),
             ));
         }
@@ -1003,6 +1005,7 @@ fn verify_agent_envelope_signature(
     )?;
     Ok(VerifiedAgentEnvelopeSecurity {
         source_agent_id: verified_source_agent_id,
+        signed_message: message.clone(),
         nonce: json_string_at(envelope, &["extensions", "nonce"]),
         issued_at_ms: json_u64_at(envelope, &["extensions", "issued_at_ms"]),
         expires_at_ms: json_u64_at(envelope, &["extensions", "expires_at_ms"]),
@@ -1149,10 +1152,22 @@ fn invocation_envelope_message(request: &InvokeAgentRequest) -> Result<Value, Ga
     Ok(message)
 }
 
-fn invocation_envelope_request_digest(
+fn validate_signed_invocation_message_matches_request(
     request: &InvokeAgentRequest,
-) -> Result<String, GatewayError> {
-    canonical_value_hash(&invocation_envelope_message(request)?)
+    signed_message: &Value,
+) -> Result<(), GatewayError> {
+    let signed_request = serde_json::from_value::<InvokeAgentRequest>(signed_message.clone())
+        .map_err(|error| {
+            GatewayError::Rejected(format!("invalid signed invocation message: {error}"))
+        })?;
+    let signed_message = invocation_envelope_message(&signed_request)?;
+    let request_message = invocation_envelope_message(request)?;
+    if signed_message == request_message {
+        return Ok(());
+    }
+    Err(GatewayError::Rejected(
+        "agent_envelope.message does not match invocation request".to_owned(),
+    ))
 }
 
 fn normalize_settlement_request(
@@ -1490,8 +1505,53 @@ mod tests {
             "nonce": nonce,
             "issued_at_ms": issued_at_ms,
             "expires_at_ms": issued_at_ms + 300_000,
-            "request_digest": invocation_envelope_request_digest(request)
-                .expect("request digest should build")
+            "request_digest": canonical_value_hash(&message).expect("request digest should build")
+        });
+        let message_json = serde_json::to_string(&message).expect("message should serialize");
+        let extensions_json =
+            Some(serde_json::to_string(&extensions).expect("extensions should serialize"));
+        let payload = SignedAgentEnvelopePayload {
+            protocol: "google_a2a",
+            transport_profile: transport_profile.as_ref(),
+            source_agent_id: Some(&source_agent_id),
+            target_agent_id: target_agent_id.as_ref(),
+            source_node_id: source_node_id.as_ref(),
+            target_node_id: None,
+            capability: capability.as_ref(),
+            source_agent_card_hash: source_agent_card_hash.as_ref(),
+            message_json: &message_json,
+            extensions_json: extensions_json.as_ref(),
+        };
+        serde_json::json!({
+            "protocol": "google_a2a",
+            "transport_profile": transport_profile,
+            "source_agent_id": source_agent_id,
+            "target_agent_id": target_agent_id,
+            "source_node_id": source_node_id,
+            "capability": capability,
+            "source_agent_card": source_agent_card,
+            "message": message,
+            "extensions": extensions,
+            "signature": sign_payload(&payload, &signing_key)
+        })
+    }
+
+    fn signed_agent_envelope_for_sparse_message(message: Value, nonce: &str) -> Value {
+        let signing_key = caller_signing_key();
+        let source_agent_id = did_from_signing_key(&signing_key);
+        let transport_profile = Some("wattswarm_mesh".to_owned());
+        let target_agent_id = Some("stripe-agent".to_owned());
+        let source_node_id = Some("node-caller".to_owned());
+        let capability = Some("servicenet.agents.invoke".to_owned());
+        let source_agent_card = signed_source_agent_card(&signing_key);
+        let source_agent_card_hash = json_string_at(&source_agent_card, &["card_hash"]);
+        let issued_at_ms = Utc::now().timestamp_millis().max(0) as u64;
+        let extensions = serde_json::json!({
+            "caller_public_id": "pub_caller",
+            "nonce": nonce,
+            "issued_at_ms": issued_at_ms,
+            "expires_at_ms": issued_at_ms + 300_000,
+            "request_digest": canonical_value_hash(&message).expect("message digest should build")
         });
         let message_json = serde_json::to_string(&message).expect("message should serialize");
         let extensions_json =
@@ -1836,6 +1896,42 @@ mod tests {
             .await
             .expect_err("replayed invoke should fail");
         assert!(err.to_string().contains("nonce has already been used"));
+    }
+
+    #[tokio::test]
+    async fn invoke_agent_accepts_sparse_signed_message_digest() {
+        let (_registry, gateway) = approved_gateway().await;
+        let sparse_message = serde_json::json!({
+            "message": "Create payment link",
+            "region": "AU",
+            "confirm_risky": true,
+            "max_cost_units": 10,
+            "auth_token": "secret-token"
+        });
+        let response = gateway
+            .invoke_agent(
+                "stripe-agent",
+                InvokeAgentRequest {
+                    task_id: None,
+                    context_id: None,
+                    message: Some("Create payment link".to_owned()),
+                    input: Value::Null,
+                    skill_id: None,
+                    settlement: None,
+                    auth_token: Some("secret-token".to_owned()),
+                    auth_context_id: None,
+                    region: Some("AU".to_owned()),
+                    confirm_risky: true,
+                    max_cost_units: Some(10),
+                    agent_envelope: Some(signed_agent_envelope_for_sparse_message(
+                        sparse_message,
+                        "nonce-sparse-1",
+                    )),
+                },
+            )
+            .await
+            .expect("sparse signed message should match request semantics");
+        assert_eq!(response.agent_id, "stripe-agent");
     }
 
     #[tokio::test]
