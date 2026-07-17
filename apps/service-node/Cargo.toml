@@ -20,6 +20,6 @@ watt-servicenet-registry = { path = "../../crates/service-registry" }
 [dev-dependencies]
 base64.workspace = true
 ed25519-dalek.workspace = true
-serde_jcs = "0.1"
+serde_jcs = "0.2"
 bs58 = "0.5"
 sha2.workspace = true

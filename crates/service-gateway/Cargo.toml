@@ -13,12 +13,12 @@ ed25519-dalek.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_jcs = "0.1"
+serde_jcs = "0.2"
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
-watt-did = { path = "../../../watt-did" }
+watt-did = { git = "https://github.com/wattetheria/watt-did.git", branch = "main" }
 watt-servicenet-protocol = { path = "../service-protocol" }
 watt-servicenet-registry = { path = "../service-registry" }
 

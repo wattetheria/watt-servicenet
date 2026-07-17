@@ -101,11 +101,7 @@ async fn provider_gossip_syncs_between_two_nodes() {
         .expect("nodes should connect");
 
     let provider = demo_provider();
-    publish_when_ready(&mut runtime_a, &mut runtime_b, &provider)
-        .await
-        .expect("provider publish should succeed");
-
-    let received = wait_for_provider(&mut runtime_a, &mut runtime_b)
+    let received = publish_until_provider_arrives(&mut runtime_a, &mut runtime_b, &provider)
         .await
         .expect("provider should arrive");
     assert_eq!(received, provider);
@@ -143,21 +139,17 @@ async fn provider_revocation_update_syncs_between_two_nodes() {
         .expect("nodes should connect");
 
     let active_provider = demo_provider();
-    publish_when_ready(&mut runtime_a, &mut runtime_b, &active_provider)
-        .await
-        .expect("active provider publish should succeed");
-    let received_active = wait_for_provider(&mut runtime_a, &mut runtime_b)
-        .await
-        .expect("active provider should arrive");
+    let received_active =
+        publish_until_provider_arrives(&mut runtime_a, &mut runtime_b, &active_provider)
+            .await
+            .expect("active provider should arrive");
     assert_eq!(received_active, active_provider);
 
     let revoked_provider = revoked_provider();
-    publish_when_ready(&mut runtime_a, &mut runtime_b, &revoked_provider)
-        .await
-        .expect("revoked provider publish should succeed");
-    let received_revoked = wait_for_provider(&mut runtime_a, &mut runtime_b)
-        .await
-        .expect("revoked provider should arrive");
+    let received_revoked =
+        publish_until_provider_arrives(&mut runtime_a, &mut runtime_b, &revoked_provider)
+            .await
+            .expect("revoked provider should arrive");
     assert_eq!(received_revoked, revoked_provider);
     assert_eq!(received_revoked.provider_id, received_active.provider_id);
     assert_eq!(received_revoked.status, ProviderStatus::Revoked);
@@ -206,43 +198,34 @@ async fn wait_for_connection(
     }
 }
 
-async fn publish_when_ready(
+async fn publish_until_provider_arrives(
     runtime_a: &mut ServiceNetworkRuntime,
     runtime_b: &mut ServiceNetworkRuntime,
-    provider: &ProviderRecord,
-) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for publish readiness");
-        }
-        match runtime_a.publish_provider(provider) {
-            Ok(()) => return Ok(()),
-            Err(err) if err.to_string().contains("NoPeersSubscribedToTopic") => {
-                let _ = runtime_a.try_next_event()?;
-                let _ = runtime_b.try_next_event()?;
-                sleep(Duration::from_millis(50)).await;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-async fn wait_for_provider(
-    runtime_a: &mut ServiceNetworkRuntime,
-    runtime_b: &mut ServiceNetworkRuntime,
+    expected_provider: &ProviderRecord,
 ) -> anyhow::Result<ProviderRecord> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut next_publish_at = Instant::now();
     loop {
         if Instant::now() >= deadline {
             anyhow::bail!("timed out waiting for provider gossip");
         }
+
+        if Instant::now() >= next_publish_at {
+            if let Err(err) = runtime_a.publish_provider(expected_provider) {
+                return Err(err);
+            }
+            next_publish_at = Instant::now() + Duration::from_millis(250);
+        }
+
         let _ = runtime_a.try_next_event()?;
         if let Some(ServiceNetworkRuntimeEvent::ProviderPublished { provider, .. }) =
             runtime_b.try_next_event()?
         {
-            return Ok(provider);
+            if provider == *expected_provider {
+                return Ok(provider);
+            }
         }
+
         sleep(Duration::from_millis(25)).await;
     }
 }

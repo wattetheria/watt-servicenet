@@ -12,4 +12,4 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
-watt-did = { path = "../../../watt-did" }
+watt-did = { git = "https://github.com/wattetheria/watt-did.git", branch = "main" }

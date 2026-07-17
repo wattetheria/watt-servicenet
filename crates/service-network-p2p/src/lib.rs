@@ -347,17 +347,21 @@ impl ServiceNetworkRuntime {
         from_event_seq: u64,
         limit: usize,
     ) -> Result<BackfillRequestId> {
-        self.inner.send_backfill_request(
-            peer,
-            RawBackfillRequest {
-                scope: SwarmScope::Global,
-                from_event_seq,
-                limit,
-                feed_key: Some(PROVIDER_FEED_KEY.to_owned()),
-                known_event_ids: Vec::new(),
-            },
-            SERVICE_NETWORK_BACKFILL_TIMEOUT,
-        )
+        self.inner
+            .send_backfill_request(
+                peer,
+                RawBackfillRequest {
+                    scope: SwarmScope::Global,
+                    from_event_seq,
+                    limit,
+                    head_only: false,
+                    feed_key: Some(PROVIDER_FEED_KEY.to_owned()),
+                    exclude_topic_events: false,
+                    known_event_ids: Vec::new(),
+                },
+                SERVICE_NETWORK_BACKFILL_TIMEOUT,
+            )?
+            .ok_or_else(|| anyhow!("local backfill capacity exhausted"))
     }
 
     pub fn send_provider_sync_response(
@@ -386,6 +390,7 @@ impl ServiceNetworkRuntime {
             RawBackfillResponse {
                 scope: SwarmScope::Global,
                 next_from_event_seq: from_event_seq.saturating_add(providers.len() as u64),
+                head_only: false,
                 feed_key: Some(PROVIDER_FEED_KEY.to_owned()),
                 head_event_ids: Vec::new(),
                 items,
@@ -407,17 +412,21 @@ impl ServiceNetworkRuntime {
         from_event_seq: u64,
         limit: usize,
     ) -> Result<BackfillRequestId> {
-        self.inner.send_backfill_request(
-            peer,
-            RawBackfillRequest {
-                scope: SwarmScope::Global,
-                from_event_seq,
-                limit,
-                feed_key: Some(PUBLISHED_AGENT_FEED_KEY.to_owned()),
-                known_event_ids: Vec::new(),
-            },
-            SERVICE_NETWORK_BACKFILL_TIMEOUT,
-        )
+        self.inner
+            .send_backfill_request(
+                peer,
+                RawBackfillRequest {
+                    scope: SwarmScope::Global,
+                    from_event_seq,
+                    limit,
+                    head_only: false,
+                    feed_key: Some(PUBLISHED_AGENT_FEED_KEY.to_owned()),
+                    exclude_topic_events: false,
+                    known_event_ids: Vec::new(),
+                },
+                SERVICE_NETWORK_BACKFILL_TIMEOUT,
+            )?
+            .ok_or_else(|| anyhow!("local backfill capacity exhausted"))
     }
 
     pub fn send_published_agent_sync_response(
@@ -446,6 +455,7 @@ impl ServiceNetworkRuntime {
             RawBackfillResponse {
                 scope: SwarmScope::Global,
                 next_from_event_seq: from_event_seq.saturating_add(records.len() as u64),
+                head_only: false,
                 feed_key: Some(PUBLISHED_AGENT_FEED_KEY.to_owned()),
                 head_event_ids: Vec::new(),
                 items,

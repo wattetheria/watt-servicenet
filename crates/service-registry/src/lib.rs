@@ -4389,11 +4389,13 @@ mod tests {
         issuer_did: &str,
         subject_did: &str,
     ) -> String {
+        let issuer_key_fragment = issuer_did.strip_prefix("did:key:").unwrap_or(issuer_did);
+        let issuer_key_id = format!("{issuer_did}#{issuer_key_fragment}");
         let header_b64 = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&json!({
                 "alg": "EdDSA",
                 "typ": "JWT",
-                "kid": "#key-1",
+                "kid": issuer_key_id,
             }))
             .unwrap(),
         );
