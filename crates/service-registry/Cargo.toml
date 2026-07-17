@@ -20,8 +20,8 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
-watt-did = { git = "https://github.com/wattetheria/watt-did.git", branch = "main" }
-watt-wallet = { git = "https://github.com/wattetheria/watt-wallet.git", branch = "main" }
+watt-did = { path = "../../../watt-did" }
+watt-wallet = { path = "../../../watt-wallet" }
 watt-servicenet-protocol = { path = "../service-protocol" }
 
 [dev-dependencies]
