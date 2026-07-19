@@ -15,13 +15,20 @@ use watt_did::{Did, DidKey, DidKeyPublicKey};
 use watt_servicenet_protocol::{
     AgentInteractionProtocol, AuthContextRecord, ExecutionReceipt, GetAgentTaskRequest,
     InvocationMode, InvokeAgentRequest, InvokeAgentResponse, NormalizedSettlementRequest,
-    PublishedAgentRecord, ReceiptStatus, RiskLevel, SettlementLayer, SettlementRequest,
-    StoredReceipt, VerificationVerdict,
+    PublishedAgentRecord, ReceiptStatus, RiskLevel, ServiceAgentSignature, SettlementLayer,
+    SettlementRequest, StoredReceipt, VerificationVerdict,
+    build_service_agent_get_task_signature_params,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry};
 
+mod service_identity;
+
+use service_identity::ServiceAgentVerifier;
+
 const DEFAULT_SERVICENET_CONTEXT_NETWORK_ID: &str = "mainnet:watt-etheria";
 const INVOCATION_REPLAY_MAX_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
+const INVOCATION_REPLAY_MAX_TTL_MS: u64 = 5 * 60 * 1000;
+const INVOCATION_REPLAY_CACHE_MAX_ENTRIES: usize = 262_144;
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -44,6 +51,7 @@ pub struct GatewayService {
     http_client: reqwest::Client,
     policy: GatewayPolicyConfig,
     replay_cache: Arc<Mutex<HashMap<String, u64>>>,
+    service_agent_verifier: ServiceAgentVerifier,
     receipt_signer: ReceiptSigner,
 }
 
@@ -250,10 +258,7 @@ impl A2aAdapter for GoogleA2aAdapter {
     }
 
     fn build_get_task_payload(&self, task_id: &str, request: &GetAgentTaskRequest) -> Value {
-        serde_json::json!({
-            "id": task_id,
-            "historyLength": request.history_length.unwrap_or(10),
-        })
+        build_service_agent_get_task_signature_params(task_id, request.history_length)
     }
 }
 
@@ -320,6 +325,7 @@ impl GatewayService {
             http_client: reqwest::Client::new(),
             policy,
             replay_cache: Arc::new(Mutex::new(HashMap::new())),
+            service_agent_verifier: ServiceAgentVerifier::default(),
             receipt_signer: ReceiptSigner::ephemeral(),
         }
     }
@@ -410,6 +416,7 @@ impl GatewayService {
             settlement: None,
             payment_receipt: None,
             output: None,
+            service_signature: None,
             raw: serde_json::json!({
                 "agent_id": agent_id,
                 "status": "running",
@@ -484,6 +491,12 @@ impl GatewayService {
                 prepared.auth_token.as_deref(),
             )
             .await?;
+        let service_signature = self.service_agent_verifier.verify_response(
+            &prepared.record,
+            prepared.envelope_security.request_digest.as_deref(),
+            prepared.envelope_security.nonce.as_deref(),
+            &response,
+        )?;
         let completed_at = Utc::now();
         let receipt_output = stored_invocation_output(&response);
 
@@ -528,6 +541,7 @@ impl GatewayService {
             Some(stored.receipt.receipt_id),
             prepared.normalized_settlement,
             response,
+            Some(service_signature),
         ))
     }
 
@@ -577,6 +591,11 @@ impl GatewayService {
                     .to_owned(),
             ));
         }
+        if expires_at_ms.saturating_sub(issued_at_ms) > INVOCATION_REPLAY_MAX_TTL_MS {
+            return Err(GatewayError::Rejected(
+                "agent_envelope validity window exceeds five minutes".to_owned(),
+            ));
+        }
         if expires_at + INVOCATION_REPLAY_MAX_CLOCK_SKEW_MS < now_ms {
             return Err(GatewayError::Rejected(
                 "agent_envelope.extensions.expires_at_ms has already passed".to_owned(),
@@ -594,7 +613,16 @@ impl GatewayService {
                 "agent_envelope nonce has already been used; refusing to replay".to_owned(),
             ));
         }
-        cache.insert(key, expires_at_ms);
+        if cache.len() >= INVOCATION_REPLAY_CACHE_MAX_ENTRIES {
+            return Err(GatewayError::Execution(
+                "invocation replay cache is at capacity; retry through another Gateway instance"
+                    .to_owned(),
+            ));
+        }
+        cache.insert(
+            key,
+            expires_at_ms.saturating_add(INVOCATION_REPLAY_MAX_CLOCK_SKEW_MS as u64),
+        );
         Ok(())
     }
 
@@ -666,16 +694,31 @@ impl GatewayService {
         self.enforce_agent_task_access(&record, auth_token.as_deref())
             .await?;
         let adapter = a2a_adapter(record.deployment.endpoint.interaction_protocol);
+        let params = adapter.build_get_task_payload(task_id, &request);
+        let expected_request_digest = jcs_sha256_digest_value(&params)
+            .map_err(|error| GatewayError::Execution(error.to_string()))?;
         let response = self
             .a2a_jsonrpc_call(
                 &record,
                 adapter.as_ref(),
                 adapter.get_task_method(),
-                adapter.build_get_task_payload(task_id, &request),
+                params,
                 auth_token.as_deref(),
             )
             .await?;
-        Ok(build_invoke_agent_response(agent_id, None, None, response))
+        let service_signature = self.service_agent_verifier.verify_response(
+            &record,
+            Some(&expected_request_digest),
+            None,
+            &response,
+        )?;
+        Ok(build_invoke_agent_response(
+            agent_id,
+            None,
+            None,
+            response,
+            Some(service_signature),
+        ))
     }
 
     async fn resolve_agent_auth_context(
@@ -1280,6 +1323,7 @@ fn build_invoke_agent_response(
     receipt_id: Option<Uuid>,
     settlement: Option<NormalizedSettlementRequest>,
     response: Value,
+    service_signature: Option<ServiceAgentSignature>,
 ) -> InvokeAgentResponse {
     let task = response
         .pointer("/result/task")
@@ -1308,6 +1352,7 @@ fn build_invoke_agent_response(
         settlement,
         payment_receipt: extract_payment_receipt(&response),
         output,
+        service_signature,
         raw: response,
     }
 }
@@ -1441,7 +1486,7 @@ fn map_registry_error(error: RegistryError) -> GatewayError {
 mod tests {
     use super::*;
     use axum::{Json, Router, extract::State, routing::post};
-    use base64::engine::general_purpose::STANDARD;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use ed25519_dalek::{Signer, SigningKey};
     use std::sync::{Arc, Mutex};
     use watt_servicenet_protocol::{
@@ -1449,6 +1494,7 @@ mod tests {
         AgentInteractionProtocol, AgentReviewProfile, ApproveAgentSubmissionRequest, AuthModel,
         RegisterAuthContextRequest, RegisterProviderRequest, RiskLevel, SettlementLayer,
         SettlementRequest, SubmitAgentRequest, build_agent_attestation_payload,
+        build_service_agent_signature_payload,
     };
 
     fn provider_signing_key() -> SigningKey {
@@ -1457,6 +1503,14 @@ mod tests {
 
     fn caller_signing_key() -> SigningKey {
         SigningKey::from_bytes(&[42u8; 32])
+    }
+
+    fn service_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[24u8; 32])
+    }
+
+    fn service_did() -> String {
+        "did:web:stripe-agent.example.com:agents:stripe-agent".to_owned()
     }
 
     fn did_from_signing_key(signing_key: &SigningKey) -> String {
@@ -1659,10 +1713,12 @@ mod tests {
     }
 
     fn agent_submission(url_base: &str, endpoint_url: &str) -> SubmitAgentRequest {
-        let provider_did = did_from_signing_key(&provider_signing_key());
+        let service_did = service_did();
+        let verification_method = format!("{service_did}#signing-key");
         let mut request = SubmitAgentRequest {
             provider_id: "provider-1".to_owned(),
             agent_id: "stripe-agent".to_owned(),
+            service_did: service_did.clone(),
             service_address: Some("stripe@wattetheria".to_owned()),
             version: "0.1.0".to_owned(),
             agent_card: serde_json::json!({
@@ -1677,8 +1733,23 @@ mod tests {
                 "securitySchemes": {"oauth2": {"type": "oauth2"}},
                 "security": [{"oauth2": ["payments:write"]}],
                 "didDocument": {
-                    "id": provider_did,
+                    "id": service_did,
                     "alsoKnownAs": ["stripe@wattetheria"],
+                    "verificationMethod": [{
+                        "id": verification_method,
+                        "type": "JsonWebKey2020",
+                        "controller": service_did,
+                        "publicKeyJwk": {
+                            "kty": "OKP",
+                            "crv": "Ed25519",
+                            "x": URL_SAFE_NO_PAD.encode(
+                                service_signing_key().verifying_key().as_bytes()
+                            ),
+                            "alg": "EdDSA"
+                        }
+                    }],
+                    "authentication": [verification_method],
+                    "assertionMethod": [verification_method],
                     "service": [{
                         "id": "#servicenet-agent",
                         "type": "WattetheriaServiceNetAgent",
@@ -1687,7 +1758,7 @@ mod tests {
                 }
             }),
             deployment: AgentDeployment {
-                runtime: "remote_http".to_owned(),
+                runtime: "wattetheria_adapter".to_owned(),
                 endpoint: AgentDeploymentEndpoint {
                     url: endpoint_url.to_owned(),
                     protocol_binding: "JSONRPC".to_owned(),
@@ -1720,15 +1791,53 @@ mod tests {
         request
     }
 
+    fn signed_a2a_response(request: &Value, result: Value) -> Value {
+        let service_did = service_did();
+        let request_digest = request
+            .pointer("/params/extensions/agent_envelope/extensions/request_digest")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                jcs_sha256_digest_value(&request["params"]).expect("request params should hash")
+            });
+        let request_nonce = request
+            .pointer("/params/extensions/agent_envelope/extensions/nonce")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let mut service_signature = ServiceAgentSignature {
+            protocol: "wattetheria.servicenet.response.v1".to_owned(),
+            service_did: service_did.clone(),
+            agent_id: "stripe-agent".to_owned(),
+            verification_method: format!("{service_did}#signing-key"),
+            request_digest,
+            request_nonce,
+            result_digest: jcs_sha256_digest_value(&result).expect("result should hash"),
+            nonce: Uuid::new_v4().to_string(),
+            issued_at_ms: Utc::now().timestamp_millis().max(0) as u64,
+            signature: String::new(),
+        };
+        service_signature.signature = sign_payload(
+            &build_service_agent_signature_payload(&service_signature),
+            &service_signing_key(),
+        );
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": result,
+            "extensions": {
+                "service_agent_signature": service_signature
+            }
+        })
+    }
+
     async fn start_mock_a2a_server() -> String {
         async fn handle(headers: axum::http::HeaderMap, Json(request): Json<Value>) -> Json<Value> {
             let method = request["method"].as_str().unwrap_or_default();
             let has_auth = headers.get("authorization").is_some();
             let response = match method {
-                "SendMessage" => serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": request["id"].clone(),
-                    "result": {
+                "SendMessage" => signed_a2a_response(
+                    &request,
+                    serde_json::json!({
                         "task": {
                             "id": "task-1",
                             "contextId": "ctx-1",
@@ -1740,19 +1849,18 @@ mod tests {
                                 }
                             ]
                         }
-                    }
-                }),
-                "GetTask" => serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": request["id"].clone(),
-                    "result": {
+                    }),
+                ),
+                "GetTask" => signed_a2a_response(
+                    &request,
+                    serde_json::json!({
                         "task": {
                             "id": "task-1",
                             "contextId": "ctx-1",
                             "status": { "state": "TASK_STATE_COMPLETED" }
                         }
-                    }
-                }),
+                    }),
+                ),
                 _ => serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": request["id"].clone(),
@@ -1760,6 +1868,33 @@ mod tests {
                 }),
             };
             Json(response)
+        }
+
+        let app = Router::new().route("/a2a", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock server should run");
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    async fn start_unsigned_a2a_server() -> String {
+        async fn handle(Json(request): Json<Value>) -> Json<Value> {
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": {
+                    "task": {
+                        "id": "task-unsigned",
+                        "status": { "state": "TASK_STATE_COMPLETED" }
+                    }
+                }
+            }))
         }
 
         let app = Router::new().route("/a2a", post(handle));
@@ -1783,10 +1918,9 @@ mod tests {
             Json(request): Json<Value>,
         ) -> Json<Value> {
             captured.lock().expect("capture lock").push(request.clone());
-            let response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request["id"].clone(),
-                "result": {
+            let response = signed_a2a_response(
+                &request,
+                serde_json::json!({
                     "task": {
                         "id": "task-ap2-1",
                         "contextId": "ctx-ap2-1",
@@ -1807,8 +1941,8 @@ mod tests {
                             }
                         ]
                     }
-                }
-            });
+                }),
+            );
             Json(response)
         }
 
@@ -1931,6 +2065,42 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| !value.is_empty())
         );
+    }
+
+    #[tokio::test]
+    async fn invoke_agent_rejects_unsigned_service_agent_response() {
+        let (_registry, gateway) =
+            approved_gateway_with_a2a_url(start_unsigned_a2a_server().await).await;
+        let error = gateway
+            .invoke_agent(
+                "stripe-agent",
+                InvokeAgentRequest {
+                    message: Some("Create payment link".to_owned()),
+                    auth_token: Some("secret-token".to_owned()),
+                    region: Some("AU".to_owned()),
+                    confirm_risky: true,
+                    max_cost_units: Some(10),
+                    agent_envelope: Some(signed_agent_envelope()),
+                    ..InvokeAgentRequest {
+                        task_id: None,
+                        context_id: None,
+                        message: None,
+                        input: Value::Null,
+                        skill_id: None,
+                        settlement: None,
+                        auth_token: None,
+                        auth_context_id: None,
+                        region: None,
+                        confirm_risky: false,
+                        max_cost_units: None,
+                        agent_envelope: None,
+                    }
+                },
+            )
+            .await
+            .expect_err("unsigned Service Agent response should be rejected");
+
+        assert!(error.to_string().contains("service_agent_signature"));
     }
 
     #[tokio::test]

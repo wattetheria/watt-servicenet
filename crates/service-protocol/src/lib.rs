@@ -5,6 +5,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 pub const SERVICE_PROTOCOL_SCHEMA_VERSION: u32 = 1;
+pub const SERVICE_AGENT_SIGNATURE_PROTOCOL: &str = "wattetheria.servicenet.response.v1";
+pub const WATTETHERIA_ADAPTER_RUNTIME: &str = "wattetheria_adapter";
+pub const SERVICE_AGENT_GET_TASK_DEFAULT_HISTORY_LENGTH: u32 = 10;
 
 fn default_schema_version() -> u32 {
     SERVICE_PROTOCOL_SCHEMA_VERSION
@@ -525,6 +528,7 @@ pub fn build_agent_attestation_payload(request: &SubmitAgentRequest) -> Value {
     json!({
         "provider_id": request.provider_id,
         "agent_id": request.agent_id,
+        "service_did": request.service_did,
         "service_address": request.service_address,
         "version": request.version,
         "agent_card": request.agent_card,
@@ -545,6 +549,7 @@ pub fn build_agent_attestation_payload(request: &SubmitAgentRequest) -> Value {
 pub struct SubmitAgentRequest {
     pub provider_id: String,
     pub agent_id: String,
+    pub service_did: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_address: Option<String>,
     pub version: String,
@@ -561,6 +566,7 @@ pub struct AgentSubmissionRecord {
     pub submission_id: Uuid,
     pub provider_id: String,
     pub agent_id: String,
+    pub service_did: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_address: Option<String>,
     pub version: String,
@@ -632,6 +638,7 @@ pub fn build_agent_unpublish_payload(agent_id: &str, request: &UnpublishAgentReq
 pub struct PublishedAgentRecord {
     pub agent_id: String,
     pub provider_id: String,
+    pub service_did: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_address: Option<String>,
     pub version: String,
@@ -702,7 +709,51 @@ pub struct InvokeAgentResponse {
     pub payment_receipt: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_signature: Option<ServiceAgentSignature>,
     pub raw: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceAgentSignature {
+    pub protocol: String,
+    pub service_did: String,
+    pub agent_id: String,
+    pub verification_method: String,
+    pub request_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_nonce: Option<String>,
+    pub result_digest: String,
+    pub nonce: String,
+    pub issued_at_ms: u64,
+    pub signature: String,
+}
+
+#[must_use]
+pub fn build_service_agent_signature_payload(signature: &ServiceAgentSignature) -> Value {
+    json!({
+        "protocol": signature.protocol,
+        "service_did": signature.service_did,
+        "agent_id": signature.agent_id,
+        "verification_method": signature.verification_method,
+        "request_digest": signature.request_digest,
+        "request_nonce": signature.request_nonce,
+        "result_digest": signature.result_digest,
+        "nonce": signature.nonce,
+        "issued_at_ms": signature.issued_at_ms,
+    })
+}
+
+#[must_use]
+pub fn build_service_agent_get_task_signature_params(
+    task_id: &str,
+    history_length: Option<u32>,
+) -> Value {
+    json!({
+        "id": task_id,
+        "historyLength": history_length
+            .unwrap_or(SERVICE_AGENT_GET_TASK_DEFAULT_HISTORY_LENGTH),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -755,6 +806,7 @@ mod tests {
         let request: SubmitAgentRequest = serde_json::from_value(serde_json::json!({
             "provider_id": "acme-labs",
             "agent_id": "stripe-agent",
+            "service_did": "did:web:example.com:agents:stripe-agent",
             "service_address": "stripe@wattetheria",
             "version": "0.1.0",
             "agent_card": {
@@ -769,7 +821,7 @@ mod tests {
                 "security": [{"oauth2": ["payments:write"]}]
             },
             "deployment": {
-                "runtime": "remote_http",
+                "runtime": "wattetheria_adapter",
                 "endpoint": {
                     "url": "https://example.com/a2a",
                     "protocol_binding": "JSONRPC",
@@ -854,6 +906,21 @@ mod tests {
         assert_eq!(
             request.settlement.as_ref().map(|value| value.rail.as_str()),
             Some("x402")
+        );
+    }
+
+    #[test]
+    fn get_task_signature_params_have_stable_digest_vector() {
+        use sha2::{Digest as _, Sha256};
+
+        let params = build_service_agent_get_task_signature_params("task-123", None);
+        let digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_jcs::to_vec(&params).unwrap())
+        );
+        assert_eq!(
+            digest,
+            "sha256:58ed7275f0789912a6589b6103ba2a5a21a84ac396f7e93a86d504df0cac401a"
         );
     }
 

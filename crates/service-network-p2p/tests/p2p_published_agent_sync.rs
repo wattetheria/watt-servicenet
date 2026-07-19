@@ -15,6 +15,7 @@ fn demo_published_agent() -> PublishedAgentRecord {
     PublishedAgentRecord {
         agent_id: "stripe-agent".to_owned(),
         provider_id: "provider-local".to_owned(),
+        service_did: "did:web:stripe-agent.example.com:agents:stripe-agent".to_owned(),
         service_address: None,
         version: "0.1.0".to_owned(),
         status: PublishedAgentStatus::Approved,
@@ -30,7 +31,7 @@ fn demo_published_agent() -> PublishedAgentRecord {
             "security": [{ "oauth2": ["payments:write"] }]
         }),
         deployment: watt_servicenet_protocol::AgentDeployment {
-            runtime: "remote_http".to_owned(),
+            runtime: "wattetheria_adapter".to_owned(),
             endpoint: watt_servicenet_protocol::AgentDeploymentEndpoint {
                 url: "https://stripe-agent.example.com/a2a".to_owned(),
                 protocol_binding: "JSONRPC".to_owned(),
@@ -113,11 +114,7 @@ async fn published_agent_gossip_syncs_between_two_nodes() {
         .expect("nodes should connect");
 
     let record = demo_published_agent();
-    publish_when_ready(&mut runtime_a, &mut runtime_b, &record)
-        .await
-        .expect("published agent gossip should succeed");
-
-    let received = wait_for_record(&mut runtime_a, &mut runtime_b)
+    let received = publish_until_record_arrives(&mut runtime_a, &mut runtime_b, &record)
         .await
         .expect("published agent should arrive");
     assert_eq!(received.agent_id, record.agent_id);
@@ -167,40 +164,31 @@ async fn wait_for_connection(
     }
 }
 
-async fn publish_when_ready(
+async fn publish_until_record_arrives(
     runtime_a: &mut ServiceNetworkRuntime,
     runtime_b: &mut ServiceNetworkRuntime,
-    record: &PublishedAgentRecord,
-) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for publish readiness");
-        }
-        match runtime_a.publish_published_agent_record(record) {
-            Ok(()) => return Ok(()),
-            Err(err) if err.to_string().contains("NoPeersSubscribedToTopic") => {
-                let _ = runtime_a.try_next_event()?;
-                let _ = runtime_b.try_next_event()?;
-                sleep(Duration::from_millis(50)).await;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-async fn wait_for_record(
-    runtime_a: &mut ServiceNetworkRuntime,
-    runtime_b: &mut ServiceNetworkRuntime,
+    expected_record: &PublishedAgentRecord,
 ) -> anyhow::Result<PublishedAgentRecord> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut next_publish_at = Instant::now();
     loop {
         if Instant::now() >= deadline {
             anyhow::bail!("timed out waiting for published agent gossip");
         }
+
+        if Instant::now() >= next_publish_at {
+            if let Err(error) = runtime_a.publish_published_agent_record(expected_record)
+                && !error.to_string().contains("NoPeersSubscribedToTopic")
+            {
+                return Err(error);
+            }
+            next_publish_at = Instant::now() + Duration::from_millis(250);
+        }
+
         let _ = runtime_a.try_next_event()?;
         if let Some(ServiceNetworkRuntimeEvent::PublishedAgentRecordPublished { record, .. }) =
             runtime_b.try_next_event()?
+            && record == *expected_record
         {
             return Ok(record);
         }

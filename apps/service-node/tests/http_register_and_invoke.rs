@@ -2,7 +2,7 @@ use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use axum::{Json, Router, extract::State, routing::post};
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 use watt_servicenet_node::build_local_app;
-use watt_servicenet_protocol::{build_agent_attestation_payload, build_agent_unpublish_payload};
+use watt_servicenet_protocol::{
+    ServiceAgentSignature, build_agent_attestation_payload, build_agent_unpublish_payload,
+    build_service_agent_signature_payload,
+};
 use watt_servicenet_registry::ServiceRegistry;
 
 fn provider_signing_key() -> SigningKey {
@@ -19,6 +22,14 @@ fn provider_signing_key() -> SigningKey {
 
 fn caller_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[42u8; 32])
+}
+
+fn service_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[24u8; 32])
+}
+
+fn service_did(agent_id: &str) -> String {
+    format!("did:web:stripe-agent.example.com:agents:{agent_id}")
 }
 
 #[derive(Debug, Serialize)]
@@ -166,9 +177,12 @@ fn valid_agent_submission_payload_for_agent(
     endpoint_url: &str,
 ) -> serde_json::Value {
     let service_address = format!("{agent_id}@wattetheria");
+    let service_did = service_did(agent_id);
+    let verification_method = format!("{service_did}#signing-key");
     let mut payload = serde_json::json!({
         "provider_id": "provider-local",
         "agent_id": agent_id,
+        "service_did": service_did,
         "service_address": service_address,
         "version": "0.1.0",
         "agent_card": {
@@ -192,8 +206,23 @@ fn valid_agent_submission_payload_for_agent(
                 { "oauth2": ["payments:write"] }
             ],
             "didDocument": {
-                "id": did_from_signing_key(&provider_signing_key()),
+                "id": service_did,
                 "alsoKnownAs": [service_address],
+                "verificationMethod": [{
+                    "id": verification_method,
+                    "type": "JsonWebKey2020",
+                    "controller": service_did,
+                    "publicKeyJwk": {
+                        "kty": "OKP",
+                        "crv": "Ed25519",
+                        "x": URL_SAFE_NO_PAD.encode(
+                            service_signing_key().verifying_key().as_bytes()
+                        ),
+                        "alg": "EdDSA"
+                    }
+                }],
+                "authentication": [verification_method],
+                "assertionMethod": [verification_method],
                 "service": [{
                     "id": "#servicenet-agent",
                     "type": "WattetheriaServiceNetAgent",
@@ -202,7 +231,7 @@ fn valid_agent_submission_payload_for_agent(
             }
         },
         "deployment": {
-            "runtime": "remote_http",
+            "runtime": "wattetheria_adapter",
             "endpoint": {
                 "url": endpoint_url,
                 "protocol_binding": "JSONRPC",
@@ -285,14 +314,59 @@ async fn response_json(response: axum::response::Response) -> serde_json::Value 
     serde_json::from_slice(&body).expect("json should parse")
 }
 
+fn signed_a2a_response(
+    request: &serde_json::Value,
+    result: serde_json::Value,
+) -> serde_json::Value {
+    let service_did = service_did("stripe-agent");
+    let request_digest = request
+        .pointer("/params/extensions/agent_envelope/extensions/request_digest")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| canonical_value_hash(&request["params"]));
+    let request_nonce = request
+        .pointer("/params/extensions/agent_envelope/extensions/nonce")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let issued_at_ms: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("timestamp should fit u64");
+    let mut service_signature = ServiceAgentSignature {
+        protocol: "wattetheria.servicenet.response.v1".to_owned(),
+        service_did: service_did.clone(),
+        agent_id: "stripe-agent".to_owned(),
+        verification_method: format!("{service_did}#signing-key"),
+        request_digest,
+        request_nonce,
+        result_digest: canonical_value_hash(&result),
+        nonce: format!("test-response-{issued_at_ms}"),
+        issued_at_ms,
+        signature: String::new(),
+    };
+    service_signature.signature = sign_payload(
+        &build_service_agent_signature_payload(&service_signature),
+        &service_signing_key(),
+    );
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request["id"].clone(),
+        "result": result,
+        "extensions": {
+            "service_agent_signature": service_signature
+        }
+    })
+}
+
 async fn start_mock_a2a_server() -> String {
     async fn handle(Json(request): Json<serde_json::Value>) -> Json<serde_json::Value> {
         let method = request["method"].as_str().unwrap_or_default();
         let response = match method {
-            "SendMessage" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request["id"].clone(),
-                "result": {
+            "SendMessage" => signed_a2a_response(
+                &request,
+                serde_json::json!({
                     "task": {
                         "id": "task-1",
                         "contextId": "ctx-1",
@@ -300,12 +374,11 @@ async fn start_mock_a2a_server() -> String {
                             "state": "TASK_STATE_WORKING"
                         }
                     }
-                }
-            }),
-            "GetTask" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request["id"].clone(),
-                "result": {
+                }),
+            ),
+            "GetTask" => signed_a2a_response(
+                &request,
+                serde_json::json!({
                     "task": {
                         "id": "task-1",
                         "contextId": "ctx-1",
@@ -326,8 +399,8 @@ async fn start_mock_a2a_server() -> String {
                             }
                         ]
                     }
-                }
-            }),
+                }),
+            ),
             _ => serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": request["id"].clone(),
@@ -361,10 +434,9 @@ async fn start_mock_a2a_server_with_capture() -> (String, Arc<Mutex<Vec<serde_js
         Json(request): Json<serde_json::Value>,
     ) -> Json<serde_json::Value> {
         captured.lock().expect("capture lock").push(request.clone());
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": request["id"].clone(),
-            "result": {
+        let response = signed_a2a_response(
+            &request,
+            serde_json::json!({
                 "task": {
                     "id": "task-ap2-1",
                     "contextId": "ctx-ap2-1",
@@ -387,8 +459,8 @@ async fn start_mock_a2a_server_with_capture() -> (String, Arc<Mutex<Vec<serde_js
                         }
                     ]
                 }
-            }
-        });
+            }),
+        );
         Json(response)
     }
 
@@ -618,7 +690,7 @@ async fn agent_submission_can_be_approved_and_published() {
     assert_eq!(agents_json["items"][0]["agent_id"], "stripe-agent");
     assert_eq!(
         agents_json["items"][0]["deployment"]["runtime"].as_str(),
-        Some("remote_http")
+        Some("wattetheria_adapter")
     );
     assert!(
         agents_json["items"][0]["deployment"]["endpoint"]

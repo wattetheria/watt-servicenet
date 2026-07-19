@@ -1394,6 +1394,7 @@ mod tests {
         let published: PublishedAgentRecord = serde_json::from_value(serde_json::json!({
             "agent_id": "agent-auto-approved",
             "provider_id": "provider-local",
+            "service_did": "did:web:agent.example.com:agents:agent-auto-approved",
             "service_address": "agent-auto-approved@wattetheria",
             "version": "0.1.0",
             "status": "approved",
@@ -1408,8 +1409,25 @@ mod tests {
                 "securitySchemes": { "none": { "type": "none" } },
                 "security": [{ "none": [] }],
                 "didDocument": {
-                    "id": "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp",
+                    "id": "did:web:agent.example.com:agents:agent-auto-approved",
                     "alsoKnownAs": ["agent-auto-approved@wattetheria"],
+                    "verificationMethod": [{
+                        "id": "did:web:agent.example.com:agents:agent-auto-approved#signing-key",
+                        "type": "JsonWebKey2020",
+                        "controller": "did:web:agent.example.com:agents:agent-auto-approved",
+                        "publicKeyJwk": {
+                            "kty": "OKP",
+                            "crv": "Ed25519",
+                            "x": "MBDSjRdEsVFNAeBljSi2gyVx6kw0WnmMQ3MuX-dgl0U",
+                            "alg": "EdDSA"
+                        }
+                    }],
+                    "authentication": [
+                        "did:web:agent.example.com:agents:agent-auto-approved#signing-key"
+                    ],
+                    "assertionMethod": [
+                        "did:web:agent.example.com:agents:agent-auto-approved#signing-key"
+                    ],
                     "service": [{
                         "id": "#servicenet-agent",
                         "type": "WattetheriaServiceNetAgent",
@@ -1418,7 +1436,7 @@ mod tests {
                 }
             },
             "deployment": {
-                "runtime": "remote_http",
+                "runtime": "wattetheria_adapter",
                 "endpoint": {
                     "url": "https://agent.example.com/a2a",
                     "protocol_binding": "JSONRPC",
@@ -1613,6 +1631,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "agent_id": "agent-auto-approved",
             "provider_id": "provider-local",
+            "service_did": "did:web:agent.example.com:agents:agent-auto-approved",
             "service_address": "agent-auto-approved@wattetheria",
             "version": "0.1.0",
             "status": status,
@@ -1627,8 +1646,25 @@ mod tests {
                 "securitySchemes": { "none": { "type": "none" } },
                 "security": [{ "none": [] }],
                 "didDocument": {
-                    "id": "did:key:z6MkpTHR8VNsBxYAAWHut2GeaddA1bbm8CLcfJ4pKzvmWwLp",
+                    "id": "did:web:agent.example.com:agents:agent-auto-approved",
                     "alsoKnownAs": ["agent-auto-approved@wattetheria"],
+                    "verificationMethod": [{
+                        "id": "did:web:agent.example.com:agents:agent-auto-approved#signing-key",
+                        "type": "JsonWebKey2020",
+                        "controller": "did:web:agent.example.com:agents:agent-auto-approved",
+                        "publicKeyJwk": {
+                            "kty": "OKP",
+                            "crv": "Ed25519",
+                            "x": "MBDSjRdEsVFNAeBljSi2gyVx6kw0WnmMQ3MuX-dgl0U",
+                            "alg": "EdDSA"
+                        }
+                    }],
+                    "authentication": [
+                        "did:web:agent.example.com:agents:agent-auto-approved#signing-key"
+                    ],
+                    "assertionMethod": [
+                        "did:web:agent.example.com:agents:agent-auto-approved#signing-key"
+                    ],
                     "service": [{
                         "id": "#servicenet-agent",
                         "type": "WattetheriaServiceNetAgent",
@@ -1637,7 +1673,7 @@ mod tests {
                 }
             },
             "deployment": {
-                "runtime": "remote_http",
+                "runtime": "wattetheria_adapter",
                 "endpoint": {
                     "url": "https://agent.example.com/a2a",
                     "protocol_binding": "JSONRPC",

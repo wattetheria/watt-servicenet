@@ -12,4 +12,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+serde_jcs = "0.2"
+sha2 = "0.10"
 watt-did = { path = "../../../watt-did" }

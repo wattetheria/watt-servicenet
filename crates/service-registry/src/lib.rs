@@ -33,9 +33,11 @@ use watt_servicenet_protocol::{
     RejectAgentSubmissionRequest, ResolveModerationCaseRequest, RevokeProviderRequest, RiskLevel,
     RotateProviderKeyRequest, RunVerifierSweepRequest, SERVICE_PROTOCOL_SCHEMA_VERSION,
     StoredReceipt, SubmitAgentRequest, UnpublishAgentRequest, VerificationRecord,
-    VerificationVerdict, VerifyReceiptRequest, build_agent_attestation_payload,
-    build_agent_unpublish_payload,
+    VerificationVerdict, VerifyReceiptRequest, WATTETHERIA_ADAPTER_RUNTIME,
+    build_agent_attestation_payload, build_agent_unpublish_payload,
 };
+
+mod service_identity;
 
 #[derive(Debug, Error)]
 pub enum RegistryError {
@@ -2366,6 +2368,18 @@ impl ServiceRegistry {
         let request = normalize_submit_agent_request(request)?;
         let mut state = self.load_state().await?;
         validate_submit_agent_request(&request, &state)?;
+        let did_document = request
+            .agent_card
+            .get("didDocument")
+            .or_else(|| request.agent_card.get("did_document"))
+            .expect("validated Service Agent DID document should exist");
+        service_identity::verify_service_did_domain_control(
+            &request.service_did,
+            &request.agent_id,
+            &request.deployment.endpoint.url,
+            did_document,
+        )
+        .await?;
         evict_expired_attestation_nonces(&mut state);
         check_attestation_nonce_not_replayed(&request, &state)?;
         if state
@@ -2397,6 +2411,7 @@ impl ServiceRegistry {
             submission_id: Uuid::new_v4(),
             provider_id: request.provider_id,
             agent_id: request.agent_id,
+            service_did: request.service_did,
             service_address: request.service_address,
             version: request.version,
             status,
@@ -2413,17 +2428,21 @@ impl ServiceRegistry {
         };
         if auto_approve {
             validate_published_agent(
-                &record.provider_id,
-                &record.agent_id,
-                record.service_address.as_deref(),
-                &record.agent_card,
-                &record.deployment,
-                &record.review,
+                PublishedAgentValidation {
+                    provider_id: &record.provider_id,
+                    agent_id: &record.agent_id,
+                    service_did: &record.service_did,
+                    service_address: record.service_address.as_deref(),
+                    agent_card: &record.agent_card,
+                    deployment: &record.deployment,
+                    review: &record.review,
+                },
                 &state,
             )?;
             let published = PublishedAgentRecord {
                 agent_id: record.agent_id.clone(),
                 provider_id: record.provider_id.clone(),
+                service_did: record.service_did.clone(),
                 service_address: record.service_address.clone(),
                 version: record.version.clone(),
                 status: PublishedAgentStatus::Approved,
@@ -2512,7 +2531,16 @@ impl ServiceRegistry {
         }
         let mut state = self.load_state().await?;
         let now = Utc::now();
-        let (provider_id, agent_id, service_address, version, agent_card, deployment, review) = {
+        let (
+            provider_id,
+            agent_id,
+            service_did,
+            service_address,
+            version,
+            agent_card,
+            deployment,
+            review,
+        ) = {
             let submission = state
                 .agent_submissions
                 .get_mut(&submission_id)
@@ -2544,6 +2572,7 @@ impl ServiceRegistry {
             (
                 submission.provider_id.clone(),
                 submission.agent_id.clone(),
+                submission.service_did.clone(),
                 submission.service_address.clone(),
                 submission.version.clone(),
                 submission.agent_card.clone(),
@@ -2552,17 +2581,21 @@ impl ServiceRegistry {
             )
         };
         validate_published_agent(
-            &provider_id,
-            &agent_id,
-            service_address.as_deref(),
-            &agent_card,
-            &deployment,
-            &review,
+            PublishedAgentValidation {
+                provider_id: &provider_id,
+                agent_id: &agent_id,
+                service_did: &service_did,
+                service_address: service_address.as_deref(),
+                agent_card: &agent_card,
+                deployment: &deployment,
+                review: &review,
+            },
             &state,
         )?;
         let record = PublishedAgentRecord {
             agent_id: agent_id.clone(),
             provider_id,
+            service_did,
             service_address,
             version,
             status: PublishedAgentStatus::Approved,
@@ -2723,12 +2756,15 @@ impl ServiceRegistry {
     ) -> Result<PublishedAgentRecord, RegistryError> {
         let mut state = self.load_state().await?;
         validate_published_agent(
-            &record.provider_id,
-            &record.agent_id,
-            record.service_address.as_deref(),
-            &record.agent_card,
-            &record.deployment,
-            &record.review,
+            PublishedAgentValidation {
+                provider_id: &record.provider_id,
+                agent_id: &record.agent_id,
+                service_did: &record.service_did,
+                service_address: record.service_address.as_deref(),
+                agent_card: &record.agent_card,
+                deployment: &record.deployment,
+                review: &record.review,
+            },
             &state,
         )?;
         state
@@ -3564,8 +3600,27 @@ fn validate_service_address_unique(
     Ok(())
 }
 
+fn validate_service_did_unique(
+    state: &RegistryState,
+    agent_id: &str,
+    service_did: &str,
+) -> Result<(), RegistryError> {
+    if let Some(existing) = state
+        .published_agents
+        .values()
+        .find(|record| record.agent_id != agent_id && record.service_did == service_did)
+    {
+        return Err(RegistryError::InvalidAgent(format!(
+            "service_did is already assigned to agent_id {}",
+            existing.agent_id
+        )));
+    }
+    Ok(())
+}
+
 fn validate_agent_card_did_document(
     provider_did: &str,
+    service_did: &str,
     agent_id: &str,
     service_address: Option<&str>,
     agent_card: &serde_json::Value,
@@ -3583,6 +3638,7 @@ fn validate_agent_card_did_document(
             "agent_card.didDocument must be an object".to_owned(),
         ));
     }
+    service_identity::validate_service_did_document(service_did, agent_id, document)?;
     if let Some(service_address) = service_address {
         validate_did_document_alias(document, service_address)?;
     }
@@ -3862,6 +3918,7 @@ fn validate_submit_agent_request(
             "version must not be empty".to_owned(),
         ));
     }
+    validate_service_did_unique(state, &request.agent_id, &request.service_did)?;
     validate_service_address(&request.agent_id, request.service_address.as_deref())?;
     validate_service_address_unique(state, &request.agent_id, request.service_address.as_deref())?;
     let provider = state
@@ -3890,6 +3947,7 @@ fn validate_submit_agent_request(
     validate_agent_card(&request.agent_card)?;
     validate_agent_card_did_document(
         &provider.provider_did,
+        &request.service_did,
         &request.agent_id,
         request.service_address.as_deref(),
         &request.agent_card,
@@ -3900,15 +3958,29 @@ fn validate_submit_agent_request(
     Ok(())
 }
 
+struct PublishedAgentValidation<'a> {
+    provider_id: &'a str,
+    agent_id: &'a str,
+    service_did: &'a str,
+    service_address: Option<&'a str>,
+    agent_card: &'a serde_json::Value,
+    deployment: &'a AgentDeployment,
+    review: &'a AgentReviewProfile,
+}
+
 fn validate_published_agent(
-    provider_id: &str,
-    agent_id: &str,
-    service_address: Option<&str>,
-    agent_card: &serde_json::Value,
-    deployment: &AgentDeployment,
-    review: &AgentReviewProfile,
+    validation: PublishedAgentValidation<'_>,
     state: &RegistryState,
 ) -> Result<(), RegistryError> {
+    let PublishedAgentValidation {
+        provider_id,
+        agent_id,
+        service_did,
+        service_address,
+        agent_card,
+        deployment,
+        review,
+    } = validation;
     if agent_id.trim().is_empty() {
         return Err(RegistryError::InvalidAgent(
             "agent_id must not be empty".to_owned(),
@@ -3916,6 +3988,7 @@ fn validate_published_agent(
     }
     validate_service_address(agent_id, service_address)?;
     validate_service_address_unique(state, agent_id, service_address)?;
+    validate_service_did_unique(state, agent_id, service_did)?;
     let provider = state
         .providers
         .get(provider_id)
@@ -3933,6 +4006,7 @@ fn validate_published_agent(
     validate_agent_card(agent_card)?;
     validate_agent_card_did_document(
         &provider.provider_did,
+        service_did,
         agent_id,
         service_address,
         agent_card,
@@ -3959,10 +4033,10 @@ fn validate_agent_review_profile(review: &AgentReviewProfile) -> Result<(), Regi
 }
 
 fn validate_agent_deployment(deployment: &AgentDeployment) -> Result<(), RegistryError> {
-    if deployment.runtime.trim().is_empty() {
-        return Err(RegistryError::InvalidAgent(
-            "deployment.runtime must not be empty".to_owned(),
-        ));
+    if deployment.runtime != WATTETHERIA_ADAPTER_RUNTIME {
+        return Err(RegistryError::InvalidAgent(format!(
+            "deployment.runtime must be `{WATTETHERIA_ADAPTER_RUNTIME}`; ServiceNet agents must run through the Wattetheria Adapter"
+        )));
     }
     if deployment.endpoint.protocol_binding.trim().is_empty() {
         return Err(RegistryError::InvalidAgent(
@@ -4450,6 +4524,7 @@ mod tests {
         let mut request = SubmitAgentRequest {
             provider_id: "provider-1".to_owned(),
             agent_id: agent_id.to_owned(),
+            service_did: String::new(),
             service_address: Some(service_address.clone()),
             version: "0.1.0".to_owned(),
             agent_card: json!({
@@ -4464,7 +4539,7 @@ mod tests {
                 "security": [{ "oauth2": ["payments:write"] }]
             }),
             deployment: AgentDeployment {
-                runtime: "remote_http".to_owned(),
+                runtime: "wattetheria_adapter".to_owned(),
                 endpoint: watt_servicenet_protocol::AgentDeploymentEndpoint {
                     url: "https://stripe-agent.example.com/a2a".to_owned(),
                     protocol_binding: "JSONRPC".to_owned(),
@@ -4504,10 +4579,29 @@ mod tests {
         alias: &str,
         endpoint: &str,
     ) {
-        let provider = demo_provider();
+        let service_did = format!(
+            "did:web:stripe-agent.example.com:agents:{}",
+            request.agent_id
+        );
+        let service_key = SigningKey::from_bytes(&[23u8; 32]);
+        let verification_method = format!("{service_did}#signing-key");
+        request.service_did = service_did.clone();
         request.agent_card["didDocument"] = json!({
-            "id": provider.provider_did,
+            "id": service_did,
             "alsoKnownAs": [alias],
+            "verificationMethod": [{
+                "id": verification_method,
+                "type": "JsonWebKey2020",
+                "controller": service_did,
+                "publicKeyJwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": URL_SAFE_NO_PAD.encode(service_key.verifying_key().as_bytes()),
+                    "alg": "EdDSA"
+                }
+            }],
+            "authentication": [verification_method],
+            "assertionMethod": [verification_method],
             "service": [{
                 "id": "#servicenet-agent",
                 "type": "WattetheriaServiceNetAgent",
@@ -4740,6 +4834,30 @@ mod tests {
 
         assert!(
             error.to_string().contains("didDocument is required"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_agent_rejects_service_did_outside_agent_path() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let mut request = demo_agent_submission("wrong-did-path-agent");
+        request.service_did = "did:web:stripe-agent.example.com:other:path".to_owned();
+        request.agent_card["didDocument"]["id"] = json!(request.service_did);
+        let provider_key = provider_signing_key();
+        sign_submission_attestation(&mut request, &provider_key, None, None);
+
+        let error = registry
+            .submit_agent(request)
+            .await
+            .expect_err("non-agent did:web path should fail");
+
+        assert!(
+            error.to_string().contains("/agents/{agent_id}"),
             "unexpected error: {error}"
         );
     }

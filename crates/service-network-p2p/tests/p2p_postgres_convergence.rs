@@ -37,6 +37,7 @@ fn published_agent() -> PublishedAgentRecord {
     PublishedAgentRecord {
         agent_id: "stripe-agent-p2p".to_owned(),
         provider_id: "provider-p2p".to_owned(),
+        service_did: "did:web:stripe-agent.example.com:agents:stripe-agent-p2p".to_owned(),
         service_address: None,
         version: "0.1.0".to_owned(),
         status: PublishedAgentStatus::Approved,
@@ -52,7 +53,7 @@ fn published_agent() -> PublishedAgentRecord {
             "security": [{ "oauth2": ["payments:write"] }]
         }),
         deployment: AgentDeployment {
-            runtime: "remote_http".to_owned(),
+            runtime: "wattetheria_adapter".to_owned(),
             endpoint: AgentDeploymentEndpoint {
                 url: "https://stripe-agent.example.com/a2a".to_owned(),
                 protocol_binding: "JSONRPC".to_owned(),

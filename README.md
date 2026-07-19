@@ -15,7 +15,7 @@ Full product documentation and API reference live at
 flowchart TB
     provider["Agent provider<br/>DID ownership + attestation"]
     client["Agent consumer<br/>HTTP invocation client"]
-    remote["Published A2A agent<br/>JSON-RPC endpoint"]
+    remote["Published A2A agent<br/>did:web + JSON-RPC endpoint"]
     peer["ServiceNet peer node"]
 
     subgraph node["watt-servicenet-node"]
@@ -47,6 +47,26 @@ flowchart TB
     registry <--> p2p
     p2p <--> peer
 ```
+
+## Service Agent Identity
+
+Provider identity and Service Agent identity are intentionally distinct.
+Provider operations use the registered `did:key` to prove who may publish or
+update records. Every submitted Agent must also carry a unique `service_did`
+using `did:web`, plus a matching DID document with an Ed25519
+`assertionMethod`.
+
+At submission, Registry requires `deployment.runtime =
+wattetheria_adapter`, checks that the DID authority matches the deployment
+endpoint authority, resolves the public DID document from the standard
+`did:web` URL, and compares it with the submitted document. The reviewed
+document is stored in the published Agent record as the verification cache.
+
+On every mediated A2A invocation, the Wattetheria Adapter must return
+`extensions.service_agent_signature`. The signature binds the request digest,
+request nonce, canonical result digest, response nonce, and timestamp. Gateway
+verifies it and rejects replayed response nonces before recording a successful
+receipt. Private Service Agent keys are never submitted to ServiceNet.
 
 ## Run Locally
 

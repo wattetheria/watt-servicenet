@@ -1,7 +1,7 @@
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -36,9 +36,13 @@ fn did_from_signing_key(signing_key: &SigningKey) -> String {
 }
 
 fn submit_payload() -> serde_json::Value {
+    let service_did = "did:web:stripe-agent.example.com:agents:stripe-agent-pg".to_owned();
+    let verification_method = format!("{service_did}#signing-key");
+    let service_key = SigningKey::from_bytes(&[24u8; 32]);
     let mut payload = serde_json::json!({
         "provider_id": "provider-pg-http",
         "agent_id": "stripe-agent-pg",
+        "service_did": service_did,
         "version": "0.1.0",
         "agent_card": {
             "name": "Stripe Agent PG",
@@ -49,10 +53,31 @@ fn submit_payload() -> serde_json::Value {
             "supportsTask": false,
             "skills": [{ "id": "payments.create_link" }],
             "securitySchemes": { "oauth2": { "type": "oauth2" } },
-            "security": [{ "oauth2": ["payments:write"] }]
+            "security": [{ "oauth2": ["payments:write"] }],
+            "didDocument": {
+                "id": service_did,
+                "verificationMethod": [{
+                    "id": verification_method,
+                    "type": "JsonWebKey2020",
+                    "controller": service_did,
+                    "publicKeyJwk": {
+                        "kty": "OKP",
+                        "crv": "Ed25519",
+                        "x": URL_SAFE_NO_PAD.encode(service_key.verifying_key().as_bytes()),
+                        "alg": "EdDSA"
+                    }
+                }],
+                "authentication": [verification_method],
+                "assertionMethod": [verification_method],
+                "service": [{
+                    "id": "#servicenet-agent",
+                    "type": "WattetheriaServiceNetAgent",
+                    "serviceEndpoint": "wattetheria://servicenet/stripe-agent-pg@wattetheria"
+                }]
+            }
         },
         "deployment": {
-            "runtime": "remote_http",
+            "runtime": "wattetheria_adapter",
             "endpoint": {
                 "url": "https://stripe-agent.example.com/a2a",
                 "protocol_binding": "JSONRPC",

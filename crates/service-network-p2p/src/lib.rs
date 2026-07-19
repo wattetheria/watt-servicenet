@@ -1118,6 +1118,7 @@ mod tests {
         PublishedAgentRecord {
             agent_id: "stripe-agent".to_owned(),
             provider_id: "provider-local".to_owned(),
+            service_did: "did:web:stripe-agent.example.com:agents:stripe-agent".to_owned(),
             service_address: None,
             version: "0.1.0".to_owned(),
             status: PublishedAgentStatus::Approved,
@@ -1133,7 +1134,7 @@ mod tests {
                 "security": [{ "oauth2": ["payments:write"] }]
             }),
             deployment: AgentDeployment {
-                runtime: "remote_http".to_owned(),
+                runtime: "wattetheria_adapter".to_owned(),
                 endpoint: AgentDeploymentEndpoint {
                     url: "https://stripe-agent.example.com/a2a".to_owned(),
                     protocol_binding: "JSONRPC".to_owned(),
