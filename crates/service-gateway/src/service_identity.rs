@@ -16,9 +16,9 @@ use watt_servicenet_protocol::{
 };
 
 const MAX_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
-const PUBLIC_KEY_CACHE_TTL: Duration = Duration::from_mins(5);
+const PUBLIC_KEY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const PUBLIC_KEY_CACHE_MAX_ENTRIES: usize = 4_096;
-const RESPONSE_NONCE_CACHE_TTL: Duration = Duration::from_mins(5);
+const RESPONSE_NONCE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const RESPONSE_NONCE_CACHE_MAX_ENTRIES: usize = 262_144;
 
 #[derive(Debug, Clone)]
