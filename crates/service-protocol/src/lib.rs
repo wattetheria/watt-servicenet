@@ -806,7 +806,7 @@ mod tests {
         let request: SubmitAgentRequest = serde_json::from_value(serde_json::json!({
             "provider_id": "acme-labs",
             "agent_id": "stripe-agent",
-            "service_did": "did:web:example.com:agents:stripe-agent",
+            "service_did": "did:key:z6Mkg5K92URgXhcuTfqt9jntq75JgPKgaQj36ougEQ3PrDXM",
             "service_address": "stripe@wattetheria",
             "version": "0.1.0",
             "agent_card": {

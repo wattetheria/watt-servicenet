@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use watt_did::{DidDocument, JwkPublicKey};
+use watt_did::{Did, DidKey, DidKeyPublicKey};
 use watt_servicenet_protocol::{
     PublishedAgentRecord, SERVICE_AGENT_SIGNATURE_PROTOCOL, ServiceAgentSignature,
     build_service_agent_signature_payload,
@@ -153,12 +153,7 @@ impl ServiceAgentVerifier {
         record: &PublishedAgentRecord,
         verification_method: &str,
     ) -> Result<[u8; 32], GatewayError> {
-        let document = did_document_value(record)?;
-        let cache_key = format!(
-            "{}:{verification_method}:{}",
-            record.service_did,
-            jcs_sha256_digest(document)?
-        );
+        let cache_key = format!("{}:{verification_method}", record.service_did);
         let now = Instant::now();
         if let Some(public_key) = self
             .public_key_cache
@@ -202,58 +197,32 @@ fn parse_public_key(
     record: &PublishedAgentRecord,
     verification_method: &str,
 ) -> Result<[u8; 32], GatewayError> {
-    let document: DidDocument = serde_json::from_value(did_document_value(record)?.clone())
-        .map_err(|error| {
-            GatewayError::Rejected(format!(
-                "published Service Agent DID document is invalid: {error}"
-            ))
-        })?;
-    if document.id.to_string() != record.service_did {
+    let did = Did::parse(&record.service_did).map_err(|error| {
+        GatewayError::Rejected(format!(
+            "published Service Agent did:key is invalid: {error}"
+        ))
+    })?;
+    let did_key = DidKey::from_did(did).map_err(|error| {
+        GatewayError::Rejected(format!(
+            "published Service Agent identity must use did:key: {error}"
+        ))
+    })?;
+    let expected_verification_method = format!("{}#{}", did_key.did, did_key.public_key_multibase);
+    if verification_method != expected_verification_method {
         return Err(GatewayError::Rejected(
-            "published Service Agent DID document id does not match service_did".to_owned(),
+            "Service Agent response references the wrong did:key verification method".to_owned(),
         ));
     }
-    let method = document
-        .verification_method_by_reference(verification_method)
-        .ok_or_else(|| {
-            GatewayError::Rejected(
-                "Service Agent response references an unknown verification method".to_owned(),
-            )
-        })?;
-    if !document.has_relationship(
-        watt_did::VerificationRelationship::AssertionMethod,
-        verification_method,
-    ) {
-        return Err(GatewayError::Rejected(
-            "Service Agent response key is not authorized for assertionMethod".to_owned(),
-        ));
-    }
-    let jwk = method
-        .public_key_jwk_model()
-        .map_err(|error| {
-            GatewayError::Rejected(format!("Service Agent public JWK is invalid: {error}"))
-        })?
-        .ok_or_else(|| {
-            GatewayError::Rejected("Service Agent response key must use publicKeyJwk".to_owned())
-        })?;
-    match jwk.to_public_key().map_err(|error| {
-        GatewayError::Rejected(format!("Service Agent public JWK is invalid: {error}"))
+    match did_key.decode_public_key().map_err(|error| {
+        GatewayError::Rejected(format!(
+            "Service Agent did:key public key is invalid: {error}"
+        ))
     })? {
-        JwkPublicKey::Ed25519(bytes) => Ok(bytes),
+        DidKeyPublicKey::Ed25519(bytes) => Ok(bytes),
         _ => Err(GatewayError::Rejected(
-            "Service Agent response key must use Ed25519".to_owned(),
+            "Service Agent did:key must use Ed25519".to_owned(),
         )),
     }
-}
-
-fn did_document_value(record: &PublishedAgentRecord) -> Result<&Value, GatewayError> {
-    record
-        .agent_card
-        .get("didDocument")
-        .or_else(|| record.agent_card.get("did_document"))
-        .ok_or_else(|| {
-            GatewayError::Rejected("published Service Agent has no DID document".to_owned())
-        })
 }
 
 fn jcs_sha256_digest(value: &Value) -> Result<String, GatewayError> {
@@ -267,14 +236,68 @@ fn jcs_sha256_digest(value: &Value) -> Result<String, GatewayError> {
 mod tests {
     use super::*;
 
+    fn service_did() -> String {
+        format!(
+            "did:key:z{}",
+            bs58::encode([[0xed, 0x01].as_slice(), &[24u8; 32]].concat()).into_string()
+        )
+    }
+
+    fn published_agent(service_did: &str) -> PublishedAgentRecord {
+        serde_json::from_value(serde_json::json!({
+            "agent_id": "ride",
+            "provider_id": "provider",
+            "service_did": service_did,
+            "version": "1.0.0",
+            "status": "approved",
+            "agent_card": {
+                "name": "Ride",
+                "description": "Ride agent",
+                "url": "https://agent.example.com/a2a",
+                "preferredTransport": "JSONRPC",
+                "protocolVersion": "1.0",
+                "supportsTask": false,
+                "skills": []
+            },
+            "deployment": {
+                "runtime": "wattetheria_adapter",
+                "endpoint": {
+                    "url": "https://agent.example.com/a2a",
+                    "protocol_binding": "JSONRPC",
+                    "protocol_version": "1.0",
+                    "interaction_protocol": "google_a2a"
+                }
+            },
+            "review": {"risk_level": "low"},
+            "approved_at": "2026-07-20T00:00:00Z",
+            "updated_at": "2026-07-20T00:00:00Z",
+            "reviewed_by": "test"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn did_key_verification_method_must_use_standard_fingerprint() {
+        let service_did = service_did();
+        let fingerprint = service_did.strip_prefix("did:key:").unwrap();
+        let record = published_agent(&service_did);
+
+        assert!(parse_public_key(&record, &format!("{service_did}#{fingerprint}")).is_ok());
+        assert!(parse_public_key(&record, &format!("{service_did}#signing-key")).is_err());
+    }
+
     #[test]
     fn response_nonce_cache_rejects_replay() {
         let verifier = ServiceAgentVerifier::default();
+        let service_did = service_did();
+        let fingerprint = service_did
+            .strip_prefix("did:key:")
+            .expect("test service DID should use did:key");
         let signature = ServiceAgentSignature {
             protocol: SERVICE_AGENT_SIGNATURE_PROTOCOL.to_owned(),
-            service_did: "did:web:agent.example.com:agents:ride".to_owned(),
+            service_did: service_did.clone(),
             agent_id: "ride".to_owned(),
-            verification_method: "did:web:agent.example.com:agents:ride#signing-key".to_owned(),
+            verification_method: format!("{service_did}#{fingerprint}"),
             request_digest: "sha256:request".to_owned(),
             request_nonce: Some("request-nonce".to_owned()),
             result_digest: "sha256:result".to_owned(),

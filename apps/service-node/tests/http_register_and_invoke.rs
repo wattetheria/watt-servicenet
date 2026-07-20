@@ -2,7 +2,7 @@ use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use axum::{Json, Router, extract::State, routing::post};
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -24,12 +24,21 @@ fn caller_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[42u8; 32])
 }
 
-fn service_signing_key() -> SigningKey {
-    SigningKey::from_bytes(&[24u8; 32])
+fn service_signing_key(agent_id: &str) -> SigningKey {
+    let seed: [u8; 32] = Sha256::digest(agent_id.as_bytes()).into();
+    SigningKey::from_bytes(&seed)
 }
 
 fn service_did(agent_id: &str) -> String {
-    format!("did:web:stripe-agent.example.com:agents:{agent_id}")
+    did_from_signing_key(&service_signing_key(agent_id))
+}
+
+fn service_verification_method(agent_id: &str) -> String {
+    let service_did = service_did(agent_id);
+    let fingerprint = service_did
+        .strip_prefix("did:key:")
+        .expect("service identity should use did:key");
+    format!("{service_did}#{fingerprint}")
 }
 
 #[derive(Debug, Serialize)]
@@ -178,7 +187,6 @@ fn valid_agent_submission_payload_for_agent(
 ) -> serde_json::Value {
     let service_address = format!("{agent_id}@wattetheria");
     let service_did = service_did(agent_id);
-    let verification_method = format!("{service_did}#signing-key");
     let mut payload = serde_json::json!({
         "provider_id": "provider-local",
         "agent_id": agent_id,
@@ -204,31 +212,7 @@ fn valid_agent_submission_payload_for_agent(
             },
             "security": [
                 { "oauth2": ["payments:write"] }
-            ],
-            "didDocument": {
-                "id": service_did,
-                "alsoKnownAs": [service_address],
-                "verificationMethod": [{
-                    "id": verification_method,
-                    "type": "JsonWebKey2020",
-                    "controller": service_did,
-                    "publicKeyJwk": {
-                        "kty": "OKP",
-                        "crv": "Ed25519",
-                        "x": URL_SAFE_NO_PAD.encode(
-                            service_signing_key().verifying_key().as_bytes()
-                        ),
-                        "alg": "EdDSA"
-                    }
-                }],
-                "authentication": [verification_method],
-                "assertionMethod": [verification_method],
-                "service": [{
-                    "id": "#servicenet-agent",
-                    "type": "WattetheriaServiceNetAgent",
-                    "serviceEndpoint": format!("wattetheria://servicenet/{service_address}")
-                }]
-            }
+            ]
         },
         "deployment": {
             "runtime": "wattetheria_adapter",
@@ -338,7 +322,7 @@ fn signed_a2a_response(
         protocol: "wattetheria.servicenet.response.v1".to_owned(),
         service_did: service_did.clone(),
         agent_id: "stripe-agent".to_owned(),
-        verification_method: format!("{service_did}#signing-key"),
+        verification_method: service_verification_method("stripe-agent"),
         request_digest,
         request_nonce,
         result_digest: canonical_value_hash(&result),
@@ -348,7 +332,7 @@ fn signed_a2a_response(
     };
     service_signature.signature = sign_payload(
         &build_service_agent_signature_payload(&service_signature),
-        &service_signing_key(),
+        &service_signing_key("stripe-agent"),
     );
     serde_json::json!({
         "jsonrpc": "2.0",

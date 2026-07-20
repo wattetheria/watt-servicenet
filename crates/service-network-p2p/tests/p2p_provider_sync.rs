@@ -211,19 +211,16 @@ async fn publish_until_provider_arrives(
         }
 
         if Instant::now() >= next_publish_at {
-            if let Err(err) = runtime_a.publish_provider(expected_provider) {
-                return Err(err);
-            }
+            runtime_a.publish_provider(expected_provider)?;
             next_publish_at = Instant::now() + Duration::from_millis(250);
         }
 
         let _ = runtime_a.try_next_event()?;
         if let Some(ServiceNetworkRuntimeEvent::ProviderPublished { provider, .. }) =
             runtime_b.try_next_event()?
+            && provider == *expected_provider
         {
-            if provider == *expected_provider {
-                return Ok(provider);
-            }
+            return Ok(provider);
         }
 
         sleep(Duration::from_millis(25)).await;

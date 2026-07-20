@@ -16,7 +16,7 @@ fn demo_published_agent() -> PublishedAgentRecord {
     PublishedAgentRecord {
         agent_id: "twilio-agent".to_owned(),
         provider_id: "provider-local".to_owned(),
-        service_did: "did:web:twilio-agent.example.com:agents:twilio-agent".to_owned(),
+        service_did: "did:key:z6Mkg5K92URgXhcuTfqt9jntq75JgPKgaQj36ougEQ3PrDXM".to_owned(),
         service_address: None,
         version: "0.1.0".to_owned(),
         status: PublishedAgentStatus::Approved,

@@ -1342,6 +1342,13 @@ mod tests {
     };
     use watt_servicenet_registry::ServiceRegistry;
 
+    fn service_did() -> String {
+        format!(
+            "did:key:z{}",
+            bs58::encode([[0xed, 0x01].as_slice(), &[24u8; 32]].concat()).into_string()
+        )
+    }
+
     #[test]
     fn split_csv_discards_empty_entries() {
         assert_eq!(
@@ -1381,6 +1388,7 @@ mod tests {
     #[tokio::test]
     async fn auto_approved_submission_queues_published_agent_for_p2p() {
         let registry = Arc::new(ServiceRegistry::in_memory());
+        let service_did = service_did();
         registry
             .register_provider(RegisterProviderRequest {
                 provider_id: "provider-local".to_owned(),
@@ -1394,7 +1402,7 @@ mod tests {
         let published: PublishedAgentRecord = serde_json::from_value(serde_json::json!({
             "agent_id": "agent-auto-approved",
             "provider_id": "provider-local",
-            "service_did": "did:web:agent.example.com:agents:agent-auto-approved",
+            "service_did": service_did,
             "service_address": "agent-auto-approved@wattetheria",
             "version": "0.1.0",
             "status": "approved",
@@ -1407,33 +1415,7 @@ mod tests {
                 "supportsTask": false,
                 "skills": [{ "id": "demo.run", "name": "Run Demo" }],
                 "securitySchemes": { "none": { "type": "none" } },
-                "security": [{ "none": [] }],
-                "didDocument": {
-                    "id": "did:web:agent.example.com:agents:agent-auto-approved",
-                    "alsoKnownAs": ["agent-auto-approved@wattetheria"],
-                    "verificationMethod": [{
-                        "id": "did:web:agent.example.com:agents:agent-auto-approved#signing-key",
-                        "type": "JsonWebKey2020",
-                        "controller": "did:web:agent.example.com:agents:agent-auto-approved",
-                        "publicKeyJwk": {
-                            "kty": "OKP",
-                            "crv": "Ed25519",
-                            "x": "MBDSjRdEsVFNAeBljSi2gyVx6kw0WnmMQ3MuX-dgl0U",
-                            "alg": "EdDSA"
-                        }
-                    }],
-                    "authentication": [
-                        "did:web:agent.example.com:agents:agent-auto-approved#signing-key"
-                    ],
-                    "assertionMethod": [
-                        "did:web:agent.example.com:agents:agent-auto-approved#signing-key"
-                    ],
-                    "service": [{
-                        "id": "#servicenet-agent",
-                        "type": "WattetheriaServiceNetAgent",
-                        "serviceEndpoint": "wattetheria://servicenet/agent-auto-approved@wattetheria"
-                    }]
-                }
+                "security": [{ "none": [] }]
             },
             "deployment": {
                 "runtime": "wattetheria_adapter",
@@ -1628,10 +1610,11 @@ mod tests {
         updated_at: &str,
         review_notes: &str,
     ) -> PublishedAgentRecord {
+        let service_did = service_did();
         serde_json::from_value(serde_json::json!({
             "agent_id": "agent-auto-approved",
             "provider_id": "provider-local",
-            "service_did": "did:web:agent.example.com:agents:agent-auto-approved",
+            "service_did": service_did,
             "service_address": "agent-auto-approved@wattetheria",
             "version": "0.1.0",
             "status": status,
@@ -1644,33 +1627,7 @@ mod tests {
                 "supportsTask": false,
                 "skills": [{ "id": "demo.run", "name": "Run Demo" }],
                 "securitySchemes": { "none": { "type": "none" } },
-                "security": [{ "none": [] }],
-                "didDocument": {
-                    "id": "did:web:agent.example.com:agents:agent-auto-approved",
-                    "alsoKnownAs": ["agent-auto-approved@wattetheria"],
-                    "verificationMethod": [{
-                        "id": "did:web:agent.example.com:agents:agent-auto-approved#signing-key",
-                        "type": "JsonWebKey2020",
-                        "controller": "did:web:agent.example.com:agents:agent-auto-approved",
-                        "publicKeyJwk": {
-                            "kty": "OKP",
-                            "crv": "Ed25519",
-                            "x": "MBDSjRdEsVFNAeBljSi2gyVx6kw0WnmMQ3MuX-dgl0U",
-                            "alg": "EdDSA"
-                        }
-                    }],
-                    "authentication": [
-                        "did:web:agent.example.com:agents:agent-auto-approved#signing-key"
-                    ],
-                    "assertionMethod": [
-                        "did:web:agent.example.com:agents:agent-auto-approved#signing-key"
-                    ],
-                    "service": [{
-                        "id": "#servicenet-agent",
-                        "type": "WattetheriaServiceNetAgent",
-                        "serviceEndpoint": "wattetheria://servicenet/agent-auto-approved@wattetheria"
-                    }]
-                }
+                "security": [{ "none": [] }]
             },
             "deployment": {
                 "runtime": "wattetheria_adapter",

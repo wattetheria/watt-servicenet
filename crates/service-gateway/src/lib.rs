@@ -1486,7 +1486,7 @@ fn map_registry_error(error: RegistryError) -> GatewayError {
 mod tests {
     use super::*;
     use axum::{Json, Router, extract::State, routing::post};
-    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::engine::general_purpose::STANDARD;
     use ed25519_dalek::{Signer, SigningKey};
     use std::sync::{Arc, Mutex};
     use watt_servicenet_protocol::{
@@ -1510,7 +1510,15 @@ mod tests {
     }
 
     fn service_did() -> String {
-        "did:web:stripe-agent.example.com:agents:stripe-agent".to_owned()
+        did_from_signing_key(&service_signing_key())
+    }
+
+    fn service_verification_method() -> String {
+        let service_did = service_did();
+        let fingerprint = service_did
+            .strip_prefix("did:key:")
+            .expect("service identity should use did:key");
+        format!("{service_did}#{fingerprint}")
     }
 
     fn did_from_signing_key(signing_key: &SigningKey) -> String {
@@ -1714,7 +1722,6 @@ mod tests {
 
     fn agent_submission(url_base: &str, endpoint_url: &str) -> SubmitAgentRequest {
         let service_did = service_did();
-        let verification_method = format!("{service_did}#signing-key");
         let mut request = SubmitAgentRequest {
             provider_id: "provider-1".to_owned(),
             agent_id: "stripe-agent".to_owned(),
@@ -1731,31 +1738,7 @@ mod tests {
                 "cost": 5,
                 "skills": [{"id": "payments.create_link"}],
                 "securitySchemes": {"oauth2": {"type": "oauth2"}},
-                "security": [{"oauth2": ["payments:write"]}],
-                "didDocument": {
-                    "id": service_did,
-                    "alsoKnownAs": ["stripe@wattetheria"],
-                    "verificationMethod": [{
-                        "id": verification_method,
-                        "type": "JsonWebKey2020",
-                        "controller": service_did,
-                        "publicKeyJwk": {
-                            "kty": "OKP",
-                            "crv": "Ed25519",
-                            "x": URL_SAFE_NO_PAD.encode(
-                                service_signing_key().verifying_key().as_bytes()
-                            ),
-                            "alg": "EdDSA"
-                        }
-                    }],
-                    "authentication": [verification_method],
-                    "assertionMethod": [verification_method],
-                    "service": [{
-                        "id": "#servicenet-agent",
-                        "type": "WattetheriaServiceNetAgent",
-                        "serviceEndpoint": "wattetheria://servicenet/stripe@wattetheria"
-                    }]
-                }
+                "security": [{"oauth2": ["payments:write"]}]
             }),
             deployment: AgentDeployment {
                 runtime: "wattetheria_adapter".to_owned(),
@@ -1808,7 +1791,7 @@ mod tests {
             protocol: "wattetheria.servicenet.response.v1".to_owned(),
             service_did: service_did.clone(),
             agent_id: "stripe-agent".to_owned(),
-            verification_method: format!("{service_did}#signing-key"),
+            verification_method: service_verification_method(),
             request_digest,
             request_nonce,
             result_digest: jcs_sha256_digest_value(&result).expect("result should hash"),

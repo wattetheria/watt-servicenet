@@ -1,5 +1,5 @@
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD;
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
@@ -57,9 +57,8 @@ fn provider_request() -> RegisterProviderRequest {
 }
 
 fn agent_submission() -> SubmitAgentRequest {
-    let service_did = "did:web:stripe-agent.example.com:agents:stripe-agent".to_owned();
-    let verification_method = format!("{service_did}#signing-key");
     let service_key = SigningKey::from_bytes(&[24u8; 32]);
+    let service_did = did_from_signing_key(&service_key);
     let mut request = SubmitAgentRequest {
         provider_id: "provider-pg".to_owned(),
         agent_id: "stripe-agent".to_owned(),
@@ -75,29 +74,7 @@ fn agent_submission() -> SubmitAgentRequest {
             "supportsTask": false,
             "skills": [{ "id": "payments.create_link" }],
             "securitySchemes": { "oauth2": { "type": "oauth2" } },
-            "security": [{ "oauth2": ["payments:write"] }],
-            "didDocument": {
-                "id": service_did,
-                "alsoKnownAs": ["stripe@wattetheria"],
-                "verificationMethod": [{
-                    "id": verification_method,
-                    "type": "JsonWebKey2020",
-                    "controller": service_did,
-                    "publicKeyJwk": {
-                        "kty": "OKP",
-                        "crv": "Ed25519",
-                        "x": URL_SAFE_NO_PAD.encode(service_key.verifying_key().as_bytes()),
-                        "alg": "EdDSA"
-                    }
-                }],
-                "authentication": [verification_method],
-                "assertionMethod": [verification_method],
-                "service": [{
-                    "id": "#servicenet-agent",
-                    "type": "WattetheriaServiceNetAgent",
-                    "serviceEndpoint": "wattetheria://servicenet/stripe@wattetheria"
-                }]
-            }
+            "security": [{ "oauth2": ["payments:write"] }]
         }),
         deployment: AgentDeployment {
             runtime: "wattetheria_adapter".to_owned(),
