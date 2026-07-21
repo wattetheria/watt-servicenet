@@ -19,13 +19,13 @@ use watt_servicenet_p2p::{
     provider_record_summary, published_agent_record_summary,
 };
 use watt_servicenet_protocol::{
-    AgentSubmissionQuery, AgentSubmissionStatus, ApproveAgentSubmissionRequest, AuthContextQuery,
-    BlockEntityRequest, CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest,
-    GetAgentTaskRequest, InvokeAgentRequest, ModerationCaseQuery, ProviderRecord,
-    PublishedAgentRecord, ReceiptQuery, RegisterAuthContextRequest, RegisterProviderRequest,
-    RejectAgentSubmissionRequest, ResolveModerationCaseRequest, RevokeProviderRequest,
-    RotateProviderKeyRequest, RunVerifierSweepRequest, SubmitAgentRequest, UnpublishAgentRequest,
-    VerifyReceiptRequest,
+    AgentConnectionMode, AgentSubmissionQuery, AgentSubmissionStatus,
+    ApproveAgentSubmissionRequest, AuthContextQuery, BlockEntityRequest,
+    CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest, GetAgentTaskRequest,
+    InvokeAgentRequest, ModerationCaseQuery, ProviderRecord, PublishedAgentRecord, ReceiptQuery,
+    RegisterAuthContextRequest, RegisterProviderRequest, RejectAgentSubmissionRequest,
+    ResolveModerationCaseRequest, RevokeProviderRequest, RotateProviderKeyRequest,
+    RunVerifierSweepRequest, SubmitAgentRequest, UnpublishAgentRequest, VerifyReceiptRequest,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry, ServiceRegistryConfig};
 
@@ -389,6 +389,7 @@ async fn get_agent(
 }
 
 fn public_published_agent_view(agent: &PublishedAgentRecord) -> serde_json::Value {
+    let endpoint_url = agent.deployment.endpoint.url.clone();
     let mut view = serde_json::to_value(agent).unwrap_or(serde_json::Value::Null);
     if let Some(object) = view.as_object_mut() {
         if let Some(agent_card) = object
@@ -405,14 +406,18 @@ fn public_published_agent_view(agent: &PublishedAgentRecord) -> serde_json::Valu
         {
             endpoint.remove("url");
         }
-        object.insert(
-            "invoke".to_owned(),
-            serde_json::json!({
-                "transport": "servicenet",
+        let invoke = match agent.deployment.connection_mode {
+            AgentConnectionMode::ServicenetRelay => serde_json::json!({
+                "transport": "servicenet_relay",
                 "sync_url": format!("/v1/agents/{}/invoke", agent.agent_id),
                 "async_url": format!("/v1/agents/{}/invoke-async", agent.agent_id),
             }),
-        );
+            AgentConnectionMode::WattetheriaDirect => serde_json::json!({
+                "transport": "wattetheria_direct",
+                "direct_url": endpoint_url,
+            }),
+        };
+        object.insert("invoke".to_owned(), invoke);
         object.insert(
             "address".to_owned(),
             serde_json::json!(format!(
@@ -1338,7 +1343,8 @@ mod tests {
         ServiceNetworkRecordSummary, provider_record_summary, published_agent_record_summary,
     };
     use watt_servicenet_protocol::{
-        AgentSubmissionStatus, ProviderRecord, PublishedAgentRecord, RegisterProviderRequest,
+        AgentConnectionMode, AgentSubmissionStatus, ProviderRecord, PublishedAgentRecord,
+        RegisterProviderRequest,
     };
     use watt_servicenet_registry::ServiceRegistry;
 
@@ -1423,7 +1429,7 @@ mod tests {
                     "url": "https://agent.example.com/a2a",
                     "protocol_binding": "JSONRPC",
                     "protocol_version": "1.0",
-                    "interaction_protocol": "google_a2a"
+                    "interaction_protocol": "a2a_v1"
                 }
             },
             "review": {
@@ -1588,6 +1594,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn public_direct_agent_view_exposes_adapter_url_only_for_direct_invocation() {
+        let mut agent = published_agent_fixture("approved", "2026-01-01T00:00:00Z", "first");
+        agent.deployment.connection_mode = AgentConnectionMode::WattetheriaDirect;
+        agent.deployment.endpoint.url = "https://provider.example.com/service".to_owned();
+
+        let view = public_published_agent_view(&agent);
+
+        assert_eq!(view["invoke"]["transport"], "wattetheria_direct");
+        assert_eq!(
+            view["invoke"]["direct_url"],
+            "https://provider.example.com/service"
+        );
+        assert!(view.pointer("/deployment/endpoint/url").is_none());
+        assert!(view["invoke"].get("sync_url").is_none());
+    }
+
     fn provider_fixture(
         status: &str,
         provider_did: &str,
@@ -1635,7 +1658,7 @@ mod tests {
                     "url": "https://agent.example.com/a2a",
                     "protocol_binding": "JSONRPC",
                     "protocol_version": "1.0",
-                    "interaction_protocol": "google_a2a"
+                    "interaction_protocol": "a2a_v1"
                 }
             },
             "review": {

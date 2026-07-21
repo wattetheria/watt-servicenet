@@ -60,7 +60,7 @@ fn submit_payload() -> serde_json::Value {
                 "url": "https://stripe-agent.example.com/a2a",
                 "protocol_binding": "JSONRPC",
                 "protocol_version": "1.0",
-                "interaction_protocol": "google_a2a"
+                "interaction_protocol": "a2a_v1"
             }
         },
         "review": {

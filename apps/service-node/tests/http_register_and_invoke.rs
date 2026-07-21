@@ -147,7 +147,7 @@ fn signed_agent_envelope() -> serde_json::Value {
     let extensions_json =
         Some(serde_json::to_string(&extensions).expect("extensions should serialize"));
     let payload = SignedAgentEnvelopePayload {
-        protocol: "google_a2a",
+        protocol: "a2a_v1",
         transport_profile: transport_profile.as_ref(),
         source_agent_id: Some(&source_agent_id),
         target_agent_id: target_agent_id.as_ref(),
@@ -159,7 +159,7 @@ fn signed_agent_envelope() -> serde_json::Value {
         extensions_json: extensions_json.as_ref(),
     };
     serde_json::json!({
-        "protocol": "google_a2a",
+        "protocol": "a2a_v1",
         "transport_profile": transport_profile,
         "source_agent_id": source_agent_id,
         "target_agent_id": target_agent_id,
@@ -220,7 +220,7 @@ fn valid_agent_submission_payload_for_agent(
                 "url": endpoint_url,
                 "protocol_binding": "JSONRPC",
                 "protocol_version": "1.0",
-                "interaction_protocol": "google_a2a"
+                "interaction_protocol": "a2a_v1"
             }
         },
         "review": {
@@ -300,16 +300,16 @@ async fn response_json(response: axum::response::Response) -> serde_json::Value 
 
 fn signed_a2a_response(
     request: &serde_json::Value,
-    result: serde_json::Value,
+    mut result: serde_json::Value,
 ) -> serde_json::Value {
     let service_did = service_did("stripe-agent");
     let request_digest = request
-        .pointer("/params/extensions/agent_envelope/extensions/request_digest")
+        .pointer("/params/metadata/agent_envelope/extensions/request_digest")
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| canonical_value_hash(&request["params"]));
     let request_nonce = request
-        .pointer("/params/extensions/agent_envelope/extensions/nonce")
+        .pointer("/params/metadata/agent_envelope/extensions/nonce")
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     let issued_at_ms: u64 = SystemTime::now()
@@ -334,13 +334,26 @@ fn signed_a2a_response(
         &build_service_agent_signature_payload(&service_signature),
         &service_signing_key("stripe-agent"),
     );
+    let signature = serde_json::Value::String(
+        serde_json::to_string(&service_signature).expect("signature should serialize"),
+    );
+    let wire_result = if request["method"] == "GetTask" {
+        let mut task = result["task"].take();
+        task["metadata"]["wattetheriaServiceAgentSignature"] = signature;
+        task
+    } else {
+        let payload_name = if result.get("task").is_some() {
+            "task"
+        } else {
+            "message"
+        };
+        result[payload_name]["metadata"]["wattetheriaServiceAgentSignature"] = signature;
+        result
+    };
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": request["id"].clone(),
-        "result": result,
-        "extensions": {
-            "service_agent_signature": service_signature
-        }
+        "result": wire_result,
     })
 }
 
@@ -1120,16 +1133,13 @@ async fn approved_agent_can_be_invoked_over_a2a_with_x402_settlement() {
     let captured = captured.lock().expect("capture lock");
     let request = captured.last().expect("captured request");
     assert_eq!(request["method"], "SendMessage");
+    assert_eq!(request["params"]["metadata"]["settlement"]["rail"], "x402");
     assert_eq!(
-        request["params"]["extensions"]["settlement"]["rail"],
+        request["params"]["metadata"]["settlement"]["request"]["protocol"],
         "x402"
     );
     assert_eq!(
-        request["params"]["extensions"]["settlement"]["request"]["protocol"],
-        "x402"
-    );
-    assert_eq!(
-        request["params"]["extensions"]["agent_envelope"]["extensions"]["caller_public_id"],
+        request["params"]["metadata"]["agent_envelope"]["extensions"]["caller_public_id"],
         serde_json::json!("pub_caller")
     );
 }

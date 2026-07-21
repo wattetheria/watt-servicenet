@@ -14,7 +14,7 @@ fn default_schema_version() -> u32 {
 }
 
 fn default_agent_interaction_protocol() -> AgentInteractionProtocol {
-    AgentInteractionProtocol::GoogleA2a
+    AgentInteractionProtocol::A2aV1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,13 +423,19 @@ pub enum PublishedAgentStatus {
 #[serde(rename_all = "snake_case")]
 pub enum AgentInteractionProtocol {
     #[default]
-    GoogleA2a,
+    A2aV1,
 }
 
 impl AgentInteractionProtocol {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::GoogleA2a => "google_a2a",
+            Self::A2aV1 => "a2a_v1",
+        }
+    }
+
+    pub fn supports_binding(self, binding: &str) -> bool {
+        match self {
+            Self::A2aV1 => binding.eq_ignore_ascii_case("JSONRPC"),
         }
     }
 }
@@ -443,9 +449,19 @@ pub struct AgentDeploymentEndpoint {
     pub interaction_protocol: AgentInteractionProtocol,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentConnectionMode {
+    #[default]
+    ServicenetRelay,
+    WattetheriaDirect,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentDeployment {
     pub runtime: String,
+    #[serde(default)]
+    pub connection_mode: AgentConnectionMode,
     pub endpoint: AgentDeploymentEndpoint,
 }
 
@@ -826,7 +842,7 @@ mod tests {
                     "url": "https://example.com/a2a",
                     "protocol_binding": "JSONRPC",
                     "protocol_version": "1.0",
-                    "interaction_protocol": "google_a2a"
+                    "interaction_protocol": "a2a_v1"
                 }
             },
             "review": {
@@ -854,7 +870,7 @@ mod tests {
         assert_eq!(request.review.cost_per_call_units, Some(10));
         assert_eq!(
             request.deployment.endpoint.interaction_protocol,
-            AgentInteractionProtocol::GoogleA2a
+            AgentInteractionProtocol::A2aV1
         );
     }
 
@@ -869,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_endpoint_defaults_interaction_protocol_to_google_a2a() {
+    fn deployment_endpoint_defaults_interaction_protocol_to_a2a_v1() {
         let endpoint: AgentDeploymentEndpoint = serde_json::from_value(serde_json::json!({
             "url": "https://example.com/a2a",
             "protocol_binding": "JSONRPC",
@@ -878,7 +894,33 @@ mod tests {
         .expect("deployment endpoint should parse");
         assert_eq!(
             endpoint.interaction_protocol,
-            AgentInteractionProtocol::GoogleA2a
+            AgentInteractionProtocol::A2aV1
+        );
+    }
+
+    #[test]
+    fn a2a_v1_declares_its_supported_transport_binding() {
+        assert!(AgentInteractionProtocol::A2aV1.supports_binding("JSONRPC"));
+        assert!(AgentInteractionProtocol::A2aV1.supports_binding("jsonrpc"));
+        assert!(!AgentInteractionProtocol::A2aV1.supports_binding("HTTP+JSON"));
+        assert!(serde_json::from_value::<AgentInteractionProtocol>(json!("google_a2a")).is_err());
+    }
+
+    #[test]
+    fn deployment_defaults_connection_mode_to_servicenet_relay() {
+        let deployment: AgentDeployment = serde_json::from_value(serde_json::json!({
+            "runtime": "wattetheria_adapter",
+            "endpoint": {
+                "url": "https://agent.example.com",
+                "protocol_binding": "JSONRPC",
+                "protocol_version": "1.0"
+            }
+        }))
+        .expect("deployment should parse");
+
+        assert_eq!(
+            deployment.connection_mode,
+            AgentConnectionMode::ServicenetRelay
         );
     }
 

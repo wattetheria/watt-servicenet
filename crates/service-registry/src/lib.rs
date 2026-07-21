@@ -21,20 +21,19 @@ use watt_did::{
     ProofEnvelope, UcanCapability,
 };
 use watt_servicenet_protocol::{
-    AgentDeployment, AgentHealthRecord, AgentInteractionProtocol, AgentReviewProfile,
-    AgentSubmissionQuery, AgentSubmissionRecord, AgentSubmissionStatus, AgentTrustRecord,
-    ApproveAgentSubmissionRequest, AuthContextQuery, AuthContextRecord, BlockEntityRequest,
-    CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest, ExecutionReceipt,
-    HealthStatus, InvocationMode, ModerationAction, ModerationCase, ModerationCaseQuery,
-    ModerationStatus, ModerationTargetKind, ProviderAuditEvent, ProviderAuditKind,
-    ProviderHealthRecord, ProviderOwnershipChallenge, ProviderOwnershipOperation, ProviderRecord,
-    ProviderStatus, ProviderTrustRecord, PublishedAgentRecord, PublishedAgentStatus, ReceiptQuery,
-    ReceiptStatus, RegisterAuthContextRequest, RegisterProviderRequest,
-    RejectAgentSubmissionRequest, ResolveModerationCaseRequest, RevokeProviderRequest, RiskLevel,
-    RotateProviderKeyRequest, RunVerifierSweepRequest, SERVICE_PROTOCOL_SCHEMA_VERSION,
-    StoredReceipt, SubmitAgentRequest, UnpublishAgentRequest, VerificationRecord,
-    VerificationVerdict, VerifyReceiptRequest, WATTETHERIA_ADAPTER_RUNTIME,
-    build_agent_attestation_payload, build_agent_unpublish_payload,
+    AgentDeployment, AgentHealthRecord, AgentReviewProfile, AgentSubmissionQuery,
+    AgentSubmissionRecord, AgentSubmissionStatus, AgentTrustRecord, ApproveAgentSubmissionRequest,
+    AuthContextQuery, AuthContextRecord, BlockEntityRequest, CreateModerationCaseRequest,
+    CreateProviderOwnershipChallengeRequest, ExecutionReceipt, HealthStatus, InvocationMode,
+    ModerationAction, ModerationCase, ModerationCaseQuery, ModerationStatus, ModerationTargetKind,
+    ProviderAuditEvent, ProviderAuditKind, ProviderHealthRecord, ProviderOwnershipChallenge,
+    ProviderOwnershipOperation, ProviderRecord, ProviderStatus, ProviderTrustRecord,
+    PublishedAgentRecord, PublishedAgentStatus, ReceiptQuery, ReceiptStatus,
+    RegisterAuthContextRequest, RegisterProviderRequest, RejectAgentSubmissionRequest,
+    ResolveModerationCaseRequest, RevokeProviderRequest, RiskLevel, RotateProviderKeyRequest,
+    RunVerifierSweepRequest, SERVICE_PROTOCOL_SCHEMA_VERSION, StoredReceipt, SubmitAgentRequest,
+    UnpublishAgentRequest, VerificationRecord, VerificationVerdict, VerifyReceiptRequest,
+    WATTETHERIA_ADAPTER_RUNTIME, build_agent_attestation_payload, build_agent_unpublish_payload,
 };
 
 mod service_identity;
@@ -3738,24 +3737,21 @@ fn validate_agent_deployment(deployment: &AgentDeployment) -> Result<(), Registr
             "deployment.endpoint.protocol_binding must not be empty".to_owned(),
         ));
     }
-    if !deployment
-        .endpoint
-        .protocol_binding
-        .eq_ignore_ascii_case("JSONRPC")
-    {
-        return Err(RegistryError::InvalidAgent(
-            "only JSONRPC protocol_binding is supported".to_owned(),
-        ));
-    }
     if deployment.endpoint.protocol_version.trim().is_empty() {
         return Err(RegistryError::InvalidAgent(
             "deployment.endpoint.protocol_version must not be empty".to_owned(),
         ));
     }
-    if deployment.endpoint.interaction_protocol != AgentInteractionProtocol::GoogleA2a {
-        return Err(RegistryError::InvalidAgent(
-            "only google_a2a interaction_protocol is supported".to_owned(),
-        ));
+    if !deployment
+        .endpoint
+        .interaction_protocol
+        .supports_binding(&deployment.endpoint.protocol_binding)
+    {
+        return Err(RegistryError::InvalidAgent(format!(
+            "unsupported ServiceNet interaction protocol and binding: {} / {}",
+            deployment.endpoint.interaction_protocol.as_str(),
+            deployment.endpoint.protocol_binding
+        )));
     }
     if !is_secure_or_loopback_url(&deployment.endpoint.url) {
         return Err(RegistryError::InvalidAgent(
@@ -4123,8 +4119,8 @@ mod tests {
     use tempfile::tempdir;
     use watt_did::PaymentAccountCustody;
     use watt_servicenet_protocol::{
-        AgentArtifacts, AgentAttestations, ApproveAgentSubmissionRequest, AuthModel,
-        CreateProviderOwnershipChallengeRequest, ProviderOwnershipOperation,
+        AgentArtifacts, AgentAttestations, AgentInteractionProtocol, ApproveAgentSubmissionRequest,
+        AuthModel, CreateProviderOwnershipChallengeRequest, ProviderOwnershipOperation,
         RegisterAuthContextRequest, RiskLevel, RunVerifierSweepRequest,
     };
     use watt_wallet::{
@@ -4236,11 +4232,12 @@ mod tests {
             }),
             deployment: AgentDeployment {
                 runtime: "wattetheria_adapter".to_owned(),
+                connection_mode: Default::default(),
                 endpoint: watt_servicenet_protocol::AgentDeploymentEndpoint {
                     url: "https://stripe-agent.example.com/a2a".to_owned(),
                     protocol_binding: "JSONRPC".to_owned(),
                     protocol_version: "1.0".to_owned(),
-                    interaction_protocol: AgentInteractionProtocol::GoogleA2a,
+                    interaction_protocol: AgentInteractionProtocol::A2aV1,
                 },
             },
             review: AgentReviewProfile {
@@ -4773,6 +4770,28 @@ mod tests {
             .await
             .expect_err("submission should fail");
         assert!(matches!(err, RegistryError::InvalidAgent(_)));
+    }
+
+    #[tokio::test]
+    async fn unsupported_protocol_binding_is_rejected_by_capability() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        let mut request = demo_agent_submission("unsupported-binding-agent");
+        request.deployment.endpoint.protocol_binding = "HTTP+JSON".to_owned();
+        sign_submission_attestation(&mut request, &provider_signing_key(), None, None);
+
+        let err = registry
+            .submit_agent(request)
+            .await
+            .expect_err("unsupported protocol binding should fail");
+        assert!(matches!(
+            err,
+            RegistryError::InvalidAgent(message)
+                if message.contains("a2a_v1 / HTTP+JSON")
+        ));
     }
 
     #[tokio::test]

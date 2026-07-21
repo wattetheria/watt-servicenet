@@ -32,11 +32,12 @@ fn demo_published_agent() -> PublishedAgentRecord {
         }),
         deployment: watt_servicenet_protocol::AgentDeployment {
             runtime: "wattetheria_adapter".to_owned(),
+            connection_mode: Default::default(),
             endpoint: watt_servicenet_protocol::AgentDeploymentEndpoint {
                 url: "https://stripe-agent.example.com/a2a".to_owned(),
                 protocol_binding: "JSONRPC".to_owned(),
                 protocol_version: "1.0".to_owned(),
-                interaction_protocol: AgentInteractionProtocol::GoogleA2a,
+                interaction_protocol: AgentInteractionProtocol::A2aV1,
             },
         },
         review: watt_servicenet_protocol::AgentReviewProfile {

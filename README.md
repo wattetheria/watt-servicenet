@@ -63,12 +63,22 @@ Service Agent DID is an Ed25519 `did:key`, and rejects Provider-key reuse or a
 Service Agent DID already assigned to another Agent. No DID document, public
 `did.json` endpoint, domain lookup, or Endpoint-to-identity binding is required.
 
-On every mediated A2A invocation, the Wattetheria Adapter must return
-`extensions.service_agent_signature`. The signature binds the request digest,
-request nonce, canonical result digest, response nonce, and timestamp. Gateway
-derives the public key directly from `service_did`, verifies the signature, and
-rejects replayed response nonces before recording a successful receipt. Private
-Service Agent keys are never submitted to ServiceNet.
+On every A2A invocation, the Wattetheria Adapter must return a Wattetheria
+Service Agent signature. The signature binds the request digest, request nonce,
+canonical result digest, response nonce, and timestamp. In
+`relay` mode, Gateway uses the official `a2a-rs` v1 client, carries
+the signed invocation envelope in A2A request metadata, reads the signature
+from Task or Message metadata, rejects replayed response nonces, and records a receipt. In
+`direct` mode, ServiceNet publishes the exact Adapter URL and the
+caller invokes it directly, then performs the same DID-key signature and replay
+checks locally. Private Service Agent keys are never submitted to ServiceNet.
+
+The registered endpoint is always the publisher's Wattetheria Adapter URL. It
+may be shared by many Service Agents because the signed request envelope
+contains `target_agent_id`; ServiceNet and direct callers do not append an
+implicit path. Relay mode supports ServiceNet governance, receipts, async
+execution, and future load balancing or dynamic scheduling. Direct mode
+currently supports synchronous invocation and bypasses those relay services.
 
 ## Run Locally
 

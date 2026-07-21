@@ -41,17 +41,19 @@ impl ServiceAgentVerifier {
         expected_request_nonce: Option<&str>,
         response: &Value,
     ) -> Result<ServiceAgentSignature, GatewayError> {
-        let signature_value = response
-            .pointer("/extensions/service_agent_signature")
-            .ok_or_else(|| {
-                GatewayError::Rejected(
-                    "callee response is missing extensions.service_agent_signature".to_owned(),
-                )
-            })?;
-        let signature: ServiceAgentSignature = serde_json::from_value(signature_value.clone())
-            .map_err(|error| {
-                GatewayError::Rejected(format!("callee service signature is invalid: {error}"))
-            })?;
+        let signature_value = service_agent_signature_value(response).ok_or_else(|| {
+            GatewayError::Rejected(
+                "callee response is missing Wattetheria Service Agent signature metadata"
+                    .to_owned(),
+            )
+        })?;
+        let signature: ServiceAgentSignature = match signature_value {
+            Value::String(signature) => serde_json::from_str(signature),
+            value => serde_json::from_value(value.clone()),
+        }
+        .map_err(|error| {
+            GatewayError::Rejected(format!("callee service signature is invalid: {error}"))
+        })?;
         if signature.protocol != SERVICE_AGENT_SIGNATURE_PROTOCOL {
             return Err(GatewayError::Rejected(
                 "callee service signature protocol is unsupported".to_owned(),
@@ -94,7 +96,7 @@ impl ServiceAgentVerifier {
                 "callee service signature timestamp is outside the accepted window".to_owned(),
             ));
         }
-        let result = response.get("result").cloned().unwrap_or(Value::Null);
+        let result = unsigned_a2a_result(response);
         if signature.result_digest != jcs_sha256_digest(&result)? {
             return Err(GatewayError::Rejected(
                 "callee service signature result digest does not match the response".to_owned(),
@@ -193,6 +195,30 @@ impl ServiceAgentVerifier {
     }
 }
 
+fn service_agent_signature_value(response: &Value) -> Option<&Value> {
+    response
+        .pointer("/result/task/metadata/wattetheriaServiceAgentSignature")
+        .or_else(|| response.pointer("/result/message/metadata/wattetheriaServiceAgentSignature"))
+        .or_else(|| response.pointer("/extensions/service_agent_signature"))
+}
+
+fn unsigned_a2a_result(response: &Value) -> Value {
+    let mut result = response.get("result").cloned().unwrap_or(Value::Null);
+    for payload_name in ["task", "message"] {
+        let Some(payload) = result.get_mut(payload_name).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let Some(metadata) = payload.get_mut("metadata").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        metadata.remove("wattetheriaServiceAgentSignature");
+        if metadata.is_empty() {
+            payload.remove("metadata");
+        }
+    }
+    result
+}
+
 fn parse_public_key(
     record: &PublishedAgentRecord,
     verification_method: &str,
@@ -265,7 +291,7 @@ mod tests {
                     "url": "https://agent.example.com/a2a",
                     "protocol_binding": "JSONRPC",
                     "protocol_version": "1.0",
-                    "interaction_protocol": "google_a2a"
+                    "interaction_protocol": "a2a_v1"
                 }
             },
             "review": {"risk_level": "low"},

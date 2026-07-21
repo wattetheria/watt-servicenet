@@ -13,16 +13,17 @@ use thiserror::Error;
 use uuid::Uuid;
 use watt_did::{Did, DidKey, DidKeyPublicKey};
 use watt_servicenet_protocol::{
-    AgentInteractionProtocol, AuthContextRecord, ExecutionReceipt, GetAgentTaskRequest,
-    InvocationMode, InvokeAgentRequest, InvokeAgentResponse, NormalizedSettlementRequest,
-    PublishedAgentRecord, ReceiptStatus, RiskLevel, ServiceAgentSignature, SettlementLayer,
-    SettlementRequest, StoredReceipt, VerificationVerdict,
-    build_service_agent_get_task_signature_params,
+    AgentConnectionMode, AuthContextRecord, ExecutionReceipt, GetAgentTaskRequest, InvocationMode,
+    InvokeAgentRequest, InvokeAgentResponse, NormalizedSettlementRequest, PublishedAgentRecord,
+    ReceiptStatus, RiskLevel, ServiceAgentSignature, SettlementLayer, SettlementRequest,
+    StoredReceipt, VerificationVerdict, build_service_agent_get_task_signature_params,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry};
 
+mod protocol_client;
 mod service_identity;
 
+use protocol_client::{AgentProtocolClient, protocol_client};
 use service_identity::ServiceAgentVerifier;
 
 const DEFAULT_SERVICENET_CONTEXT_NETWORK_ID: &str = "mainnet:watt-etheria";
@@ -48,7 +49,6 @@ pub struct GatewayPolicyConfig {
 #[derive(Clone)]
 pub struct GatewayService {
     registry: Arc<ServiceRegistry>,
-    http_client: reqwest::Client,
     policy: GatewayPolicyConfig,
     replay_cache: Arc<Mutex<HashMap<String, u64>>>,
     service_agent_verifier: ServiceAgentVerifier,
@@ -58,7 +58,7 @@ pub struct GatewayService {
 struct PreparedInvocation {
     record: PublishedAgentRecord,
     auth_token: Option<String>,
-    adapter: Box<dyn A2aAdapter + Send + Sync>,
+    protocol_client: Box<dyn AgentProtocolClient + Send + Sync>,
     normalized_settlement: Option<NormalizedSettlementRequest>,
     cost_units: Option<u32>,
     request_digest: String,
@@ -162,104 +162,12 @@ impl ReceiptSigner {
     }
 }
 
-trait A2aAdapter: Send + Sync {
-    fn send_message_method(&self) -> &'static str;
-
-    fn get_task_method(&self) -> &'static str;
-
-    fn version_header_name(&self) -> &'static str;
-
-    fn build_send_message_payload(
-        &self,
-        request: &InvokeAgentRequest,
-        settlement: Option<&NormalizedSettlementRequest>,
-    ) -> Value;
-
-    fn build_get_task_payload(&self, task_id: &str, request: &GetAgentTaskRequest) -> Value;
-}
-
 trait SettlementRailAdapter: Send + Sync {
     fn rail_id(&self) -> &'static str;
 
     fn layer(&self) -> SettlementLayer;
 
     fn normalize_request(&self, request: &Value) -> Result<Value, GatewayError>;
-}
-
-#[derive(Debug, Default)]
-struct GoogleA2aAdapter;
-
-impl A2aAdapter for GoogleA2aAdapter {
-    fn send_message_method(&self) -> &'static str {
-        "SendMessage"
-    }
-
-    fn get_task_method(&self) -> &'static str {
-        "GetTask"
-    }
-
-    fn version_header_name(&self) -> &'static str {
-        "A2A-Version"
-    }
-
-    fn build_send_message_payload(
-        &self,
-        request: &InvokeAgentRequest,
-        settlement: Option<&NormalizedSettlementRequest>,
-    ) -> Value {
-        let mut parts = Vec::new();
-        if let Some(message_text) = invoke_request_message_text(request) {
-            parts.push(serde_json::json!({
-                "kind": "text",
-                "text": message_text,
-            }));
-        }
-        if !request.input.is_null() {
-            parts.push(serde_json::json!({
-                "kind": "data",
-                "data": request.input.clone(),
-            }));
-        }
-        if parts.is_empty() {
-            parts.push(serde_json::json!({
-                "kind": "data",
-                "data": Value::Null,
-            }));
-        }
-
-        let mut map = serde_json::Map::new();
-        if let Some(task_id) = &request.task_id {
-            map.insert("taskId".to_owned(), Value::String(task_id.clone()));
-        }
-        if let Some(context_id) = &request.context_id {
-            map.insert("contextId".to_owned(), Value::String(context_id.clone()));
-        }
-        if let Some(skill_id) = &request.skill_id {
-            map.insert("skillId".to_owned(), Value::String(skill_id.clone()));
-        }
-        map.insert(
-            "message".to_owned(),
-            serde_json::json!({
-                "role": "user",
-                "parts": parts,
-            }),
-        );
-        let mut extensions = serde_json::Map::new();
-        if let Some(settlement) = settlement {
-            extensions.insert("settlement".to_owned(), serde_json::json!(settlement));
-        }
-        if let Some(agent_envelope) = &request.agent_envelope {
-            extensions.insert("agent_envelope".to_owned(), agent_envelope.clone());
-        }
-        if !extensions.is_empty() {
-            map.insert("extensions".to_owned(), Value::Object(extensions));
-        }
-        Value::Object(map)
-    }
-
-    fn build_get_task_payload(&self, task_id: &str, request: &GetAgentTaskRequest) -> Value {
-        build_service_agent_get_task_signature_params(task_id, request.history_length)
-    }
 }
 
 #[derive(Debug, Default)]
@@ -291,12 +199,6 @@ impl SettlementRailAdapter for X402SettlementRailAdapter {
     }
 }
 
-fn a2a_adapter(protocol: AgentInteractionProtocol) -> Box<dyn A2aAdapter + Send + Sync> {
-    match protocol {
-        AgentInteractionProtocol::GoogleA2a => Box::<GoogleA2aAdapter>::default(),
-    }
-}
-
 fn settlement_rail_adapter(
     settlement: &SettlementRequest,
 ) -> Result<Box<dyn SettlementRailAdapter + Send + Sync>, GatewayError> {
@@ -322,7 +224,6 @@ impl GatewayService {
     pub fn with_policy(registry: Arc<ServiceRegistry>, policy: GatewayPolicyConfig) -> Self {
         Self {
             registry,
-            http_client: reqwest::Client::new(),
             policy,
             replay_cache: Arc::new(Mutex::new(HashMap::new())),
             service_agent_verifier: ServiceAgentVerifier::default(),
@@ -435,6 +336,12 @@ impl GatewayService {
             .get_published_agent(agent_id)
             .await
             .map_err(map_registry_error)?;
+        if record.deployment.connection_mode != AgentConnectionMode::ServicenetRelay {
+            return Err(GatewayError::Rejected(
+                "agent uses wattetheria_direct connection mode; invoke its published Adapter URL directly"
+                    .to_owned(),
+            ));
+        }
         let normalized_settlement = normalize_settlement_request(request.settlement.as_ref())?;
         let request_digest = invocation_request_digest(request, normalized_settlement.as_ref())?;
         let envelope_security = verify_agent_envelope_signature(request)?;
@@ -445,7 +352,7 @@ impl GatewayService {
             .or(request.auth_token.clone());
         self.enforce_agent_preflight(&record, request, auth_token.as_deref())
             .await?;
-        let adapter = a2a_adapter(record.deployment.endpoint.interaction_protocol);
+        let protocol_client = protocol_client(&record.deployment.endpoint)?;
         let agent_cost_units = agent_cost_units(&record.agent_card);
         let cost_units = request
             .max_cost_units
@@ -454,7 +361,7 @@ impl GatewayService {
         Ok(PreparedInvocation {
             record,
             auth_token,
-            adapter,
+            protocol_client,
             normalized_settlement,
             cost_units,
             request_digest,
@@ -480,14 +387,12 @@ impl GatewayService {
         {
             request.context_id = Some(context_id);
         }
-        let response = self
-            .a2a_jsonrpc_call(
-                &prepared.record,
-                prepared.adapter.as_ref(),
-                prepared.adapter.send_message_method(),
-                prepared
-                    .adapter
-                    .build_send_message_payload(&request, prepared.normalized_settlement.as_ref()),
+        let response = prepared
+            .protocol_client
+            .send_message(
+                &prepared.record.deployment.endpoint.url,
+                &request,
+                prepared.normalized_settlement.as_ref(),
                 prepared.auth_token.as_deref(),
             )
             .await?;
@@ -687,22 +592,27 @@ impl GatewayService {
             .get_published_agent(agent_id)
             .await
             .map_err(map_registry_error)?;
+        if record.deployment.connection_mode != AgentConnectionMode::ServicenetRelay {
+            return Err(GatewayError::Rejected(
+                "agent uses wattetheria_direct connection mode; ServiceNet task polling is unavailable"
+                    .to_owned(),
+            ));
+        }
         let auth_token = self
             .resolve_agent_auth_context(&record, request.auth_context_id)
             .await?
             .or(request.auth_token.clone());
         self.enforce_agent_task_access(&record, auth_token.as_deref())
             .await?;
-        let adapter = a2a_adapter(record.deployment.endpoint.interaction_protocol);
-        let params = adapter.build_get_task_payload(task_id, &request);
+        let protocol_client = protocol_client(&record.deployment.endpoint)?;
+        let params = build_service_agent_get_task_signature_params(task_id, request.history_length);
         let expected_request_digest = jcs_sha256_digest_value(&params)
             .map_err(|error| GatewayError::Execution(error.to_string()))?;
-        let response = self
-            .a2a_jsonrpc_call(
-                &record,
-                adapter.as_ref(),
-                adapter.get_task_method(),
-                params,
+        let response = protocol_client
+            .get_task(
+                &record.deployment.endpoint.url,
+                task_id,
+                &request,
                 auth_token.as_deref(),
             )
             .await?;
@@ -840,77 +750,6 @@ impl GatewayService {
             ));
         }
         Ok(())
-    }
-
-    async fn a2a_jsonrpc_call(
-        &self,
-        record: &PublishedAgentRecord,
-        adapter: &(dyn A2aAdapter + Send + Sync),
-        method: &str,
-        params: Value,
-        auth_token: Option<&str>,
-    ) -> Result<Value, GatewayError> {
-        let mut builder = self
-            .http_client
-            .post(&record.deployment.endpoint.url)
-            .header(
-                adapter.version_header_name(),
-                &record.deployment.endpoint.protocol_version,
-            );
-        if let Some(token) = auth_token {
-            builder = builder.bearer_auth(token);
-        }
-        let response = builder
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": Uuid::new_v4().to_string(),
-                "method": method,
-                "params": params,
-            }))
-            .send()
-            .await
-            .map_err(|err| {
-                GatewayError::Execution(classify_a2a_send_error(record, method, &err))
-            })?;
-        let status = response.status();
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(ToOwned::to_owned);
-        let text = response.text().await.map_err(|err| {
-            GatewayError::Execution(format!(
-                "callee agent response body could not be read after ServiceNet sent `{method}` to agent `{}`: {}. The target may have closed the connection while responding; the caller may retry.",
-                record.agent_id, err
-            ))
-        })?;
-        if !status.is_success() {
-            return Err(GatewayError::Execution(format!(
-                "callee agent returned HTTP {status} after ServiceNet sent `{method}` to agent `{}`. content_type={}; body_preview={}. This is a target agent or upstream proxy response; the caller may retry later.",
-                record.agent_id,
-                content_type.as_deref().unwrap_or("unknown"),
-                body_preview(&text)
-            )));
-        }
-        let body = serde_json::from_str::<Value>(&text).map_err(|err| {
-            GatewayError::Execution(format!(
-                "callee agent returned a non-JSON or invalid A2A response after ServiceNet sent `{method}` to agent `{}`: {err}. content_type={}; body_preview={}. This means the target agent or its upstream proxy responded, but not with valid A2A JSON; the caller may retry later.",
-                record.agent_id,
-                content_type.as_deref().unwrap_or("unknown"),
-                body_preview(&text)
-            ))
-        })?;
-        if let Some(error) = body.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("a2a request failed");
-            return Err(GatewayError::Execution(format!(
-                "callee agent returned an A2A error after ServiceNet sent `{method}` to agent `{}`: {message}. The caller may retry later if this was transient.",
-                record.agent_id
-            )));
-        }
-        Ok(body)
     }
 }
 
@@ -1425,50 +1264,6 @@ fn request_digest_matches_signed_message(
         || request_digest == jcs_sha256_digest_value(signed_message)?)
 }
 
-fn classify_a2a_send_error(
-    record: &PublishedAgentRecord,
-    method: &str,
-    error: &reqwest::Error,
-) -> String {
-    if error.is_timeout() {
-        return format!(
-            "ServiceNet sent `{method}` to agent `{}` but did not receive a response before timeout: {error}. The target agent or network path may be unavailable; the caller may retry later.",
-            record.agent_id
-        );
-    }
-    if error.is_connect() {
-        return format!(
-            "ServiceNet could not connect to the target endpoint for agent `{}` while sending `{method}`: {error}. The request was not delivered to the callee agent; the caller may retry later.",
-            record.agent_id
-        );
-    }
-    if error.is_request() {
-        return format!(
-            "ServiceNet could not send `{method}` to agent `{}` because the outgoing request failed before delivery: {error}. The caller may retry later.",
-            record.agent_id
-        );
-    }
-    if error.is_body() {
-        return format!(
-            "ServiceNet started sending `{method}` to agent `{}` but the request body failed before delivery completed: {error}. The caller may retry later.",
-            record.agent_id
-        );
-    }
-    format!(
-        "ServiceNet failed while sending `{method}` to agent `{}` before a valid callee response was received: {error}. The caller may retry later.",
-        record.agent_id
-    )
-}
-
-fn body_preview(text: &str) -> String {
-    let preview: String = text.chars().take(500).collect();
-    if text.chars().count() > 500 {
-        format!("{preview}...")
-    } else {
-        preview
-    }
-}
-
 fn map_registry_error(error: RegistryError) -> GatewayError {
     match error {
         RegistryError::ProviderNotFound(_) | RegistryError::PublishedAgentNotFound(_) => {
@@ -1592,7 +1387,7 @@ mod tests {
         let extensions_json =
             Some(serde_json::to_string(&extensions).expect("extensions should serialize"));
         let payload = SignedAgentEnvelopePayload {
-            protocol: "google_a2a",
+            protocol: "a2a_v1",
             transport_profile: transport_profile.as_ref(),
             source_agent_id: Some(&source_agent_id),
             target_agent_id: target_agent_id.as_ref(),
@@ -1604,7 +1399,7 @@ mod tests {
             extensions_json: extensions_json.as_ref(),
         };
         serde_json::json!({
-            "protocol": "google_a2a",
+            "protocol": "a2a_v1",
             "transport_profile": transport_profile,
             "source_agent_id": source_agent_id,
             "target_agent_id": target_agent_id,
@@ -1639,7 +1434,7 @@ mod tests {
         let extensions_json =
             Some(serde_json::to_string(&extensions).expect("extensions should serialize"));
         let payload = SignedAgentEnvelopePayload {
-            protocol: "google_a2a",
+            protocol: "a2a_v1",
             transport_profile: transport_profile.as_ref(),
             source_agent_id: Some(&source_agent_id),
             target_agent_id: target_agent_id.as_ref(),
@@ -1651,7 +1446,7 @@ mod tests {
             extensions_json: extensions_json.as_ref(),
         };
         serde_json::json!({
-            "protocol": "google_a2a",
+            "protocol": "a2a_v1",
             "transport_profile": transport_profile,
             "source_agent_id": source_agent_id,
             "target_agent_id": target_agent_id,
@@ -1685,7 +1480,7 @@ mod tests {
         let extensions_json =
             Some(serde_json::to_string(&extensions).expect("extensions should serialize"));
         let payload = SignedAgentEnvelopePayload {
-            protocol: "google_a2a",
+            protocol: "a2a_v1",
             transport_profile: transport_profile.as_ref(),
             source_agent_id: Some(&source_agent_id),
             target_agent_id: target_agent_id.as_ref(),
@@ -1697,7 +1492,7 @@ mod tests {
             extensions_json: extensions_json.as_ref(),
         };
         serde_json::json!({
-            "protocol": "google_a2a",
+            "protocol": "a2a_v1",
             "transport_profile": transport_profile,
             "source_agent_id": source_agent_id,
             "target_agent_id": target_agent_id,
@@ -1742,11 +1537,12 @@ mod tests {
             }),
             deployment: AgentDeployment {
                 runtime: "wattetheria_adapter".to_owned(),
+                connection_mode: AgentConnectionMode::ServicenetRelay,
                 endpoint: AgentDeploymentEndpoint {
                     url: endpoint_url.to_owned(),
                     protocol_binding: "JSONRPC".to_owned(),
                     protocol_version: "1.0".to_owned(),
-                    interaction_protocol: AgentInteractionProtocol::GoogleA2a,
+                    interaction_protocol: AgentInteractionProtocol::A2aV1,
                 },
             },
             review: AgentReviewProfile {
@@ -1774,17 +1570,17 @@ mod tests {
         request
     }
 
-    fn signed_a2a_response(request: &Value, result: Value) -> Value {
+    fn signed_a2a_response(request: &Value, mut result: Value) -> Value {
         let service_did = service_did();
         let request_digest = request
-            .pointer("/params/extensions/agent_envelope/extensions/request_digest")
+            .pointer("/params/metadata/agent_envelope/extensions/request_digest")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| {
                 jcs_sha256_digest_value(&request["params"]).expect("request params should hash")
             });
         let request_nonce = request
-            .pointer("/params/extensions/agent_envelope/extensions/nonce")
+            .pointer("/params/metadata/agent_envelope/extensions/nonce")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let mut service_signature = ServiceAgentSignature {
@@ -1803,13 +1599,26 @@ mod tests {
             &build_service_agent_signature_payload(&service_signature),
             &service_signing_key(),
         );
+        let signature = Value::String(
+            serde_json::to_string(&service_signature).expect("signature should serialize"),
+        );
+        let wire_result = if request["method"] == "GetTask" {
+            let mut task = result["task"].take();
+            task["metadata"]["wattetheriaServiceAgentSignature"] = signature;
+            task
+        } else {
+            let payload_name = if result.get("task").is_some() {
+                "task"
+            } else {
+                "message"
+            };
+            result[payload_name]["metadata"]["wattetheriaServiceAgentSignature"] = signature;
+            result
+        };
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": request["id"].clone(),
-            "result": result,
-            "extensions": {
-                "service_agent_signature": service_signature
-            }
+            "result": wire_result,
         })
     }
 
@@ -1965,14 +1774,24 @@ mod tests {
     async fn approved_gateway_with_a2a_url(
         a2a_url: String,
     ) -> (Arc<ServiceRegistry>, GatewayService) {
+        approved_gateway_with_connection_mode(a2a_url, AgentConnectionMode::ServicenetRelay).await
+    }
+
+    async fn approved_gateway_with_connection_mode(
+        a2a_url: String,
+        connection_mode: AgentConnectionMode,
+    ) -> (Arc<ServiceRegistry>, GatewayService) {
         let registry = Arc::new(ServiceRegistry::in_memory());
         registry
             .register_provider(provider_request())
             .await
             .expect("provider should register");
         let card_url = a2a_url.trim_end_matches("/a2a").to_owned();
+        let mut request = agent_submission(&card_url, &a2a_url);
+        request.deployment.connection_mode = connection_mode;
+        sign_submission_attestation(&mut request, &provider_signing_key());
         let submission = registry
-            .submit_agent(agent_submission(&card_url, &a2a_url))
+            .submit_agent(request)
             .await
             .expect("agent should submit");
         registry
@@ -2051,6 +1870,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_rejects_direct_agent_instead_of_relaying_it() {
+        let (_, gateway) = approved_gateway_with_connection_mode(
+            start_mock_a2a_server().await,
+            AgentConnectionMode::WattetheriaDirect,
+        )
+        .await;
+
+        let error = gateway
+            .invoke_agent(
+                "stripe-agent",
+                InvokeAgentRequest {
+                    task_id: None,
+                    context_id: None,
+                    message: None,
+                    input: Value::Null,
+                    skill_id: None,
+                    settlement: None,
+                    auth_token: Some("secret-token".to_owned()),
+                    auth_context_id: None,
+                    region: None,
+                    confirm_risky: false,
+                    max_cost_units: None,
+                    agent_envelope: Some(signed_agent_envelope()),
+                },
+            )
+            .await
+            .expect_err("direct agents must not be invoked through the relay gateway");
+
+        assert!(
+            matches!(
+                error,
+                GatewayError::Rejected(ref message)
+                    if message.contains("wattetheria_direct")
+                        && message.contains("Adapter URL")
+            ),
+            "unexpected gateway error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn invoke_agent_rejects_unsigned_service_agent_response() {
         let (_registry, gateway) =
             approved_gateway_with_a2a_url(start_unsigned_a2a_server().await).await;
@@ -2083,7 +1942,11 @@ mod tests {
             .await
             .expect_err("unsigned Service Agent response should be rejected");
 
-        assert!(error.to_string().contains("service_agent_signature"));
+        assert!(
+            error
+                .to_string()
+                .contains("Service Agent signature metadata")
+        );
     }
 
     #[tokio::test]
@@ -2185,7 +2048,7 @@ mod tests {
             did_from_signing_key(&caller_signing_key())
         );
         assert_eq!(
-            request["params"]["contextId"].as_str(),
+            request["params"]["message"]["contextId"].as_str(),
             Some(expected_context_id.as_str())
         );
     }
@@ -2250,9 +2113,8 @@ mod tests {
             .expect_err("invalid callee response should fail");
 
         let message = err.to_string();
-        assert!(message.contains("callee agent returned a non-JSON or invalid A2A response"));
-        assert!(message.contains("body_preview=callee returned a non-json response"));
-        assert!(message.contains("caller may retry later"));
+        assert!(message.contains("A2A SendMessage"));
+        assert!(message.contains("failed to parse JSON-RPC response"));
     }
 
     #[tokio::test]
@@ -2508,11 +2370,11 @@ mod tests {
         let request = captured.last().expect("captured request");
         assert_eq!(request["method"].as_str(), Some("SendMessage"));
         assert_eq!(
-            request["params"]["extensions"]["settlement"]["rail"].as_str(),
+            request["params"]["metadata"]["settlement"]["rail"].as_str(),
             Some("x402")
         );
         assert_eq!(
-            request["params"]["extensions"]["settlement"]["request"]["protocol"].as_str(),
+            request["params"]["metadata"]["settlement"]["request"]["protocol"].as_str(),
             Some("x402")
         );
     }
@@ -2530,129 +2392,5 @@ mod tests {
         assert!(agent_requires_auth(&serde_json::json!({
             "securitySchemes": {"oauth2": {"type": "oauth2"}}
         })));
-    }
-
-    #[test]
-    fn google_a2a_adapter_builds_existing_send_message_shape() {
-        let adapter = GoogleA2aAdapter;
-        let payload = adapter.build_send_message_payload(
-            &InvokeAgentRequest {
-                task_id: Some("task-1".to_owned()),
-                context_id: Some("ctx-1".to_owned()),
-                message: Some("Create payment link".to_owned()),
-                input: serde_json::json!({"amount": 42}),
-                skill_id: Some("payments.create_link".to_owned()),
-                settlement: None,
-                auth_token: None,
-                auth_context_id: None,
-                region: None,
-                confirm_risky: false,
-                max_cost_units: None,
-                agent_envelope: Some(serde_json::json!({
-                    "source_agent_id": "did:key:zCaller",
-                    "source_agent_card": {
-                        "agent_id": "did:key:zCaller"
-                    }
-                })),
-            },
-            None,
-        );
-        assert_eq!(adapter.send_message_method(), "SendMessage");
-        assert_eq!(adapter.get_task_method(), "GetTask");
-        assert_eq!(adapter.version_header_name(), "A2A-Version");
-        assert_eq!(payload["taskId"].as_str(), Some("task-1"));
-        assert_eq!(payload["contextId"].as_str(), Some("ctx-1"));
-        assert_eq!(payload["skillId"].as_str(), Some("payments.create_link"));
-        assert_eq!(
-            payload["message"]["parts"][0]["text"].as_str(),
-            Some("Create payment link")
-        );
-        assert_eq!(
-            payload["message"]["parts"][1]["data"]["amount"].as_i64(),
-            Some(42)
-        );
-        assert_eq!(
-            payload["extensions"]["agent_envelope"]["source_agent_id"].as_str(),
-            Some("did:key:zCaller")
-        );
-    }
-
-    #[test]
-    fn google_a2a_adapter_derives_text_from_input_shapes() {
-        let adapter = GoogleA2aAdapter;
-        let payload = adapter.build_send_message_payload(
-            &InvokeAgentRequest {
-                task_id: None,
-                context_id: None,
-                message: None,
-                input: serde_json::json!({"query": "Recommend dishes"}),
-                skill_id: None,
-                settlement: None,
-                auth_token: None,
-                auth_context_id: None,
-                region: None,
-                confirm_risky: false,
-                max_cost_units: None,
-                agent_envelope: None,
-            },
-            None,
-        );
-        assert_eq!(
-            payload["message"]["parts"][0]["text"].as_str(),
-            Some("Recommend dishes")
-        );
-        assert_eq!(
-            payload["message"]["parts"][1]["data"]["query"].as_str(),
-            Some("Recommend dishes")
-        );
-
-        let payload = adapter.build_send_message_payload(
-            &InvokeAgentRequest {
-                task_id: None,
-                context_id: None,
-                message: None,
-                input: serde_json::json!("plain user prompt"),
-                skill_id: None,
-                settlement: None,
-                auth_token: None,
-                auth_context_id: None,
-                region: None,
-                confirm_risky: false,
-                max_cost_units: None,
-                agent_envelope: None,
-            },
-            None,
-        );
-        assert_eq!(
-            payload["message"]["parts"][0]["text"].as_str(),
-            Some("plain user prompt")
-        );
-
-        let payload = adapter.build_send_message_payload(
-            &InvokeAgentRequest {
-                task_id: None,
-                context_id: None,
-                message: None,
-                input: serde_json::json!({
-                    "message": {
-                        "role": "user",
-                        "parts": [{"kind": "text", "text": "A2A user prompt"}]
-                    }
-                }),
-                skill_id: None,
-                settlement: None,
-                auth_token: None,
-                auth_context_id: None,
-                region: None,
-                confirm_risky: false,
-                max_cost_units: None,
-                agent_envelope: None,
-            },
-            None,
-        );
-        assert_eq!(
-            payload["message"]["parts"][0]["text"].as_str(),
-            Some("A2A user prompt")
-        );
     }
 }
