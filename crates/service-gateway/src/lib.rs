@@ -1572,15 +1572,20 @@ mod tests {
 
     fn signed_a2a_response(request: &Value, mut result: Value) -> Value {
         let service_did = service_did();
-        let request_digest = request
-            .pointer("/params/metadata/agent_envelope/extensions/request_digest")
+        let encoded_envelope = request.pointer("/params/metadata/agent_envelope");
+        let decoded_envelope = encoded_envelope
+            .and_then(Value::as_str)
+            .and_then(|value| serde_json::from_str::<Value>(value).ok());
+        let agent_envelope = decoded_envelope.as_ref().or(encoded_envelope);
+        let request_digest = agent_envelope
+            .and_then(|value| value.pointer("/extensions/request_digest"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| {
                 jcs_sha256_digest_value(&request["params"]).expect("request params should hash")
             });
-        let request_nonce = request
-            .pointer("/params/metadata/agent_envelope/extensions/nonce")
+        let request_nonce = agent_envelope
+            .and_then(|value| value.pointer("/extensions/nonce"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let mut service_signature = ServiceAgentSignature {
@@ -2020,6 +2025,7 @@ mod tests {
     async fn invoke_agent_derives_servicenet_context_id_from_caller_envelope() {
         let (a2a_url, captured) = start_mock_a2a_server_with_capture().await;
         let (_registry, gateway) = approved_gateway_with_a2a_url(a2a_url).await;
+        let envelope = signed_agent_envelope();
         gateway
             .invoke_agent(
                 "stripe-agent",
@@ -2035,7 +2041,7 @@ mod tests {
                     region: Some("AU".to_owned()),
                     confirm_risky: true,
                     max_cost_units: Some(10),
-                    agent_envelope: Some(signed_agent_envelope()),
+                    agent_envelope: Some(envelope.clone()),
                 },
             )
             .await
@@ -2051,6 +2057,13 @@ mod tests {
             request["params"]["message"]["contextId"].as_str(),
             Some(expected_context_id.as_str())
         );
+        let forwarded_envelope: Value = serde_json::from_str(
+            request["params"]["metadata"]["agent_envelope"]
+                .as_str()
+                .expect("signed envelope should cross A2A metadata as opaque JSON"),
+        )
+        .expect("forwarded signed envelope should remain valid JSON");
+        assert_eq!(forwarded_envelope, envelope);
     }
 
     #[tokio::test]

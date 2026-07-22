@@ -298,18 +298,29 @@ async fn response_json(response: axum::response::Response) -> serde_json::Value 
     serde_json::from_slice(&body).expect("json should parse")
 }
 
+fn forwarded_agent_envelope(request: &serde_json::Value) -> Option<serde_json::Value> {
+    let envelope = request.pointer("/params/metadata/agent_envelope")?;
+    match envelope {
+        serde_json::Value::String(encoded) => serde_json::from_str(encoded).ok(),
+        value => Some(value.clone()),
+    }
+}
+
 fn signed_a2a_response(
     request: &serde_json::Value,
     mut result: serde_json::Value,
 ) -> serde_json::Value {
     let service_did = service_did("stripe-agent");
-    let request_digest = request
-        .pointer("/params/metadata/agent_envelope/extensions/request_digest")
+    let agent_envelope = forwarded_agent_envelope(request);
+    let request_digest = agent_envelope
+        .as_ref()
+        .and_then(|value| value.pointer("/extensions/request_digest"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| canonical_value_hash(&request["params"]));
-    let request_nonce = request
-        .pointer("/params/metadata/agent_envelope/extensions/nonce")
+    let request_nonce = agent_envelope
+        .as_ref()
+        .and_then(|value| value.pointer("/extensions/nonce"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     let issued_at_ms: u64 = SystemTime::now()
@@ -1138,8 +1149,10 @@ async fn approved_agent_can_be_invoked_over_a2a_with_x402_settlement() {
         request["params"]["metadata"]["settlement"]["request"]["protocol"],
         "x402"
     );
+    let forwarded_envelope =
+        forwarded_agent_envelope(request).expect("signed envelope should remain valid JSON");
     assert_eq!(
-        request["params"]["metadata"]["agent_envelope"]["extensions"]["caller_public_id"],
+        forwarded_envelope["extensions"]["caller_public_id"],
         serde_json::json!("pub_caller")
     );
 }

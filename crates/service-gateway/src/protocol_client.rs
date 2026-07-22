@@ -53,7 +53,7 @@ impl AgentProtocolClient for A2aV1Client {
         auth_token: Option<&str>,
     ) -> Result<Value, GatewayError> {
         let client = client(endpoint, auth_token)?;
-        let request = build_send_message_request(request, settlement);
+        let request = build_send_message_request(request, settlement)?;
         let response = client.send_message(&request).await.map_err(|error| {
             GatewayError::Execution(format!("A2A SendMessage to `{endpoint}` failed: {error}"))
         })?;
@@ -141,7 +141,7 @@ fn shared_http_client() -> Result<reqwest_a2a::Client, GatewayError> {
 fn build_send_message_request(
     request: &InvokeAgentRequest,
     settlement: Option<&NormalizedSettlementRequest>,
-) -> SendMessageRequest {
+) -> Result<SendMessageRequest, GatewayError> {
     let mut parts = Vec::new();
     if let Some(text) = super::invoke_request_message_text(request) {
         parts.push(Part::text(text));
@@ -168,18 +168,24 @@ fn build_send_message_request(
         metadata.insert(SETTLEMENT_METADATA_KEY.to_owned(), json!(settlement));
     }
     if let Some(agent_envelope) = &request.agent_envelope {
+        // A2A metadata is transported through protobuf Struct. Keep the signed
+        // envelope opaque so numeric JSON values cannot be normalized to floats.
         metadata.insert(
             AGENT_ENVELOPE_METADATA_KEY.to_owned(),
-            agent_envelope.clone(),
+            Value::String(serde_json::to_string(agent_envelope).map_err(|error| {
+                GatewayError::Execution(format!(
+                    "serialize signed agent_envelope metadata failed: {error}"
+                ))
+            })?),
         );
     }
 
-    SendMessageRequest {
+    Ok(SendMessageRequest {
         message,
         configuration: None,
         metadata: (!metadata.is_empty()).then_some(metadata),
         tenant: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -222,7 +228,8 @@ mod tests {
                 agent_envelope: Some(json!({"source_agent_id": "did:key:zCaller"})),
             },
             None,
-        );
+        )
+        .expect("request should build");
         let value = serde_json::to_value(request).expect("request should serialize");
 
         assert_eq!(value["message"]["taskId"], "task-1");
@@ -230,9 +237,12 @@ mod tests {
         assert_eq!(value["message"]["parts"][0]["text"], "Create payment link");
         assert_eq!(value["message"]["parts"][1]["data"]["amount"], 42);
         assert_eq!(value["metadata"]["skillId"], "payments.create_link");
-        assert_eq!(
-            value["metadata"]["agent_envelope"]["source_agent_id"],
-            "did:key:zCaller"
-        );
+        let envelope: Value = serde_json::from_str(
+            value["metadata"]["agent_envelope"]
+                .as_str()
+                .expect("signed envelope should be opaque JSON metadata"),
+        )
+        .expect("signed envelope metadata should remain valid JSON");
+        assert_eq!(envelope["source_agent_id"], "did:key:zCaller");
     }
 }
