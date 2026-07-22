@@ -13,15 +13,16 @@ use thiserror::Error;
 use uuid::Uuid;
 use watt_did::{Did, DidKey, DidKeyPublicKey};
 use watt_servicenet_protocol::{
-    AgentConnectionMode, AuthContextRecord, ExecutionReceipt, GetAgentTaskRequest, InvocationMode,
-    InvokeAgentRequest, InvokeAgentResponse, NormalizedSettlementRequest, PublishedAgentRecord,
-    ReceiptStatus, RiskLevel, ServiceAgentSignature, SettlementLayer, SettlementRequest,
-    StoredReceipt, VerificationVerdict, build_service_agent_get_task_signature_params,
+    AgentConnectionMode, AuthContextRecord, ExecutionReceipt, InvocationMode, InvokeAgentRequest,
+    InvokeAgentResponse, NormalizedSettlementRequest, PublishedAgentRecord, ReceiptStatus,
+    RiskLevel, ServiceAgentSignature, SettlementLayer, SettlementRequest, StoredReceipt,
+    VerificationVerdict, build_service_agent_get_task_signature_params,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry};
 
 mod protocol_client;
 mod service_identity;
+mod task_gateway;
 
 use protocol_client::{AgentProtocolClient, protocol_client};
 use service_identity::ServiceAgentVerifier;
@@ -455,9 +456,17 @@ impl GatewayService {
         request: &InvokeAgentRequest,
         security: &VerifiedAgentEnvelopeSecurity,
     ) -> Result<(), GatewayError> {
-        let Some(nonce) = security.nonce.as_deref() else {
-            return Ok(());
-        };
+        validate_signed_invocation_message_matches_request(request, &security.signed_message)?;
+        self.enforce_signed_envelope_replay(security)
+    }
+
+    fn enforce_signed_envelope_replay(
+        &self,
+        security: &VerifiedAgentEnvelopeSecurity,
+    ) -> Result<(), GatewayError> {
+        let nonce = security.nonce.as_deref().ok_or_else(|| {
+            GatewayError::Rejected("agent_envelope.extensions.nonce is required".to_owned())
+        })?;
         let issued_at_ms = security.issued_at_ms.ok_or_else(|| {
             GatewayError::Rejected(
                 "agent_envelope.extensions.issued_at_ms is required when nonce is set".to_owned(),
@@ -473,7 +482,6 @@ impl GatewayService {
                 "agent_envelope.extensions.request_digest is required when nonce is set".to_owned(),
             )
         })?;
-        validate_signed_invocation_message_matches_request(request, &security.signed_message)?;
         if !request_digest_matches_signed_message(request_digest, &security.signed_message)
             .map_err(|err| GatewayError::Execution(err.to_string()))?
         {
@@ -579,56 +587,6 @@ impl GatewayService {
             .await
             .map_err(map_registry_error)?;
         Ok(())
-    }
-
-    pub async fn get_agent_task(
-        &self,
-        agent_id: &str,
-        task_id: &str,
-        request: GetAgentTaskRequest,
-    ) -> Result<InvokeAgentResponse, GatewayError> {
-        let record = self
-            .registry
-            .get_published_agent(agent_id)
-            .await
-            .map_err(map_registry_error)?;
-        if record.deployment.connection_mode != AgentConnectionMode::ServicenetRelay {
-            return Err(GatewayError::Rejected(
-                "agent uses wattetheria_direct connection mode; ServiceNet task polling is unavailable"
-                    .to_owned(),
-            ));
-        }
-        let auth_token = self
-            .resolve_agent_auth_context(&record, request.auth_context_id)
-            .await?
-            .or(request.auth_token.clone());
-        self.enforce_agent_task_access(&record, auth_token.as_deref())
-            .await?;
-        let protocol_client = protocol_client(&record.deployment.endpoint)?;
-        let params = build_service_agent_get_task_signature_params(task_id, request.history_length);
-        let expected_request_digest = jcs_sha256_digest_value(&params)
-            .map_err(|error| GatewayError::Execution(error.to_string()))?;
-        let response = protocol_client
-            .get_task(
-                &record.deployment.endpoint.url,
-                task_id,
-                &request,
-                auth_token.as_deref(),
-            )
-            .await?;
-        let service_signature = self.service_agent_verifier.verify_response(
-            &record,
-            Some(&expected_request_digest),
-            None,
-            &response,
-        )?;
-        Ok(build_invoke_agent_response(
-            agent_id,
-            None,
-            None,
-            response,
-            Some(service_signature),
-        ))
     }
 
     async fn resolve_agent_auth_context(
@@ -811,6 +769,7 @@ fn invocation_request_digest(
         "message": request.message,
         "input": request.input,
         "skill_id": request.skill_id,
+        "return_immediately": request.return_immediately,
         "settlement": normalized_settlement
     }))
     .map_err(|err| GatewayError::Execution(err.to_string()))
@@ -888,6 +847,12 @@ fn verify_agent_envelope_signature(
         .agent_envelope
         .as_ref()
         .ok_or_else(|| GatewayError::Rejected("agent_envelope is required".to_owned()))?;
+    verify_agent_envelope_value(envelope)
+}
+
+fn verify_agent_envelope_value(
+    envelope: &Value,
+) -> Result<VerifiedAgentEnvelopeSecurity, GatewayError> {
     let signature = json_string_at(envelope, &["signature"])
         .ok_or_else(|| GatewayError::Rejected("agent_envelope.signature is required".to_owned()))?;
     let source_agent_id = json_string_at(envelope, &["source_agent_id"]).ok_or_else(|| {
@@ -1166,6 +1131,11 @@ fn build_invoke_agent_response(
 ) -> InvokeAgentResponse {
     let task = response
         .pointer("/result/task")
+        .or_else(|| {
+            response
+                .get("result")
+                .filter(|result| result.get("id").is_some() && result.get("status").is_some())
+        })
         .cloned()
         .unwrap_or(Value::Null);
     let status = task
@@ -1199,6 +1169,7 @@ fn build_invoke_agent_response(
 fn extract_task_output(response: &Value) -> Option<Value> {
     response
         .pointer("/result/task/artifacts")
+        .or_else(|| response.pointer("/result/artifacts"))
         .and_then(Value::as_array)
         .and_then(|artifacts| artifacts.first())
         .and_then(|artifact| artifact.get("parts"))
@@ -1459,6 +1430,15 @@ mod tests {
         })
     }
 
+    fn with_signed_agent_envelope(
+        mut request: InvokeAgentRequest,
+        nonce: &str,
+    ) -> InvokeAgentRequest {
+        request.agent_envelope = None;
+        request.agent_envelope = Some(signed_agent_envelope_for_request(&request, nonce));
+        request
+    }
+
     fn signed_agent_envelope_for_sparse_message(message: Value, nonce: &str) -> Value {
         let signing_key = caller_signing_key();
         let source_agent_id = did_from_signing_key(&signing_key);
@@ -1537,6 +1517,7 @@ mod tests {
             }),
             deployment: AgentDeployment {
                 runtime: "wattetheria_adapter".to_owned(),
+                execution_mode: watt_servicenet_protocol::AgentExecutionMode::CustomizedAgent,
                 connection_mode: AgentConnectionMode::ServicenetRelay,
                 endpoint: AgentDeploymentEndpoint {
                     url: endpoint_url.to_owned(),
@@ -1588,6 +1569,11 @@ mod tests {
             .and_then(|value| value.pointer("/extensions/nonce"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+        let unsigned_wire_result = if request["method"] == "GetTask" {
+            result["task"].clone()
+        } else {
+            result.clone()
+        };
         let mut service_signature = ServiceAgentSignature {
             protocol: "wattetheria.servicenet.response.v1".to_owned(),
             service_did: service_did.clone(),
@@ -1595,7 +1581,8 @@ mod tests {
             verification_method: service_verification_method(),
             request_digest,
             request_nonce,
-            result_digest: jcs_sha256_digest_value(&result).expect("result should hash"),
+            result_digest: jcs_sha256_digest_value(&unsigned_wire_result)
+                .expect("result should hash"),
             nonce: Uuid::new_v4().to_string(),
             issued_at_ms: Utc::now().timestamp_millis().max(0) as u64,
             signature: String::new(),
@@ -1607,19 +1594,24 @@ mod tests {
         let signature = Value::String(
             serde_json::to_string(&service_signature).expect("signature should serialize"),
         );
-        let wire_result = if request["method"] == "GetTask" {
+        let mut wire_result = if request["method"] == "GetTask" {
             let mut task = result["task"].take();
-            task["metadata"]["wattetheriaServiceAgentSignature"] = signature;
+            task["metadata"]["wattetheriaServiceAgentSignature"] = signature.clone();
             task
         } else {
-            let payload_name = if result.get("task").is_some() {
-                "task"
-            } else {
-                "message"
-            };
-            result[payload_name]["metadata"]["wattetheriaServiceAgentSignature"] = signature;
             result
         };
+        if request["method"] != "GetTask" {
+            if let Some(payload_name) = ["task", "message"]
+                .into_iter()
+                .find(|name| wire_result.get(*name).is_some())
+            {
+                wire_result[payload_name]["metadata"]["wattetheriaServiceAgentSignature"] =
+                    signature;
+            } else {
+                wire_result["metadata"]["wattetheriaServiceAgentSignature"] = signature;
+            }
+        }
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": request["id"].clone(),
@@ -1629,6 +1621,17 @@ mod tests {
 
     async fn start_mock_a2a_server() -> String {
         async fn handle(headers: axum::http::HeaderMap, Json(request): Json<Value>) -> Json<Value> {
+            let mut request = request;
+            if let Some(encoded) = headers
+                .get("x-wattetheria-agent-envelope")
+                .and_then(|value| value.to_str().ok())
+                && let Ok(bytes) = STANDARD.decode(encoded)
+                && let Ok(envelope) = serde_json::from_slice::<Value>(&bytes)
+            {
+                request["params"]["metadata"]["agent_envelope"] = Value::String(
+                    serde_json::to_string(&envelope).expect("envelope should serialize"),
+                );
+            }
             let method = request["method"].as_str().unwrap_or_default();
             let has_auth = headers.get("authorization").is_some();
             let response = match method {
@@ -1656,6 +1659,24 @@ mod tests {
                             "contextId": "ctx-1",
                             "status": { "state": "TASK_STATE_COMPLETED" }
                         }
+                    }),
+                ),
+                "ListTasks" => signed_a2a_response(
+                    &request,
+                    serde_json::json!({
+                        "tasks": [{
+                            "id": "task-1",
+                            "contextId": "ctx-1",
+                            "status": {"state": "TASK_STATE_WORKING"}
+                        }]
+                    }),
+                ),
+                "CancelTask" => signed_a2a_response(
+                    &request,
+                    serde_json::json!({
+                        "id": "task-1",
+                        "contextId": "ctx-1",
+                        "status": {"state": "TASK_STATE_CANCELED"}
                     }),
                 ),
                 _ => serde_json::json!({
@@ -1786,6 +1807,19 @@ mod tests {
         a2a_url: String,
         connection_mode: AgentConnectionMode,
     ) -> (Arc<ServiceRegistry>, GatewayService) {
+        approved_gateway_with_modes(
+            a2a_url,
+            watt_servicenet_protocol::AgentExecutionMode::CustomizedAgent,
+            connection_mode,
+        )
+        .await
+    }
+
+    async fn approved_gateway_with_modes(
+        a2a_url: String,
+        execution_mode: watt_servicenet_protocol::AgentExecutionMode,
+        connection_mode: AgentConnectionMode,
+    ) -> (Arc<ServiceRegistry>, GatewayService) {
         let registry = Arc::new(ServiceRegistry::in_memory());
         registry
             .register_provider(provider_request())
@@ -1793,6 +1827,7 @@ mod tests {
             .expect("provider should register");
         let card_url = a2a_url.trim_end_matches("/a2a").to_owned();
         let mut request = agent_submission(&card_url, &a2a_url);
+        request.deployment.execution_mode = execution_mode;
         request.deployment.connection_mode = connection_mode;
         sign_submission_attestation(&mut request, &provider_signing_key());
         let submission = registry
@@ -1820,30 +1855,26 @@ mod tests {
     #[tokio::test]
     async fn invoke_agent_records_receipt() {
         let (registry, gateway) = approved_gateway().await;
+        let request = with_signed_agent_envelope(
+            InvokeAgentRequest {
+                message: Some("Create payment link".to_owned()),
+                input: serde_json::json!({"amount": 42}),
+                region: Some("AU".to_owned()),
+                confirm_risky: true,
+                task_id: None,
+                context_id: None,
+                skill_id: None,
+                return_immediately: None,
+                settlement: None,
+                auth_token: Some("secret-token".to_owned()),
+                auth_context_id: None,
+                max_cost_units: Some(10),
+                agent_envelope: None,
+            },
+            "nonce-record-receipt",
+        );
         let response = gateway
-            .invoke_agent(
-                "stripe-agent",
-                InvokeAgentRequest {
-                    message: Some("Create payment link".to_owned()),
-                    input: serde_json::json!({"amount": 42}),
-                    region: Some("AU".to_owned()),
-                    confirm_risky: true,
-                    ..InvokeAgentRequest {
-                        task_id: None,
-                        context_id: None,
-                        message: None,
-                        input: Value::Null,
-                        skill_id: None,
-                        settlement: None,
-                        auth_token: Some("secret-token".to_owned()),
-                        auth_context_id: None,
-                        region: None,
-                        confirm_risky: false,
-                        max_cost_units: Some(10),
-                        agent_envelope: Some(signed_agent_envelope()),
-                    }
-                },
-            )
+            .invoke_agent("stripe-agent", request)
             .await
             .expect("invoke should succeed");
         assert_eq!(response.agent_id, "stripe-agent");
@@ -1875,6 +1906,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_agent_task_for_customized_agent_verifies_signed_a2a_response() {
+        let (_registry, gateway) = approved_gateway().await;
+        let mut request = watt_servicenet_protocol::GetAgentTaskRequest {
+            history_length: Some(3),
+            auth_token: Some("secret-token".to_owned()),
+            auth_context_id: None,
+            agent_envelope: None,
+        };
+        let message = watt_servicenet_protocol::get_agent_task_envelope_message("task-1", &request);
+        request.agent_envelope = Some(signed_agent_envelope_for_sparse_message(
+            message,
+            "nonce-get-task",
+        ));
+
+        let response = gateway
+            .get_agent_task("stripe-agent", "task-1", request)
+            .await
+            .expect("signed A2A GetTask should succeed");
+
+        assert_eq!(response.task_id.as_deref(), Some("task-1"));
+        assert_eq!(response.status, "TASK_STATE_COMPLETED");
+        assert!(response.service_signature.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_and_cancel_customized_agent_tasks_verify_signed_a2a_responses() {
+        let (_registry, gateway) = approved_gateway().await;
+        let mut list_request = watt_servicenet_protocol::ListAgentTasksRequest {
+            context_id: Some("ctx-1".to_owned()),
+            auth_token: Some("secret-token".to_owned()),
+            ..Default::default()
+        };
+        list_request.agent_envelope = Some(signed_agent_envelope_for_sparse_message(
+            watt_servicenet_protocol::list_agent_tasks_envelope_message(&list_request),
+            "nonce-list-tasks",
+        ));
+
+        let listed = gateway
+            .list_agent_tasks("stripe-agent", list_request)
+            .await
+            .expect("signed A2A ListTasks should succeed");
+        assert_eq!(listed.raw["result"]["tasks"][0]["id"], "task-1");
+        assert!(listed.service_signature.is_some());
+
+        let mut cancel_request = watt_servicenet_protocol::CancelAgentTaskRequest {
+            auth_token: Some("secret-token".to_owned()),
+            ..Default::default()
+        };
+        cancel_request.agent_envelope = Some(signed_agent_envelope_for_sparse_message(
+            watt_servicenet_protocol::cancel_agent_task_envelope_message("task-1"),
+            "nonce-cancel-task",
+        ));
+        let cancelled = gateway
+            .cancel_agent_task("stripe-agent", "task-1", cancel_request)
+            .await
+            .expect("signed A2A CancelTask should succeed");
+        assert_eq!(cancelled.task_id.as_deref(), Some("task-1"));
+        assert_eq!(cancelled.status, "TASK_STATE_CANCELED");
+        assert!(cancelled.service_signature.is_some());
+    }
+
+    #[tokio::test]
+    async fn a2a_task_tools_reject_wattetheria_runtime_agents() {
+        let (_, gateway) = approved_gateway_with_modes(
+            start_mock_a2a_server().await,
+            watt_servicenet_protocol::AgentExecutionMode::WattetheriaRuntime,
+            AgentConnectionMode::ServicenetRelay,
+        )
+        .await;
+
+        let error = gateway
+            .list_agent_tasks(
+                "stripe-agent",
+                watt_servicenet_protocol::ListAgentTasksRequest::default(),
+            )
+            .await
+            .expect_err("Wattetheria Runtime must not expose A2A Task operations");
+
+        assert!(
+            matches!(
+                error,
+                GatewayError::Rejected(ref message)
+                    if message.contains("Customized Agent")
+                        && message.contains("internal invocation flow")
+            ),
+            "unexpected gateway error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn gateway_rejects_direct_agent_instead_of_relaying_it() {
         let (_, gateway) = approved_gateway_with_connection_mode(
             start_mock_a2a_server().await,
@@ -1891,6 +2012,7 @@ mod tests {
                     message: None,
                     input: Value::Null,
                     skill_id: None,
+                    return_immediately: None,
                     settlement: None,
                     auth_token: Some("secret-token".to_owned()),
                     auth_context_id: None,
@@ -1918,32 +2040,26 @@ mod tests {
     async fn invoke_agent_rejects_unsigned_service_agent_response() {
         let (_registry, gateway) =
             approved_gateway_with_a2a_url(start_unsigned_a2a_server().await).await;
+        let request = with_signed_agent_envelope(
+            InvokeAgentRequest {
+                task_id: None,
+                context_id: None,
+                message: Some("Create payment link".to_owned()),
+                input: Value::Null,
+                skill_id: None,
+                return_immediately: None,
+                settlement: None,
+                auth_token: Some("secret-token".to_owned()),
+                auth_context_id: None,
+                region: Some("AU".to_owned()),
+                confirm_risky: true,
+                max_cost_units: Some(10),
+                agent_envelope: None,
+            },
+            "nonce-unsigned-response",
+        );
         let error = gateway
-            .invoke_agent(
-                "stripe-agent",
-                InvokeAgentRequest {
-                    message: Some("Create payment link".to_owned()),
-                    auth_token: Some("secret-token".to_owned()),
-                    region: Some("AU".to_owned()),
-                    confirm_risky: true,
-                    max_cost_units: Some(10),
-                    agent_envelope: Some(signed_agent_envelope()),
-                    ..InvokeAgentRequest {
-                        task_id: None,
-                        context_id: None,
-                        message: None,
-                        input: Value::Null,
-                        skill_id: None,
-                        settlement: None,
-                        auth_token: None,
-                        auth_context_id: None,
-                        region: None,
-                        confirm_risky: false,
-                        max_cost_units: None,
-                        agent_envelope: None,
-                    }
-                },
-            )
+            .invoke_agent("stripe-agent", request)
             .await
             .expect_err("unsigned Service Agent response should be rejected");
 
@@ -1963,6 +2079,7 @@ mod tests {
             message: Some("Create payment link".to_owned()),
             input: serde_json::json!({"amount": 42}),
             skill_id: None,
+            return_immediately: None,
             settlement: None,
             auth_token: Some("secret-token".to_owned()),
             auth_context_id: None,
@@ -2004,6 +2121,7 @@ mod tests {
                     message: Some("Create payment link".to_owned()),
                     input: Value::Null,
                     skill_id: None,
+                    return_immediately: None,
                     settlement: None,
                     auth_token: Some("secret-token".to_owned()),
                     auth_context_id: None,
@@ -2025,25 +2143,27 @@ mod tests {
     async fn invoke_agent_derives_servicenet_context_id_from_caller_envelope() {
         let (a2a_url, captured) = start_mock_a2a_server_with_capture().await;
         let (_registry, gateway) = approved_gateway_with_a2a_url(a2a_url).await;
-        let envelope = signed_agent_envelope();
+        let request = with_signed_agent_envelope(
+            InvokeAgentRequest {
+                task_id: None,
+                context_id: None,
+                message: Some("Create payment link".to_owned()),
+                input: serde_json::json!({"amount": 42}),
+                skill_id: None,
+                return_immediately: None,
+                settlement: None,
+                auth_token: Some("secret-token".to_owned()),
+                auth_context_id: None,
+                region: Some("AU".to_owned()),
+                confirm_risky: true,
+                max_cost_units: Some(10),
+                agent_envelope: None,
+            },
+            "nonce-context-id",
+        );
+        let envelope = request.agent_envelope.clone().expect("signed envelope");
         gateway
-            .invoke_agent(
-                "stripe-agent",
-                InvokeAgentRequest {
-                    task_id: None,
-                    context_id: None,
-                    message: Some("Create payment link".to_owned()),
-                    input: serde_json::json!({"amount": 42}),
-                    skill_id: None,
-                    settlement: None,
-                    auth_token: Some("secret-token".to_owned()),
-                    auth_context_id: None,
-                    region: Some("AU".to_owned()),
-                    confirm_risky: true,
-                    max_cost_units: Some(10),
-                    agent_envelope: Some(envelope.clone()),
-                },
-            )
+            .invoke_agent("stripe-agent", request)
             .await
             .expect("invoke should succeed");
 
@@ -2078,6 +2198,7 @@ mod tests {
                     message: Some("Create payment link".to_owned()),
                     input: Value::Null,
                     skill_id: None,
+                    return_immediately: None,
                     settlement: None,
                     auth_token: Some("secret-token".to_owned()),
                     auth_context_id: None,
@@ -2097,31 +2218,26 @@ mod tests {
     async fn invoke_agent_reports_invalid_callee_response() {
         let (_registry, gateway) =
             approved_gateway_with_a2a_url(start_invalid_a2a_server().await).await;
+        let request = with_signed_agent_envelope(
+            InvokeAgentRequest {
+                task_id: None,
+                context_id: None,
+                message: Some("Create payment link".to_owned()),
+                input: Value::Null,
+                skill_id: None,
+                return_immediately: None,
+                settlement: None,
+                auth_token: Some("secret-token".to_owned()),
+                auth_context_id: None,
+                region: Some("AU".to_owned()),
+                confirm_risky: true,
+                max_cost_units: None,
+                agent_envelope: None,
+            },
+            "nonce-invalid-response",
+        );
         let err = gateway
-            .invoke_agent(
-                "stripe-agent",
-                InvokeAgentRequest {
-                    message: Some("Create payment link".to_owned()),
-                    input: Value::Null,
-                    region: Some("AU".to_owned()),
-                    confirm_risky: true,
-                    auth_token: Some("secret-token".to_owned()),
-                    ..InvokeAgentRequest {
-                        task_id: None,
-                        context_id: None,
-                        message: None,
-                        input: Value::Null,
-                        skill_id: None,
-                        settlement: None,
-                        auth_token: None,
-                        auth_context_id: None,
-                        region: None,
-                        confirm_risky: false,
-                        max_cost_units: None,
-                        agent_envelope: Some(signed_agent_envelope()),
-                    }
-                },
-            )
+            .invoke_agent("stripe-agent", request)
             .await
             .expect_err("invalid callee response should fail");
 
@@ -2133,24 +2249,26 @@ mod tests {
     #[tokio::test]
     async fn invoke_agent_async_returns_receipt_and_records_result() {
         let (registry, gateway) = approved_gateway().await;
+        let request = with_signed_agent_envelope(
+            InvokeAgentRequest {
+                task_id: None,
+                context_id: None,
+                message: Some("Create payment link".to_owned()),
+                input: Value::Null,
+                skill_id: None,
+                return_immediately: None,
+                settlement: None,
+                auth_token: Some("secret-token".to_owned()),
+                auth_context_id: None,
+                region: Some("AU".to_owned()),
+                confirm_risky: true,
+                max_cost_units: Some(10),
+                agent_envelope: None,
+            },
+            "nonce-async-invoke",
+        );
         let response = gateway
-            .invoke_agent_async(
-                "stripe-agent",
-                InvokeAgentRequest {
-                    task_id: None,
-                    context_id: None,
-                    message: Some("Create payment link".to_owned()),
-                    input: Value::Null,
-                    skill_id: None,
-                    settlement: None,
-                    auth_token: Some("secret-token".to_owned()),
-                    auth_context_id: None,
-                    region: Some("AU".to_owned()),
-                    confirm_risky: true,
-                    max_cost_units: Some(10),
-                    agent_envelope: Some(signed_agent_envelope()),
-                },
-            )
+            .invoke_agent_async("stripe-agent", request)
             .await
             .expect("async invoke should be accepted");
         assert_eq!(response.status, "running");
@@ -2243,28 +2361,26 @@ mod tests {
             )
             .await
             .expect("agent should block");
+        let request = with_signed_agent_envelope(
+            InvokeAgentRequest {
+                task_id: None,
+                context_id: None,
+                message: Some("Create payment link".to_owned()),
+                input: Value::Null,
+                skill_id: None,
+                return_immediately: None,
+                settlement: None,
+                auth_token: Some("secret-token".to_owned()),
+                auth_context_id: None,
+                region: Some("AU".to_owned()),
+                confirm_risky: true,
+                max_cost_units: Some(10),
+                agent_envelope: None,
+            },
+            "nonce-blocked-agent",
+        );
         let err = gateway
-            .invoke_agent(
-                "stripe-agent",
-                InvokeAgentRequest {
-                    region: Some("AU".to_owned()),
-                    confirm_risky: true,
-                    ..InvokeAgentRequest {
-                        task_id: None,
-                        context_id: None,
-                        message: Some("Create payment link".to_owned()),
-                        input: Value::Null,
-                        skill_id: None,
-                        settlement: None,
-                        auth_token: Some("secret-token".to_owned()),
-                        auth_context_id: None,
-                        region: None,
-                        confirm_risky: false,
-                        max_cost_units: Some(10),
-                        agent_envelope: Some(signed_agent_envelope()),
-                    }
-                },
-            )
+            .invoke_agent("stripe-agent", request)
             .await
             .expect_err("invoke should reject");
         assert!(matches!(err, GatewayError::Rejected(_)));
@@ -2283,24 +2399,26 @@ mod tests {
             })
             .await
             .expect("auth context should register");
+        let request = with_signed_agent_envelope(
+            InvokeAgentRequest {
+                task_id: None,
+                context_id: None,
+                message: Some("Create payment link".to_owned()),
+                input: Value::Null,
+                skill_id: None,
+                return_immediately: None,
+                settlement: None,
+                auth_token: None,
+                auth_context_id: Some(auth_context.auth_context_id),
+                region: Some("AU".to_owned()),
+                confirm_risky: true,
+                max_cost_units: Some(10),
+                agent_envelope: None,
+            },
+            "nonce-auth-context",
+        );
         let response = gateway
-            .invoke_agent(
-                "stripe-agent",
-                InvokeAgentRequest {
-                    task_id: None,
-                    context_id: None,
-                    message: Some("Create payment link".to_owned()),
-                    input: Value::Null,
-                    skill_id: None,
-                    settlement: None,
-                    auth_token: None,
-                    auth_context_id: Some(auth_context.auth_context_id),
-                    region: Some("AU".to_owned()),
-                    confirm_risky: true,
-                    max_cost_units: Some(10),
-                    agent_envelope: Some(signed_agent_envelope()),
-                },
-            )
+            .invoke_agent("stripe-agent", request)
             .await
             .expect("invoke should succeed");
         assert_eq!(
@@ -2333,33 +2451,34 @@ mod tests {
             .await
             .expect("agent should approve");
         let gateway = GatewayService::new(registry.clone());
-
+        let request = with_signed_agent_envelope(
+            InvokeAgentRequest {
+                task_id: Some("task-ap2-1".to_owned()),
+                context_id: Some("ctx-ap2-1".to_owned()),
+                message: Some("Book the best flight".to_owned()),
+                input: serde_json::json!({
+                    "quote_id": "quote-1"
+                }),
+                skill_id: None,
+                return_immediately: None,
+                settlement: Some(SettlementRequest {
+                    layer: SettlementLayer::Web3,
+                    rail: "X402".to_owned(),
+                    request: serde_json::json!({
+                        "pay_to": "0xabc123"
+                    }),
+                }),
+                auth_token: Some("secret-token".to_owned()),
+                auth_context_id: None,
+                region: Some("AU".to_owned()),
+                confirm_risky: true,
+                max_cost_units: Some(10),
+                agent_envelope: None,
+            },
+            "nonce-x402",
+        );
         let response = gateway
-            .invoke_agent(
-                "stripe-agent",
-                InvokeAgentRequest {
-                    task_id: Some("task-ap2-1".to_owned()),
-                    context_id: Some("ctx-ap2-1".to_owned()),
-                    message: Some("Book the best flight".to_owned()),
-                    input: serde_json::json!({
-                        "quote_id": "quote-1"
-                    }),
-                    skill_id: None,
-                    settlement: Some(SettlementRequest {
-                        layer: SettlementLayer::Web3,
-                        rail: "X402".to_owned(),
-                        request: serde_json::json!({
-                            "pay_to": "0xabc123"
-                        }),
-                    }),
-                    auth_token: Some("secret-token".to_owned()),
-                    auth_context_id: None,
-                    region: Some("AU".to_owned()),
-                    confirm_risky: true,
-                    max_cost_units: Some(10),
-                    agent_envelope: Some(signed_agent_envelope()),
-                },
-            )
+            .invoke_agent("stripe-agent", request)
             .await
             .expect("invoke should succeed");
         assert_eq!(response.status, "TASK_STATE_COMPLETED");

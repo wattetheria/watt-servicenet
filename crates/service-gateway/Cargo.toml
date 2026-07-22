@@ -13,6 +13,7 @@ base64.workspace = true
 bs58 = "0.5"
 chrono.workspace = true
 ed25519-dalek.workspace = true
+futures-util.workspace = true
 reqwest-a2a.workspace = true
 serde.workspace = true
 serde_json.workspace = true

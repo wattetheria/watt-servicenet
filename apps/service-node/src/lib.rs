@@ -20,12 +20,13 @@ use watt_servicenet_p2p::{
 };
 use watt_servicenet_protocol::{
     AgentConnectionMode, AgentSubmissionQuery, AgentSubmissionStatus,
-    ApproveAgentSubmissionRequest, AuthContextQuery, BlockEntityRequest,
+    ApproveAgentSubmissionRequest, AuthContextQuery, BlockEntityRequest, CancelAgentTaskRequest,
     CreateModerationCaseRequest, CreateProviderOwnershipChallengeRequest, GetAgentTaskRequest,
-    InvokeAgentRequest, ModerationCaseQuery, ProviderRecord, PublishedAgentRecord, ReceiptQuery,
-    RegisterAuthContextRequest, RegisterProviderRequest, RejectAgentSubmissionRequest,
-    ResolveModerationCaseRequest, RevokeProviderRequest, RotateProviderKeyRequest,
-    RunVerifierSweepRequest, SubmitAgentRequest, UnpublishAgentRequest, VerifyReceiptRequest,
+    InvokeAgentRequest, ListAgentTasksRequest, ModerationCaseQuery, ProviderRecord,
+    PublishedAgentRecord, ReceiptQuery, RegisterAuthContextRequest, RegisterProviderRequest,
+    RejectAgentSubmissionRequest, ResolveModerationCaseRequest, RevokeProviderRequest,
+    RotateProviderKeyRequest, RunVerifierSweepRequest, SubmitAgentRequest,
+    SubscribeAgentTaskRequest, UnpublishAgentRequest, VerifyReceiptRequest,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry, ServiceRegistryConfig};
 
@@ -192,6 +193,15 @@ fn build_app(state: RouterState) -> Router {
         .route(
             "/v1/agents/:agent_id/tasks/:task_id/get",
             post(get_agent_task),
+        )
+        .route("/v1/agents/:agent_id/tasks/list", post(list_agent_tasks))
+        .route(
+            "/v1/agents/:agent_id/tasks/:task_id/cancel",
+            post(cancel_agent_task),
+        )
+        .route(
+            "/v1/agents/:agent_id/tasks/:task_id/subscribe",
+            post(subscribe_agent_task),
         )
         .route("/v1/agent-submissions", get(list_agent_submissions))
         .route("/v1/agent-submissions", post(submit_agent))
@@ -547,6 +557,45 @@ async fn get_agent_task(
     let response = state
         .gateway
         .get_agent_task(&agent_id, &task_id, request)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!(response)))
+}
+
+async fn list_agent_tasks(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(request): Json<ListAgentTasksRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let response = state
+        .gateway
+        .list_agent_tasks(&agent_id, request)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!(response)))
+}
+
+async fn cancel_agent_task(
+    State(state): State<AppState>,
+    Path((agent_id, task_id)): Path<(String, String)>,
+    Json(request): Json<CancelAgentTaskRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let response = state
+        .gateway
+        .cancel_agent_task(&agent_id, &task_id, request)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!(response)))
+}
+
+async fn subscribe_agent_task(
+    State(state): State<AppState>,
+    Path((agent_id, task_id)): Path<(String, String)>,
+    Json(request): Json<SubscribeAgentTaskRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let response = state
+        .gateway
+        .subscribe_agent_task(&agent_id, &task_id, request)
         .await
         .map_err(AppError::from)?;
     Ok(Json(serde_json::json!(response)))

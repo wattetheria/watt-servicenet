@@ -457,9 +457,19 @@ pub enum AgentConnectionMode {
     WattetheriaDirect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentExecutionMode {
+    #[default]
+    WattetheriaRuntime,
+    CustomizedAgent,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentDeployment {
     pub runtime: String,
+    #[serde(default)]
+    pub execution_mode: AgentExecutionMode,
     #[serde(default)]
     pub connection_mode: AgentConnectionMode,
     pub endpoint: AgentDeploymentEndpoint,
@@ -682,6 +692,8 @@ pub struct InvokeAgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_immediately: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement: Option<SettlementRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
@@ -705,6 +717,89 @@ pub struct GetAgentTaskRequest {
     pub auth_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_context_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ListAgentTasksRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_timestamp_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_artifacts: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_context_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CancelAgentTaskRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_context_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SubscribeAgentTaskRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_context_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_events: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_timeout_ms: Option<u64>,
+}
+
+#[must_use]
+pub fn get_agent_task_envelope_message(task_id: &str, request: &GetAgentTaskRequest) -> Value {
+    json!({
+        "operation": "GetTask",
+        "task_id": task_id,
+        "history_length": request.history_length,
+    })
+}
+
+#[must_use]
+pub fn list_agent_tasks_envelope_message(request: &ListAgentTasksRequest) -> Value {
+    json!({
+        "operation": "ListTasks",
+        "context_id": request.context_id,
+        "status": request.status,
+        "page_size": request.page_size,
+        "page_token": request.page_token,
+        "history_length": request.history_length,
+        "status_timestamp_after": request.status_timestamp_after,
+        "include_artifacts": request.include_artifacts,
+    })
+}
+
+#[must_use]
+pub fn cancel_agent_task_envelope_message(task_id: &str) -> Value {
+    json!({"operation": "CancelTask", "task_id": task_id})
+}
+
+#[must_use]
+pub fn subscribe_agent_task_envelope_message(task_id: &str) -> Value {
+    json!({"operation": "SubscribeToTask", "task_id": task_id})
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -921,6 +1016,34 @@ mod tests {
         assert_eq!(
             deployment.connection_mode,
             AgentConnectionMode::ServicenetRelay
+        );
+        assert_eq!(
+            deployment.execution_mode,
+            AgentExecutionMode::WattetheriaRuntime
+        );
+    }
+
+    #[test]
+    fn deployment_accepts_customized_agent_execution_independently_from_connection() {
+        let deployment: AgentDeployment = serde_json::from_value(serde_json::json!({
+            "runtime": "wattetheria_adapter",
+            "execution_mode": "customized_agent",
+            "connection_mode": "wattetheria_direct",
+            "endpoint": {
+                "url": "https://provider.example.com",
+                "protocol_binding": "JSONRPC",
+                "protocol_version": "1.0"
+            }
+        }))
+        .expect("customized direct deployment should parse");
+
+        assert_eq!(
+            deployment.execution_mode,
+            AgentExecutionMode::CustomizedAgent
+        );
+        assert_eq!(
+            deployment.connection_mode,
+            AgentConnectionMode::WattetheriaDirect
         );
     }
 

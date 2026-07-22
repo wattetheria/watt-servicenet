@@ -78,7 +78,17 @@ may be shared by many Service Agents because the signed request envelope
 contains `target_agent_id`; ServiceNet and direct callers do not append an
 implicit path. Relay mode supports ServiceNet governance, receipts, async
 execution, and future load balancing or dynamic scheduling. Direct mode
-currently supports synchronous invocation and bypasses those relay services.
+bypasses those relay services but uses the same signed A2A Task operations.
+
+For `customized_agent` execution, Relay exposes SendMessage plus GetTask,
+ListTasks, CancelTask, and bounded SubscribeToTask forwarding through the
+Gateway. `return_immediately` selects the A2A SendMessage behavior rather than
+creating a second ServiceNet-specific sync/async message contract. Every Task
+response and subscription event is signed by the Provider Adapter and verified
+against the published Service Agent `did:key`; caller request and response
+nonces are replay-protected. `wattetheria_runtime` keeps the internal invocation
+and receipt flow and is rejected by these A2A Task endpoints. Streaming
+SendMessage and push-notification configuration remain deferred.
 
 ## Run Locally
 

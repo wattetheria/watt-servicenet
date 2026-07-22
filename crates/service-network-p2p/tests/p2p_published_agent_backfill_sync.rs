@@ -33,6 +33,7 @@ fn demo_published_agent() -> PublishedAgentRecord {
         }),
         deployment: watt_servicenet_protocol::AgentDeployment {
             runtime: "wattetheria_adapter".to_owned(),
+            execution_mode: Default::default(),
             connection_mode: Default::default(),
             endpoint: watt_servicenet_protocol::AgentDeploymentEndpoint {
                 url: "https://twilio-agent.example.com/a2a".to_owned(),

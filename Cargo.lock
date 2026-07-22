@@ -7108,6 +7108,7 @@ dependencies = [
  "bs58 0.5.1",
  "chrono",
  "ed25519-dalek 2.2.0",
+ "futures-util",
  "reqwest 0.13.4",
  "serde",
  "serde_jcs 0.2.0",

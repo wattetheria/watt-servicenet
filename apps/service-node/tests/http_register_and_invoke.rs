@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 use watt_servicenet_node::build_local_app;
 use watt_servicenet_protocol::{
-    ServiceAgentSignature, build_agent_attestation_payload, build_agent_unpublish_payload,
-    build_service_agent_signature_payload,
+    InvokeAgentRequest, ServiceAgentSignature, build_agent_attestation_payload,
+    build_agent_unpublish_payload, build_service_agent_signature_payload,
 };
 use watt_servicenet_registry::ServiceRegistry;
 
@@ -125,7 +125,7 @@ fn signed_source_agent_card(signing_key: &SigningKey) -> serde_json::Value {
     })
 }
 
-fn signed_agent_envelope() -> serde_json::Value {
+fn signed_agent_envelope(request: &serde_json::Value) -> serde_json::Value {
     let signing_key = caller_signing_key();
     let source_agent_id = did_from_signing_key(&signing_key);
     let transport_profile = Some("wattswarm_mesh".to_owned());
@@ -137,11 +137,29 @@ fn signed_agent_envelope() -> serde_json::Value {
         .get("card_hash")
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
-    let message = serde_json::json!({
-        "message": "Book a flight"
-    });
+    let mut message = serde_json::to_value(
+        serde_json::from_value::<InvokeAgentRequest>(request.clone())
+            .expect("invocation request should parse"),
+    )
+    .expect("invocation request should serialize");
+    let message_object = message
+        .as_object_mut()
+        .expect("invocation request should be an object");
+    message_object.remove("auth_token");
+    message_object.remove("auth_context_id");
+    message_object.remove("agent_envelope");
+    let issued_at_ms: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("timestamp should fit u64");
     let extensions = serde_json::json!({
-        "caller_public_id": "pub_caller"
+        "caller_public_id": "pub_caller",
+        "nonce": format!("http-test-{}", uuid::Uuid::new_v4()),
+        "issued_at_ms": issued_at_ms,
+        "expires_at_ms": issued_at_ms.saturating_add(60_000),
+        "request_digest": canonical_value_hash(&message),
     });
     let message_json = serde_json::to_string(&message).expect("message should serialize");
     let extensions_json =
@@ -170,6 +188,11 @@ fn signed_agent_envelope() -> serde_json::Value {
         "extensions": extensions,
         "signature": sign_payload(&payload, &signing_key)
     })
+}
+
+fn with_signed_agent_envelope(mut request: serde_json::Value) -> serde_json::Value {
+    request["agent_envelope"] = signed_agent_envelope(&request);
+    request
 }
 
 fn provider_payload() -> serde_json::Value {
@@ -329,6 +352,11 @@ fn signed_a2a_response(
         .as_millis()
         .try_into()
         .expect("timestamp should fit u64");
+    let unsigned_wire_result = if request["method"] == "GetTask" {
+        result["task"].clone()
+    } else {
+        result.clone()
+    };
     let mut service_signature = ServiceAgentSignature {
         protocol: "wattetheria.servicenet.response.v1".to_owned(),
         service_did: service_did.clone(),
@@ -336,7 +364,7 @@ fn signed_a2a_response(
         verification_method: service_verification_method("stripe-agent"),
         request_digest,
         request_nonce,
-        result_digest: canonical_value_hash(&result),
+        result_digest: canonical_value_hash(&unsigned_wire_result),
         nonce: format!("test-response-{issued_at_ms}"),
         issued_at_ms,
         signature: String::new(),
@@ -952,13 +980,12 @@ async fn approved_agent_can_be_invoked_over_a2a_and_polled() {
                 .uri("/v1/agents/stripe-agent/invoke")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({
+                    with_signed_agent_envelope(serde_json::json!({
                         "message": "Create a payment link",
                         "input": { "amount": 42, "currency": "AUD" },
                         "auth_token": "test-token",
-                        "region": "AU",
-                        "agent_envelope": signed_agent_envelope()
-                    })
+                        "region": "AU"
+                    }))
                     .to_string(),
                 ))
                 .expect("request should build"),
@@ -987,8 +1014,9 @@ async fn approved_agent_can_be_invoked_over_a2a_and_polled() {
         )
         .await
         .expect("task get should succeed");
-    assert_eq!(poll.status(), StatusCode::OK);
+    let poll_status = poll.status();
     let poll_json = response_json(poll).await;
+    assert_eq!(poll_status, StatusCode::OK, "task poll failed: {poll_json}");
     assert_eq!(poll_json["status"], "TASK_STATE_COMPLETED");
     assert_eq!(poll_json["output"]["ok"], true);
     assert_eq!(poll_json["output"]["provider"], "mock-a2a");
@@ -1010,13 +1038,12 @@ async fn approved_agent_can_be_invoked_async_and_polled_by_receipt() {
                 .uri("/v1/agents/stripe-agent/invoke-async")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({
+                    with_signed_agent_envelope(serde_json::json!({
                         "message": "Create a payment link",
                         "input": { "amount": 42, "currency": "AUD" },
                         "auth_token": "test-token",
-                        "region": "AU",
-                        "agent_envelope": signed_agent_envelope()
-                    })
+                        "region": "AU"
+                    }))
                     .to_string(),
                 ))
                 .expect("request should build"),
@@ -1076,7 +1103,7 @@ async fn approved_agent_can_be_invoked_over_a2a_with_x402_settlement() {
                 .uri("/v1/agents/stripe-agent/invoke")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({
+                    with_signed_agent_envelope(serde_json::json!({
                         "task_id": "task-ap2-1",
                         "context_id": "ctx-ap2-1",
                         "message": "Book a flight",
@@ -1092,9 +1119,8 @@ async fn approved_agent_can_be_invoked_over_a2a_with_x402_settlement() {
                         },
                         "auth_token": "test-token",
                         "region": "AU",
-                        "confirm_risky": true,
-                        "agent_envelope": signed_agent_envelope()
-                    })
+                        "confirm_risky": true
+                    }))
                     .to_string(),
                 ))
                 .expect("request should build"),
@@ -1290,10 +1316,9 @@ async fn blocked_agent_is_rejected_until_unblocked() {
                 .uri("/v1/agents/stripe-agent/invoke")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({
-                        "message": "Create a payment link",
-                        "agent_envelope": signed_agent_envelope()
-                    })
+                    with_signed_agent_envelope(serde_json::json!({
+                        "message": "Create a payment link"
+                    }))
                     .to_string(),
                 ))
                 .expect("request should build"),
@@ -1325,12 +1350,11 @@ async fn blocked_agent_is_rejected_until_unblocked() {
                 .uri("/v1/agents/stripe-agent/invoke")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({
+                    with_signed_agent_envelope(serde_json::json!({
                         "message": "Create a payment link",
                         "auth_token": "test-token",
-                        "region": "AU",
-                        "agent_envelope": signed_agent_envelope()
-                    })
+                        "region": "AU"
+                    }))
                     .to_string(),
                 ))
                 .expect("request should build"),

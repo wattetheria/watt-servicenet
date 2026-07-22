@@ -4232,6 +4232,7 @@ mod tests {
             }),
             deployment: AgentDeployment {
                 runtime: "wattetheria_adapter".to_owned(),
+                execution_mode: Default::default(),
                 connection_mode: Default::default(),
                 endpoint: watt_servicenet_protocol::AgentDeploymentEndpoint {
                     url: "https://stripe-agent.example.com/a2a".to_owned(),

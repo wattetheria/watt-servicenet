@@ -199,12 +199,19 @@ fn service_agent_signature_value(response: &Value) -> Option<&Value> {
     response
         .pointer("/result/task/metadata/wattetheriaServiceAgentSignature")
         .or_else(|| response.pointer("/result/message/metadata/wattetheriaServiceAgentSignature"))
+        .or_else(|| {
+            response.pointer("/result/statusUpdate/metadata/wattetheriaServiceAgentSignature")
+        })
+        .or_else(|| {
+            response.pointer("/result/artifactUpdate/metadata/wattetheriaServiceAgentSignature")
+        })
+        .or_else(|| response.pointer("/result/metadata/wattetheriaServiceAgentSignature"))
         .or_else(|| response.pointer("/extensions/service_agent_signature"))
 }
 
 fn unsigned_a2a_result(response: &Value) -> Value {
     let mut result = response.get("result").cloned().unwrap_or(Value::Null);
-    for payload_name in ["task", "message"] {
+    for payload_name in ["task", "message", "statusUpdate", "artifactUpdate"] {
         let Some(payload) = result.get_mut(payload_name).and_then(Value::as_object_mut) else {
             continue;
         };
@@ -215,6 +222,16 @@ fn unsigned_a2a_result(response: &Value) -> Value {
         if metadata.is_empty() {
             payload.remove("metadata");
         }
+    }
+    let remove_root_metadata = result
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|metadata| {
+            metadata.remove("wattetheriaServiceAgentSignature");
+            metadata.is_empty()
+        });
+    if remove_root_metadata && let Some(object) = result.as_object_mut() {
+        object.remove("metadata");
     }
     result
 }
