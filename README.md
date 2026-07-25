@@ -203,7 +203,3 @@ For Docker configuration checks:
 ```bash
 docker compose config
 ```
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/image?repos=wattetheria/watt-servicenet&type=Date)](https://star-history.com/#wattetheria/watt-servicenet&Date)
