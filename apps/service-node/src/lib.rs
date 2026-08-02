@@ -34,6 +34,8 @@ const DEFAULT_AGENT_LIST_LIMIT: usize = 50;
 const MAX_AGENT_LIST_LIMIT: usize = 100;
 const P2P_BACKFILL_PAGE_SIZE: usize = 256;
 const DEFAULT_P2P_ANTI_ENTROPY_INTERVAL_SECS: u64 = 60;
+const ASYNC_INVOCATION_WORKER_INTERVAL_MS: u64 = 1_000;
+const ASYNC_INVOCATION_WORKER_BATCH_SIZE: usize = 16;
 const PUBLIC_SERVICENET_NETWORK_ID: &str = "mainnet.watt-etheria";
 const SERVICENET_FEDERATION_MODE_ENV: &str = "SERVICENET_FEDERATION_MODE";
 const SERVICENET_FEDERATION_TRUSTED_PEERS_ENV: &str = "SERVICENET_FEDERATION_TRUSTED_PEERS";
@@ -159,6 +161,7 @@ pub struct RouterState {
 
 fn build_app(state: RouterState) -> Router {
     let gateway = GatewayService::with_policy(state.registry.clone(), state.gateway_policy);
+    start_async_invocation_worker(gateway.clone());
     let state = AppState {
         registry: state.registry,
         gateway,
@@ -252,6 +255,24 @@ fn build_app(state: RouterState) -> Router {
             post(resolve_moderation_case),
         )
         .with_state(state)
+}
+
+fn start_async_invocation_worker(gateway: GatewayService) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        let worker_id = format!("service-node-{}", Uuid::new_v4());
+        loop {
+            if let Err(error) = gateway
+                .process_pending_invocations(&worker_id, ASYNC_INVOCATION_WORKER_BATCH_SIZE)
+                .await
+            {
+                eprintln!("ServiceNet async invocation worker error: {error}");
+            }
+            tokio::time::sleep(Duration::from_millis(ASYNC_INVOCATION_WORKER_INTERVAL_MS)).await;
+        }
+    });
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -615,11 +636,11 @@ async fn list_receipts(
 
 async fn get_receipt(
     State(state): State<AppState>,
-    Path(receipt_id): Path<Uuid>,
+    Path(receipt_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let receipt = state
         .registry
-        .get_receipt(receipt_id)
+        .get_receipt(&receipt_id)
         .await
         .map_err(AppError::from)?;
     Ok(Json(serde_json::json!(receipt)))
@@ -627,12 +648,12 @@ async fn get_receipt(
 
 async fn verify_receipt(
     State(state): State<AppState>,
-    Path(receipt_id): Path<Uuid>,
+    Path(receipt_id): Path<String>,
     Json(request): Json<VerifyReceiptRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let receipt = state
         .registry
-        .verify_receipt(receipt_id, request)
+        .verify_receipt(&receipt_id, request)
         .await
         .map_err(AppError::from)?;
     Ok(Json(serde_json::json!(receipt)))
@@ -640,11 +661,11 @@ async fn verify_receipt(
 
 async fn list_receipt_verifications(
     State(state): State<AppState>,
-    Path(receipt_id): Path<Uuid>,
+    Path(receipt_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let items = state
         .registry
-        .list_verifications(receipt_id)
+        .list_verifications(&receipt_id)
         .await
         .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "items": items })))

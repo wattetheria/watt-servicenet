@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::fs;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 use watt_did::proof::ProofVerifier;
 use watt_did::{
@@ -25,10 +25,10 @@ use watt_servicenet_protocol::{
     AgentSubmissionRecord, AgentSubmissionStatus, AgentTrustRecord, ApproveAgentSubmissionRequest,
     AuthContextQuery, AuthContextRecord, BlockEntityRequest, CreateModerationCaseRequest,
     CreateProviderOwnershipChallengeRequest, ExecutionReceipt, HealthStatus, InvocationMode,
-    ModerationAction, ModerationCase, ModerationCaseQuery, ModerationStatus, ModerationTargetKind,
-    ProviderAuditEvent, ProviderAuditKind, ProviderHealthRecord, ProviderOwnershipChallenge,
-    ProviderOwnershipOperation, ProviderRecord, ProviderStatus, ProviderTrustRecord,
-    PublishedAgentRecord, PublishedAgentStatus, ReceiptQuery, ReceiptStatus,
+    InvokeAgentRequest, ModerationAction, ModerationCase, ModerationCaseQuery, ModerationStatus,
+    ModerationTargetKind, ProviderAuditEvent, ProviderAuditKind, ProviderHealthRecord,
+    ProviderOwnershipChallenge, ProviderOwnershipOperation, ProviderRecord, ProviderStatus,
+    ProviderTrustRecord, PublishedAgentRecord, PublishedAgentStatus, ReceiptQuery, ReceiptStatus,
     RegisterAuthContextRequest, RegisterProviderRequest, RejectAgentSubmissionRequest,
     ResolveModerationCaseRequest, RevokeProviderRequest, RiskLevel, RotateProviderKeyRequest,
     RunVerifierSweepRequest, SERVICE_PROTOCOL_SCHEMA_VERSION, StoredReceipt, SubmitAgentRequest,
@@ -53,7 +53,7 @@ pub enum RegistryError {
     #[error("agent `{0}` is blocked")]
     AgentBlocked(String),
     #[error("receipt `{0}` not found")]
-    ReceiptNotFound(Uuid),
+    ReceiptNotFound(String),
     #[error("auth context `{0}` not found")]
     AuthContextNotFound(Uuid),
     #[error("provider ownership challenge `{0}` not found")]
@@ -82,12 +82,13 @@ pub enum RegistryError {
 #[serde(default)]
 pub struct RegistryState {
     pub providers: HashMap<String, ProviderRecord>,
-    pub receipts: HashMap<Uuid, StoredReceipt>,
+    pub receipts: HashMap<String, StoredReceipt>,
+    pub receipt_jobs: HashMap<String, StoredInvocationJob>,
     pub provider_health: HashMap<String, ProviderHealthRecord>,
     pub agent_health: HashMap<String, AgentHealthRecord>,
     pub provider_trust: HashMap<String, ProviderTrustRecord>,
     pub agent_trust: HashMap<String, AgentTrustRecord>,
-    pub verifications: HashMap<Uuid, Vec<VerificationRecord>>,
+    pub verifications: HashMap<String, Vec<VerificationRecord>>,
     pub auth_contexts: HashMap<Uuid, AuthContextRecord>,
     pub auth_context_secrets: HashMap<Uuid, EncryptedSecretEnvelope>,
     pub provider_ownership_challenges: HashMap<Uuid, ProviderOwnershipChallenge>,
@@ -136,10 +137,67 @@ pub struct EncryptedSecretEnvelope {
     pub ciphertext: String,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredInvocationJob {
+    pub receipt_id: String,
+    pub request_secret: EncryptedSecretEnvelope,
+    pub available_at: DateTime<Utc>,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub attempt_count: u32,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaimedInvocation {
+    pub receipt_id: String,
+    pub request: InvokeAgentRequest,
+    pub attempt_count: u32,
+}
+
 #[async_trait]
 pub trait RegistryStore: Send + Sync {
     async fn load_state(&self) -> Result<RegistryState>;
     async fn save_state(&self, state: &RegistryState) -> Result<()>;
+
+    async fn save_receipt_state(&self, state: &RegistryState, _receipt_id: &str) -> Result<()> {
+        self.save_state(state).await
+    }
+
+    async fn claim_receipt_jobs(
+        &self,
+        worker_id: &str,
+        now: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<StoredInvocationJob>> {
+        let mut state = self.load_state().await?;
+        let mut candidates = state
+            .receipt_jobs
+            .values()
+            .filter(|job| {
+                job.available_at <= now
+                    && job
+                        .lease_expires_at
+                        .is_none_or(|lease_expires_at| lease_expires_at <= now)
+            })
+            .map(|job| (job.available_at, job.receipt_id.clone()))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(available_at, _)| *available_at);
+
+        let mut claimed = Vec::new();
+        for (_, receipt_id) in candidates.into_iter().take(limit) {
+            let Some(job) = state.receipt_jobs.get_mut(&receipt_id) else {
+                continue;
+            };
+            job.lease_owner = Some(worker_id.to_owned());
+            job.lease_expires_at = Some(lease_expires_at);
+            job.attempt_count = job.attempt_count.saturating_add(1);
+            claimed.push(job.clone());
+        }
+        self.save_state(&state).await?;
+        Ok(claimed)
+    }
 
     async fn list_published_agents_page(
         &self,
@@ -352,7 +410,7 @@ impl PostgresRegistryStore {
             ),
             format!(
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."receipts" (
-                    receipt_id UUID PRIMARY KEY,
+                    receipt_id TEXT PRIMARY KEY,
                     agent_id TEXT NOT NULL,
                     provider_id TEXT NOT NULL,
                     invoke_mode TEXT NOT NULL DEFAULT 'sync',
@@ -360,11 +418,21 @@ impl PostgresRegistryStore {
                     caller_public_id TEXT NULL,
                     caller_display_name TEXT NULL,
                     caller_node_id TEXT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
                     verification TEXT NOT NULL,
+                    request_secret_json JSONB NULL,
+                    available_at TIMESTAMPTZ NULL,
+                    lease_owner TEXT NULL,
+                    lease_expires_at TIMESTAMPTZ NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     stored_json JSONB NOT NULL
                 )"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."receipts" ALTER COLUMN receipt_id TYPE TEXT USING receipt_id::TEXT"#
             ),
             format!(
                 r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS caller_agent_id TEXT NULL"#
@@ -382,6 +450,32 @@ impl PostgresRegistryStore {
                 r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS caller_node_id TEXT NULL"#
             ),
             format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'running'"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS request_secret_json JSONB NULL"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ NULL"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS lease_owner TEXT NULL"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ NULL"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS last_error TEXT NULL"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."receipts"
+                   SET status = COALESCE(stored_json#>>'{{receipt,status}}', status)
+                   WHERE status IS DISTINCT FROM COALESCE(stored_json#>>'{{receipt,status}}', status)"#
+            ),
+            format!(
                 r#"CREATE INDEX IF NOT EXISTS "receipts_agent_caller_idx" ON "{schema}"."receipts" (agent_id, caller_agent_id)"#
             ),
             format!(
@@ -389,6 +483,9 @@ impl PostgresRegistryStore {
             ),
             format!(
                 r#"CREATE INDEX IF NOT EXISTS "receipts_public_caller_idx" ON "{schema}"."receipts" (caller_public_id)"#
+            ),
+            format!(
+                r#"CREATE INDEX IF NOT EXISTS "receipts_job_claim_idx" ON "{schema}"."receipts" (available_at, lease_expires_at) WHERE invoke_mode = 'async' AND request_secret_json IS NOT NULL"#
             ),
             format!(
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."provider_health" (
@@ -427,11 +524,14 @@ impl PostgresRegistryStore {
             ),
             format!(
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."verifications" (
-                    receipt_id UUID PRIMARY KEY,
+                    receipt_id TEXT PRIMARY KEY,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     record_json JSONB NOT NULL
                 )"#
+            ),
+            format!(
+                r#"ALTER TABLE "{schema}"."verifications" ALTER COLUMN receipt_id TYPE TEXT USING receipt_id::TEXT"#
             ),
             format!(
                 r#"CREATE TABLE IF NOT EXISTS "{schema}"."auth_contexts" (
@@ -675,14 +775,34 @@ impl RegistryStore for PostgresRegistryStore {
         }
 
         for row in sqlx::query(&format!(
-            r#"SELECT stored_json FROM "{}"."receipts""#,
+            r#"SELECT receipt_id, stored_json, request_secret_json, available_at, lease_owner, lease_expires_at, attempt_count, last_error FROM "{}"."receipts""#,
             self.schema
         ))
         .fetch_all(&self.pool)
         .await?
         {
             let stored: StoredReceipt = serde_json::from_value(row.try_get("stored_json")?)?;
-            state.receipts.insert(stored.receipt.receipt_id, stored);
+            let receipt_id = stored.receipt.receipt_id.clone();
+            state.receipts.insert(receipt_id.clone(), stored);
+            if let Some(request_secret_json) = row.try_get::<Option<serde_json::Value>, _>(
+                "request_secret_json",
+            )? {
+                state.receipt_jobs.insert(
+                    receipt_id.clone(),
+                    StoredInvocationJob {
+                        receipt_id,
+                        request_secret: serde_json::from_value(request_secret_json)?,
+                        available_at: row
+                            .try_get::<Option<DateTime<Utc>>, _>("available_at")?
+                            .unwrap_or_else(Utc::now),
+                        lease_owner: row.try_get("lease_owner")?,
+                        lease_expires_at: row.try_get("lease_expires_at")?,
+                        attempt_count: u32::try_from(row.try_get::<i32, _>("attempt_count")?)
+                            .unwrap_or(u32::MAX),
+                        last_error: row.try_get("last_error")?,
+                    },
+                );
+            }
         }
 
         for row in sqlx::query(&format!(
@@ -742,7 +862,7 @@ impl RegistryStore for PostgresRegistryStore {
         {
             let records: Vec<VerificationRecord> =
                 serde_json::from_value(row.try_get("record_json")?)?;
-            if let Some(receipt_id) = records.first().map(|record| record.receipt_id) {
+            if let Some(receipt_id) = records.first().map(|record| record.receipt_id.clone()) {
                 state.verifications.insert(receipt_id, records);
             }
         }
@@ -910,40 +1030,6 @@ impl RegistryStore for PostgresRegistryStore {
             .await?;
         }
 
-        for stored in state.receipts.values() {
-            let (created_at, updated_at) = receipt_timestamps(stored);
-            sqlx::query(&format!(
-                r#"INSERT INTO "{}"."receipts" (receipt_id, agent_id, provider_id, invoke_mode, caller_agent_id, caller_public_id, caller_display_name, caller_node_id, verification, created_at, updated_at, stored_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                   ON CONFLICT (receipt_id) DO UPDATE SET
-                     agent_id = EXCLUDED.agent_id,
-                     provider_id = EXCLUDED.provider_id,
-                     invoke_mode = EXCLUDED.invoke_mode,
-                     caller_agent_id = EXCLUDED.caller_agent_id,
-                     caller_public_id = EXCLUDED.caller_public_id,
-                     caller_display_name = EXCLUDED.caller_display_name,
-                     caller_node_id = EXCLUDED.caller_node_id,
-                     verification = EXCLUDED.verification,
-                     updated_at = EXCLUDED.updated_at,
-                     stored_json = EXCLUDED.stored_json"#,
-                self.schema
-            ))
-            .bind(stored.receipt.receipt_id)
-            .bind(&stored.receipt.agent_id)
-            .bind(&stored.receipt.provider_id)
-            .bind(invocation_mode_column(&stored.receipt.invoke_mode))
-            .bind(&stored.receipt.caller_agent_id)
-            .bind(&stored.receipt.caller_public_id)
-            .bind(&stored.receipt.caller_display_name)
-            .bind(&stored.receipt.caller_node_id)
-            .bind(format!("{:?}", stored.receipt.verification))
-            .bind(created_at)
-            .bind(updated_at)
-            .bind(serde_json::to_value(stored)?)
-            .execute(&mut *tx)
-            .await?;
-        }
-
         for record in state.provider_health.values() {
             sqlx::query(&format!(
                 r#"INSERT INTO "{}"."provider_health" (provider_id, created_at, updated_at, record_json)
@@ -1014,26 +1100,6 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.updated_at)
             .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        for records in state.verifications.values() {
-            let Some((created_at, updated_at)) = verification_timestamps(records) else {
-                continue;
-            };
-            sqlx::query(&format!(
-                r#"INSERT INTO "{}"."verifications" (receipt_id, created_at, updated_at, record_json)
-                   VALUES ($1, $2, $3, $4)
-                   ON CONFLICT (receipt_id) DO UPDATE SET
-                     updated_at = EXCLUDED.updated_at,
-                     record_json = EXCLUDED.record_json"#,
-                self.schema
-            ))
-            .bind(records[0].receipt_id)
-            .bind(created_at)
-            .bind(updated_at)
-            .bind(serde_json::to_value(records)?)
             .execute(&mut *tx)
             .await?;
         }
@@ -1224,14 +1290,6 @@ impl RegistryStore for PostgresRegistryStore {
             .await?;
         }
 
-        delete_stale_uuid_rows(
-            &mut tx,
-            &self.schema,
-            "receipts",
-            "receipt_id",
-            state.receipts.keys().copied().collect::<Vec<_>>(),
-        )
-        .await?;
         delete_stale_text_rows(
             &mut tx,
             &self.schema,
@@ -1270,14 +1328,6 @@ impl RegistryStore for PostgresRegistryStore {
             "agent_trust",
             "agent_id",
             state.agent_trust.keys().cloned().collect::<Vec<_>>(),
-        )
-        .await?;
-        delete_stale_uuid_rows(
-            &mut tx,
-            &self.schema,
-            "verifications",
-            "receipt_id",
-            state.verifications.keys().copied().collect::<Vec<_>>(),
         )
         .await?;
         delete_stale_uuid_rows(
@@ -1364,6 +1414,229 @@ impl RegistryStore for PostgresRegistryStore {
         tx.commit().await?;
         Ok(())
     }
+
+    async fn save_receipt_state(&self, state: &RegistryState, receipt_id: &str) -> Result<()> {
+        let stored = state
+            .receipts
+            .get(receipt_id)
+            .with_context(|| format!("receipt `{receipt_id}` is missing from registry state"))?;
+        let mut tx = self.pool.begin().await?;
+        upsert_receipt(
+            &mut tx,
+            &self.schema,
+            stored,
+            state.receipt_jobs.get(receipt_id),
+        )
+        .await?;
+
+        if let Some(records) = state.verifications.get(receipt_id)
+            && let Some((created_at, updated_at)) = verification_timestamps(records)
+        {
+            sqlx::query(&format!(
+                r#"INSERT INTO "{}"."verifications" (receipt_id, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (receipt_id) DO UPDATE SET
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
+                self.schema
+            ))
+            .bind(receipt_id)
+            .bind(created_at)
+            .bind(updated_at)
+            .bind(serde_json::to_value(records)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if let Some(record) = state.provider_health.get(&stored.receipt.provider_id) {
+            sqlx::query(&format!(
+                r#"INSERT INTO "{}"."provider_health" (provider_id, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (provider_id) DO UPDATE SET
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
+                self.schema
+            ))
+            .bind(&record.provider_id)
+            .bind(record.updated_at)
+            .bind(record.updated_at)
+            .bind(serde_json::to_value(record)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(record) = state.agent_health.get(&stored.receipt.agent_id) {
+            sqlx::query(&format!(
+                r#"INSERT INTO "{}"."agent_health" (agent_id, provider_id, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (agent_id) DO UPDATE SET
+                     provider_id = EXCLUDED.provider_id,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
+                self.schema
+            ))
+            .bind(&record.agent_id)
+            .bind(&record.provider_id)
+            .bind(record.updated_at)
+            .bind(record.updated_at)
+            .bind(serde_json::to_value(record)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(record) = state.provider_trust.get(&stored.receipt.provider_id) {
+            sqlx::query(&format!(
+                r#"INSERT INTO "{}"."provider_trust" (provider_id, blocked, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (provider_id) DO UPDATE SET
+                     blocked = EXCLUDED.blocked,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
+                self.schema
+            ))
+            .bind(&record.provider_id)
+            .bind(record.blocked)
+            .bind(record.updated_at)
+            .bind(record.updated_at)
+            .bind(serde_json::to_value(record)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(record) = state.agent_trust.get(&stored.receipt.agent_id) {
+            sqlx::query(&format!(
+                r#"INSERT INTO "{}"."agent_trust" (agent_id, blocked, created_at, updated_at, record_json)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (agent_id) DO UPDATE SET
+                     blocked = EXCLUDED.blocked,
+                     updated_at = EXCLUDED.updated_at,
+                     record_json = EXCLUDED.record_json"#,
+                self.schema
+            ))
+            .bind(&record.agent_id)
+            .bind(record.blocked)
+            .bind(record.updated_at)
+            .bind(record.updated_at)
+            .bind(serde_json::to_value(record)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn claim_receipt_jobs(
+        &self,
+        worker_id: &str,
+        now: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<StoredInvocationJob>> {
+        let rows = sqlx::query(&format!(
+            r#"WITH candidates AS (
+                   SELECT receipt_id
+                   FROM "{}"."receipts"
+                   WHERE invoke_mode = 'async'
+                     AND status = 'running'
+                     AND request_secret_json IS NOT NULL
+                     AND available_at <= $1
+                     AND (lease_expires_at IS NULL OR lease_expires_at <= $1)
+                   ORDER BY available_at, created_at
+                   FOR UPDATE SKIP LOCKED
+                   LIMIT $2
+               )
+               UPDATE "{}"."receipts" AS receipt
+               SET lease_owner = $3,
+                   lease_expires_at = $4,
+                   attempt_count = receipt.attempt_count + 1,
+                   updated_at = $1
+               FROM candidates
+               WHERE receipt.receipt_id = candidates.receipt_id
+               RETURNING receipt.receipt_id, receipt.request_secret_json,
+                         receipt.available_at, receipt.lease_owner,
+                         receipt.lease_expires_at, receipt.attempt_count,
+                         receipt.last_error"#,
+            self.schema, self.schema
+        ))
+        .bind(now)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .bind(worker_id)
+        .bind(lease_expires_at)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(StoredInvocationJob {
+                    receipt_id: row.try_get("receipt_id")?,
+                    request_secret: serde_json::from_value(row.try_get("request_secret_json")?)?,
+                    available_at: row.try_get("available_at")?,
+                    lease_owner: row.try_get("lease_owner")?,
+                    lease_expires_at: row.try_get("lease_expires_at")?,
+                    attempt_count: u32::try_from(row.try_get::<i32, _>("attempt_count")?)
+                        .unwrap_or(u32::MAX),
+                    last_error: row.try_get("last_error")?,
+                })
+            })
+            .collect()
+    }
+}
+
+async fn upsert_receipt(
+    tx: &mut Transaction<'_, Postgres>,
+    schema: &str,
+    stored: &StoredReceipt,
+    job: Option<&StoredInvocationJob>,
+) -> Result<()> {
+    let (created_at, updated_at) = receipt_timestamps(stored);
+    sqlx::query(&format!(
+        r#"INSERT INTO "{schema}"."receipts" (receipt_id, agent_id, provider_id, invoke_mode, caller_agent_id, caller_public_id, caller_display_name, caller_node_id, status, verification, request_secret_json, available_at, lease_owner, lease_expires_at, attempt_count, last_error, created_at, updated_at, stored_json)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+           ON CONFLICT (receipt_id) DO UPDATE SET
+             agent_id = EXCLUDED.agent_id,
+             provider_id = EXCLUDED.provider_id,
+             invoke_mode = EXCLUDED.invoke_mode,
+             caller_agent_id = EXCLUDED.caller_agent_id,
+             caller_public_id = EXCLUDED.caller_public_id,
+             caller_display_name = EXCLUDED.caller_display_name,
+             caller_node_id = EXCLUDED.caller_node_id,
+             status = EXCLUDED.status,
+             verification = EXCLUDED.verification,
+             request_secret_json = EXCLUDED.request_secret_json,
+             available_at = EXCLUDED.available_at,
+             lease_owner = EXCLUDED.lease_owner,
+             lease_expires_at = EXCLUDED.lease_expires_at,
+             attempt_count = EXCLUDED.attempt_count,
+             last_error = EXCLUDED.last_error,
+             updated_at = EXCLUDED.updated_at,
+             stored_json = EXCLUDED.stored_json"#
+    ))
+    .bind(&stored.receipt.receipt_id)
+    .bind(&stored.receipt.agent_id)
+    .bind(&stored.receipt.provider_id)
+    .bind(invocation_mode_column(&stored.receipt.invoke_mode))
+    .bind(&stored.receipt.caller_agent_id)
+    .bind(&stored.receipt.caller_public_id)
+    .bind(&stored.receipt.caller_display_name)
+    .bind(&stored.receipt.caller_node_id)
+    .bind(receipt_status_column(&stored.receipt.status))
+    .bind(format!("{:?}", stored.receipt.verification))
+    .bind(
+        job.map(|job| serde_json::to_value(&job.request_secret))
+            .transpose()?,
+    )
+    .bind(job.map(|job| job.available_at))
+    .bind(job.and_then(|job| job.lease_owner.as_deref()))
+    .bind(job.and_then(|job| job.lease_expires_at))
+    .bind(
+        job.map(|job| i32::try_from(job.attempt_count).unwrap_or(i32::MAX))
+            .unwrap_or_default(),
+    )
+    .bind(job.and_then(|job| job.last_error.as_deref()))
+    .bind(created_at)
+    .bind(updated_at)
+    .bind(serde_json::to_value(stored)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn provider_record_timestamps(provider: &ProviderRecord) -> (DateTime<Utc>, DateTime<Utc>) {
@@ -1382,6 +1655,15 @@ fn invocation_mode_column(mode: &InvocationMode) -> &'static str {
     match mode {
         InvocationMode::Sync => "sync",
         InvocationMode::Async => "async",
+    }
+}
+
+fn receipt_status_column(status: &ReceiptStatus) -> &'static str {
+    match status {
+        ReceiptStatus::Running => "running",
+        ReceiptStatus::Succeeded => "succeeded",
+        ReceiptStatus::Failed => "failed",
+        ReceiptStatus::Rejected => "rejected",
     }
 }
 
@@ -1439,6 +1721,7 @@ pub struct ServiceRegistry {
     require_provider_ownership_challenges: bool,
     provider_challenge_ttl_secs: i64,
     secret_broker: Arc<SecretBroker>,
+    receipt_mutation_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1462,6 +1745,7 @@ impl ServiceRegistry {
             require_provider_ownership_challenges: config.require_provider_ownership_challenges,
             provider_challenge_ttl_secs: provider_challenge_ttl_secs as i64,
             secret_broker: Arc::new(secret_broker),
+            receipt_mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1796,19 +2080,20 @@ impl ServiceRegistry {
         Ok(receipts)
     }
 
-    pub async fn get_receipt(&self, receipt_id: Uuid) -> Result<StoredReceipt, RegistryError> {
+    pub async fn get_receipt(&self, receipt_id: &str) -> Result<StoredReceipt, RegistryError> {
         self.load_state()
             .await?
             .receipts
-            .get(&receipt_id)
+            .get(receipt_id)
             .cloned()
-            .ok_or(RegistryError::ReceiptNotFound(receipt_id))
+            .ok_or_else(|| RegistryError::ReceiptNotFound(receipt_id.to_owned()))
     }
 
     pub async fn record_receipt(
         &self,
         stored: &StoredReceipt,
     ) -> Result<StoredReceipt, RegistryError> {
+        let _guard = self.receipt_mutation_lock.lock().await;
         let mut state = self.load_state().await?;
         if !state
             .published_agents
@@ -1820,16 +2105,19 @@ impl ServiceRegistry {
         }
         state
             .receipts
-            .insert(stored.receipt.receipt_id, stored.clone());
+            .insert(stored.receipt.receipt_id.clone(), stored.clone());
+        if stored.receipt.status != ReceiptStatus::Running {
+            state.receipt_jobs.remove(&stored.receipt.receipt_id);
+        }
         if stored.receipt.status != watt_servicenet_protocol::ReceiptStatus::Running {
             update_health_for_receipt(&mut state, &stored.receipt);
             update_trust_for_receipt(&mut state, &stored.receipt);
         }
         if stored.receipt.verification == VerificationVerdict::Pending {
             state.verifications.insert(
-                stored.receipt.receipt_id,
+                stored.receipt.receipt_id.clone(),
                 vec![VerificationRecord {
-                    receipt_id: stored.receipt.receipt_id,
+                    receipt_id: stored.receipt.receipt_id.clone(),
                     verifier_id: "system-queue".to_owned(),
                     verdict: VerificationVerdict::Pending,
                     automated: true,
@@ -1840,13 +2128,109 @@ impl ServiceRegistry {
         } else {
             state.verifications.remove(&stored.receipt.receipt_id);
         }
-        self.save_state(&state).await?;
+        self.store
+            .save_receipt_state(&state, &stored.receipt.receipt_id)
+            .await
+            .map_err(|error| RegistryError::Storage(error.to_string()))?;
         Ok(stored.clone())
+    }
+
+    pub async fn enqueue_async_invocation(
+        &self,
+        stored: &StoredReceipt,
+        request: &InvokeAgentRequest,
+    ) -> Result<StoredReceipt, RegistryError> {
+        let _guard = self.receipt_mutation_lock.lock().await;
+        let mut state = self.load_state().await?;
+        if !state
+            .published_agents
+            .contains_key(&stored.receipt.agent_id)
+        {
+            return Err(RegistryError::PublishedAgentNotFound(
+                stored.receipt.agent_id.clone(),
+            ));
+        }
+        let request_json = serde_json::to_string(request)
+            .map_err(|error| RegistryError::Storage(error.to_string()))?;
+        let job = StoredInvocationJob {
+            receipt_id: stored.receipt.receipt_id.clone(),
+            request_secret: self.secret_broker.seal(&request_json)?,
+            available_at: Utc::now(),
+            lease_owner: None,
+            lease_expires_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        state
+            .receipts
+            .insert(stored.receipt.receipt_id.clone(), stored.clone());
+        state
+            .receipt_jobs
+            .insert(stored.receipt.receipt_id.clone(), job);
+        self.store
+            .save_receipt_state(&state, &stored.receipt.receipt_id)
+            .await
+            .map_err(|error| RegistryError::Storage(error.to_string()))?;
+        Ok(stored.clone())
+    }
+
+    pub async fn claim_async_invocations(
+        &self,
+        worker_id: &str,
+        lease_seconds: i64,
+        limit: usize,
+    ) -> Result<Vec<ClaimedInvocation>, RegistryError> {
+        let _guard = self.receipt_mutation_lock.lock().await;
+        let now = Utc::now();
+        let jobs = self
+            .store
+            .claim_receipt_jobs(
+                worker_id,
+                now,
+                now + chrono::Duration::seconds(lease_seconds.max(1)),
+                limit,
+            )
+            .await
+            .map_err(|error| RegistryError::Storage(error.to_string()))?;
+        jobs.into_iter()
+            .map(|job| {
+                let request_json = self.secret_broker.open(&job.request_secret)?;
+                let request = serde_json::from_str(&request_json)
+                    .map_err(|error| RegistryError::Storage(error.to_string()))?;
+                Ok(ClaimedInvocation {
+                    receipt_id: job.receipt_id,
+                    request,
+                    attempt_count: job.attempt_count,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn defer_async_invocation(
+        &self,
+        receipt_id: &str,
+        error: String,
+        retry_after_seconds: i64,
+    ) -> Result<(), RegistryError> {
+        let _guard = self.receipt_mutation_lock.lock().await;
+        let mut state = self.load_state().await?;
+        let job = state
+            .receipt_jobs
+            .get_mut(receipt_id)
+            .ok_or_else(|| RegistryError::ReceiptNotFound(receipt_id.to_owned()))?;
+        job.available_at = Utc::now() + chrono::Duration::seconds(retry_after_seconds.max(1));
+        job.lease_owner = None;
+        job.lease_expires_at = None;
+        job.last_error = Some(error);
+        self.store
+            .save_receipt_state(&state, receipt_id)
+            .await
+            .map_err(|error| RegistryError::Storage(error.to_string()))
     }
 
     pub async fn verify_receipt(
         &self,
-        receipt_id: Uuid,
+        receipt_id: &str,
         request: VerifyReceiptRequest,
     ) -> Result<StoredReceipt, RegistryError> {
         if request.verifier_id.trim().is_empty() {
@@ -1854,21 +2238,22 @@ impl ServiceRegistry {
                 "verifier_id must not be empty".to_owned(),
             ));
         }
+        let _guard = self.receipt_mutation_lock.lock().await;
         let mut state = self.load_state().await?;
         let updated_receipt = {
             let stored = state
                 .receipts
-                .get_mut(&receipt_id)
-                .ok_or(RegistryError::ReceiptNotFound(receipt_id))?;
+                .get_mut(receipt_id)
+                .ok_or_else(|| RegistryError::ReceiptNotFound(receipt_id.to_owned()))?;
             stored.receipt.verification = request.verdict.clone();
             stored.clone()
         };
         state
             .verifications
-            .entry(receipt_id)
+            .entry(receipt_id.to_owned())
             .or_default()
             .push(VerificationRecord {
-                receipt_id,
+                receipt_id: receipt_id.to_owned(),
                 verifier_id: request.verifier_id,
                 verdict: request.verdict,
                 automated: request.automated,
@@ -1876,21 +2261,24 @@ impl ServiceRegistry {
                 verified_at: Utc::now(),
             });
         update_trust_for_verification(&mut state, &updated_receipt.receipt);
-        self.save_state(&state).await?;
+        self.store
+            .save_receipt_state(&state, receipt_id)
+            .await
+            .map_err(|error| RegistryError::Storage(error.to_string()))?;
         Ok(updated_receipt)
     }
 
     pub async fn list_verifications(
         &self,
-        receipt_id: Uuid,
+        receipt_id: &str,
     ) -> Result<Vec<VerificationRecord>, RegistryError> {
         let mut items = self
             .load_state()
             .await?
             .verifications
-            .get(&receipt_id)
+            .get(receipt_id)
             .cloned()
-            .ok_or(RegistryError::ReceiptNotFound(receipt_id))?;
+            .ok_or_else(|| RegistryError::ReceiptNotFound(receipt_id.to_owned()))?;
         items.sort_by_key(|item| item.verified_at);
         Ok(items)
     }
@@ -1904,13 +2292,15 @@ impl ServiceRegistry {
                 "verifier_id must not be empty".to_owned(),
             ));
         }
+        let _guard = self.receipt_mutation_lock.lock().await;
         let mut state = self.load_state().await?;
         let mut updated = Vec::new();
         let receipt_ids = state
             .receipts
             .iter()
             .filter_map(|(receipt_id, stored)| {
-                (stored.receipt.verification == VerificationVerdict::Pending).then_some(*receipt_id)
+                (stored.receipt.verification == VerificationVerdict::Pending)
+                    .then_some(receipt_id.clone())
             })
             .collect::<Vec<_>>();
 
@@ -1941,10 +2331,10 @@ impl ServiceRegistry {
             };
             state
                 .verifications
-                .entry(receipt_id)
+                .entry(receipt_id.clone())
                 .or_default()
                 .push(VerificationRecord {
-                    receipt_id,
+                    receipt_id: receipt_id.clone(),
                     verifier_id: request.verifier_id.clone(),
                     verdict: verdict.clone(),
                     automated: true,
@@ -1959,7 +2349,12 @@ impl ServiceRegistry {
                 updated.push(updated_receipt);
             }
         }
-        self.save_state(&state).await?;
+        for stored in &updated {
+            self.store
+                .save_receipt_state(&state, &stored.receipt.receipt_id)
+                .await
+                .map_err(|error| RegistryError::Storage(error.to_string()))?;
+        }
         Ok(updated)
     }
 
@@ -4357,7 +4752,7 @@ mod tests {
     fn demo_receipt() -> StoredReceipt {
         StoredReceipt {
             receipt: ExecutionReceipt {
-                receipt_id: Uuid::new_v4(),
+                receipt_id: Uuid::new_v4().to_string(),
                 agent_id: "stripe-agent".to_owned(),
                 provider_id: "provider-1".to_owned(),
                 caller_agent_id: Some("did:key:zCaller".to_owned()),
@@ -4861,6 +5256,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn async_receipt_job_is_leased_retried_and_removed_on_completion() {
+        let registry = ServiceRegistry::in_memory();
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        registry
+            .submit_agent(demo_agent_submission("stripe-agent"))
+            .await
+            .expect("agent should publish");
+        let mut stored = demo_receipt();
+        stored.receipt.invoke_mode = InvocationMode::Async;
+        stored.receipt.status = ReceiptStatus::Running;
+        stored.receipt.verification = VerificationVerdict::NotRequired;
+        stored.receipt.completed_at = None;
+        stored.output = None;
+        let request = InvokeAgentRequest {
+            task_id: None,
+            context_id: None,
+            message: Some("run later".to_owned()),
+            input: serde_json::json!({"value": 1}),
+            skill_id: None,
+            return_immediately: None,
+            settlement: None,
+            auth_token: Some("private-token".to_owned()),
+            auth_context_id: None,
+            region: Some("AU".to_owned()),
+            confirm_risky: true,
+            max_cost_units: Some(10),
+            agent_envelope: Some(serde_json::json!({"signed": true})),
+        };
+        registry
+            .enqueue_async_invocation(&stored, &request)
+            .await
+            .expect("async receipt should enqueue");
+
+        let state = registry.load_state().await.expect("state should load");
+        let encrypted = serde_json::to_string(
+            &state
+                .receipt_jobs
+                .get(&stored.receipt.receipt_id)
+                .expect("job should exist")
+                .request_secret,
+        )
+        .expect("job should serialize");
+        assert!(!encrypted.contains("private-token"));
+
+        let first = registry
+            .claim_async_invocations("worker-a", 60, 1)
+            .await
+            .expect("first worker should claim");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].attempt_count, 1);
+        assert_eq!(first[0].request, request);
+        assert!(
+            registry
+                .claim_async_invocations("worker-b", 60, 1)
+                .await
+                .expect("second claim should succeed")
+                .is_empty()
+        );
+
+        registry
+            .defer_async_invocation(&stored.receipt.receipt_id, "temporary".to_owned(), 1)
+            .await
+            .expect("job should defer");
+        tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
+        let retried = registry
+            .claim_async_invocations("worker-b", 60, 1)
+            .await
+            .expect("retry should claim");
+        assert_eq!(retried[0].attempt_count, 2);
+
+        stored.receipt.status = ReceiptStatus::Succeeded;
+        stored.receipt.completed_at = Some(Utc::now());
+        registry
+            .record_receipt(&stored)
+            .await
+            .expect("terminal receipt should persist");
+        assert!(
+            !registry
+                .load_state()
+                .await
+                .expect("state should load")
+                .receipt_jobs
+                .contains_key(&stored.receipt.receipt_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn file_backed_async_receipt_can_be_claimed_after_registry_restart() {
+        let dir = tempdir().expect("temp dir should exist");
+        let path = dir.path().join("registry.json");
+        let config = ServiceRegistryConfig {
+            secret_broker_key: Some(STANDARD.encode([9u8; 32])),
+            ..Default::default()
+        };
+        let registry = ServiceRegistry::json_file_with_config(&path, config.clone());
+        registry
+            .register_provider(demo_provider())
+            .await
+            .expect("provider should register");
+        registry
+            .submit_agent(demo_agent_submission("stripe-agent"))
+            .await
+            .expect("agent should publish");
+        let mut stored = demo_receipt();
+        stored.receipt.invoke_mode = InvocationMode::Async;
+        stored.receipt.status = ReceiptStatus::Running;
+        stored.receipt.verification = VerificationVerdict::NotRequired;
+        stored.receipt.completed_at = None;
+        let request = InvokeAgentRequest {
+            task_id: None,
+            context_id: None,
+            message: Some("resume me".to_owned()),
+            input: serde_json::Value::Null,
+            skill_id: None,
+            return_immediately: None,
+            settlement: None,
+            auth_token: Some("private-token".to_owned()),
+            auth_context_id: None,
+            region: None,
+            confirm_risky: false,
+            max_cost_units: None,
+            agent_envelope: None,
+        };
+        registry
+            .enqueue_async_invocation(&stored, &request)
+            .await
+            .expect("async receipt should enqueue");
+        drop(registry);
+
+        let restarted = ServiceRegistry::json_file_with_config(&path, config);
+        let claimed = restarted
+            .claim_async_invocations("restarted-worker", 60, 1)
+            .await
+            .expect("restarted registry should decrypt and claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].receipt_id, stored.receipt.receipt_id);
+        assert_eq!(claimed[0].request, request);
+    }
+
+    #[tokio::test]
     async fn blocklists_and_audit_events_are_recorded() {
         let registry = ServiceRegistry::in_memory();
         registry
@@ -5101,7 +5639,7 @@ mod tests {
 
         let stored = StoredReceipt {
             receipt: ExecutionReceipt {
-                receipt_id: Uuid::new_v4(),
+                receipt_id: Uuid::new_v4().to_string(),
                 agent_id: "risk-medium".to_owned(),
                 provider_id: "provider-1".to_owned(),
                 caller_agent_id: None,
@@ -5139,7 +5677,7 @@ mod tests {
 
         let verified = registry
             .verify_receipt(
-                stored.receipt.receipt_id,
+                &stored.receipt.receipt_id,
                 VerifyReceiptRequest {
                     verifier_id: "manual-verifier".to_owned(),
                     verdict: VerificationVerdict::Verified,

@@ -13,10 +13,10 @@ use thiserror::Error;
 use uuid::Uuid;
 use watt_did::{Did, DidKey, DidKeyPublicKey};
 use watt_servicenet_protocol::{
-    AgentConnectionMode, AuthContextRecord, ExecutionReceipt, InvocationMode, InvokeAgentRequest,
-    InvokeAgentResponse, NormalizedSettlementRequest, PublishedAgentRecord, ReceiptStatus,
-    RiskLevel, ServiceAgentSignature, SettlementLayer, SettlementRequest, StoredReceipt,
-    VerificationVerdict, build_service_agent_get_task_signature_params,
+    AgentConnectionMode, AgentExecutionMode, AuthContextRecord, ExecutionReceipt, InvocationMode,
+    InvokeAgentRequest, InvokeAgentResponse, NormalizedSettlementRequest, PublishedAgentRecord,
+    ReceiptStatus, RiskLevel, ServiceAgentSignature, SettlementLayer, SettlementRequest,
+    StoredReceipt, VerificationVerdict, build_service_agent_get_task_signature_params,
 };
 use watt_servicenet_registry::{RegistryError, ServiceRegistry};
 
@@ -31,6 +31,8 @@ const DEFAULT_SERVICENET_CONTEXT_NETWORK_ID: &str = "mainnet:watt-etheria";
 const INVOCATION_REPLAY_MAX_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
 const INVOCATION_REPLAY_MAX_TTL_MS: u64 = 5 * 60 * 1000;
 const INVOCATION_REPLAY_CACHE_MAX_ENTRIES: usize = 262_144;
+const ASYNC_INVOCATION_LEASE_SECONDS: i64 = 300;
+const ASYNC_INVOCATION_MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -242,7 +244,7 @@ impl GatewayService {
             agent_id,
             request,
             prepared,
-            Uuid::new_v4(),
+            Uuid::new_v4().to_string(),
             Utc::now(),
             InvocationMode::Sync,
         )
@@ -255,10 +257,16 @@ impl GatewayService {
         request: InvokeAgentRequest,
     ) -> Result<InvokeAgentResponse, GatewayError> {
         let prepared = self.prepare_invocation(agent_id, &request).await?;
-        let receipt_id = Uuid::new_v4();
+        if prepared.record.deployment.execution_mode == AgentExecutionMode::CustomizedAgent {
+            return Err(GatewayError::Rejected(
+                "Customized Agent async execution uses /invoke with return_immediately=true"
+                    .to_owned(),
+            ));
+        }
+        let receipt_id = Uuid::new_v4().to_string();
         let started_at = Utc::now();
         let mut execution_receipt = ExecutionReceipt {
-            receipt_id,
+            receipt_id: receipt_id.clone(),
             agent_id: prepared.record.agent_id.clone(),
             provider_id: prepared.record.provider_id.clone(),
             caller_agent_id: prepared.caller_context.caller_agent_id.clone(),
@@ -286,32 +294,15 @@ impl GatewayService {
         };
         let stored = self
             .registry
-            .record_receipt(&running)
+            .enqueue_async_invocation(&running, &request)
             .await
             .map_err(map_registry_error)?;
-        let service = self.clone();
-        let agent_id_owned = agent_id.to_owned();
-        tokio::spawn(async move {
-            if let Err(error) = service
-                .execute_prepared_invocation(
-                    &agent_id_owned,
-                    request,
-                    prepared,
-                    receipt_id,
-                    started_at,
-                    InvocationMode::Async,
-                )
-                .await
-            {
-                let _ = service
-                    .record_failed_invocation(receipt_id, error.to_string())
-                    .await;
-            }
-        });
+        self.process_pending_invocations(&format!("inline-{}", Uuid::new_v4()), 1)
+            .await?;
         Ok(InvokeAgentResponse {
             agent_id: agent_id.to_owned(),
             status: "running".to_owned(),
-            receipt_id: Some(stored.receipt.receipt_id),
+            receipt_id: Some(stored.receipt.receipt_id.clone()),
             task_id: None,
             context_id: None,
             message: Some("ServiceNet invocation accepted".to_owned()),
@@ -327,10 +318,93 @@ impl GatewayService {
         })
     }
 
+    pub async fn process_pending_invocations(
+        &self,
+        worker_id: &str,
+        limit: usize,
+    ) -> Result<usize, GatewayError> {
+        let claimed = self
+            .registry
+            .claim_async_invocations(worker_id, ASYNC_INVOCATION_LEASE_SECONDS, limit)
+            .await
+            .map_err(map_registry_error)?;
+        let claimed_count = claimed.len();
+        for invocation in claimed {
+            let service = self.clone();
+            tokio::spawn(async move {
+                service.process_claimed_invocation(invocation).await;
+            });
+        }
+        Ok(claimed_count)
+    }
+
+    async fn process_claimed_invocation(
+        &self,
+        invocation: watt_servicenet_registry::ClaimedInvocation,
+    ) {
+        let result = async {
+            let stored = self
+                .registry
+                .get_receipt(&invocation.receipt_id)
+                .await
+                .map_err(map_registry_error)?;
+            let agent_id = stored.receipt.agent_id.clone();
+            let prepared = self
+                .prepare_invocation_for_claim(&agent_id, &invocation.request)
+                .await?;
+            self.execute_prepared_invocation(
+                &agent_id,
+                invocation.request.clone(),
+                prepared,
+                invocation.receipt_id.clone(),
+                stored.receipt.started_at,
+                InvocationMode::Async,
+            )
+            .await
+        }
+        .await;
+
+        if let Err(error) = result {
+            if invocation.attempt_count < ASYNC_INVOCATION_MAX_ATTEMPTS {
+                let retry_after_seconds = i64::from(invocation.attempt_count) * 5;
+                let _ = self
+                    .registry
+                    .defer_async_invocation(
+                        &invocation.receipt_id,
+                        error.to_string(),
+                        retry_after_seconds,
+                    )
+                    .await;
+            } else {
+                let _ = self
+                    .record_failed_invocation(&invocation.receipt_id, error.to_string())
+                    .await;
+            }
+        }
+    }
+
     async fn prepare_invocation(
         &self,
         agent_id: &str,
         request: &InvokeAgentRequest,
+    ) -> Result<PreparedInvocation, GatewayError> {
+        self.prepare_invocation_inner(agent_id, request, true).await
+    }
+
+    async fn prepare_invocation_for_claim(
+        &self,
+        agent_id: &str,
+        request: &InvokeAgentRequest,
+    ) -> Result<PreparedInvocation, GatewayError> {
+        self.prepare_invocation_inner(agent_id, request, false)
+            .await
+    }
+
+    async fn prepare_invocation_inner(
+        &self,
+        agent_id: &str,
+        request: &InvokeAgentRequest,
+        enforce_replay: bool,
     ) -> Result<PreparedInvocation, GatewayError> {
         let record = self
             .registry
@@ -346,7 +420,14 @@ impl GatewayService {
         let normalized_settlement = normalize_settlement_request(request.settlement.as_ref())?;
         let request_digest = invocation_request_digest(request, normalized_settlement.as_ref())?;
         let envelope_security = verify_agent_envelope_signature(request)?;
-        self.enforce_invocation_replay_protection(request, &envelope_security)?;
+        if enforce_replay {
+            self.enforce_invocation_replay_protection(request, &envelope_security)?;
+        } else {
+            validate_signed_invocation_message_matches_request(
+                request,
+                &envelope_security.signed_message,
+            )?;
+        }
         let auth_token = self
             .resolve_agent_auth_context(&record, request.auth_context_id)
             .await?
@@ -376,7 +457,7 @@ impl GatewayService {
         agent_id: &str,
         mut request: InvokeAgentRequest,
         prepared: PreparedInvocation,
-        receipt_id: Uuid,
+        receipt_id: String,
         started_at: DateTime<Utc>,
         invoke_mode: InvocationMode,
     ) -> Result<InvokeAgentResponse, GatewayError> {
@@ -403,20 +484,45 @@ impl GatewayService {
             prepared.envelope_security.nonce.as_deref(),
             &response,
         )?;
-        let completed_at = Utc::now();
+        let customized_agent =
+            prepared.record.deployment.execution_mode == AgentExecutionMode::CustomizedAgent;
+        let receipt_id = if customized_agent {
+            response
+                .pointer("/result/task/id")
+                .or_else(|| response.pointer("/result/id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or(receipt_id)
+        } else {
+            receipt_id
+        };
+        let customized_status =
+            customized_agent.then(|| receipt_status_from_task_response(&response));
+        let receipt_status = customized_status.unwrap_or(ReceiptStatus::Succeeded);
+        let effective_invoke_mode =
+            if customized_agent && request.return_immediately.unwrap_or(false) {
+                InvocationMode::Async
+            } else {
+                invoke_mode
+            };
+        let completed_at = (receipt_status != ReceiptStatus::Running).then(Utc::now);
         let receipt_output = stored_invocation_output(&response);
 
         let mut execution_receipt = ExecutionReceipt {
-            receipt_id,
+            receipt_id: receipt_id.clone(),
             agent_id: prepared.record.agent_id.clone(),
             provider_id: prepared.record.provider_id.clone(),
             caller_agent_id: prepared.caller_context.caller_agent_id.clone(),
             caller_public_id: prepared.caller_context.caller_public_id.clone(),
             caller_display_name: prepared.caller_context.caller_display_name.clone(),
             caller_node_id: prepared.caller_context.caller_node_id.clone(),
-            invoke_mode,
-            status: ReceiptStatus::Succeeded,
-            verification: verification_for_risk(&prepared.record.review.risk_level),
+            invoke_mode: effective_invoke_mode,
+            status: receipt_status.clone(),
+            verification: if receipt_status == ReceiptStatus::Running {
+                VerificationVerdict::NotRequired
+            } else {
+                verification_for_risk(&prepared.record.review.risk_level)
+            },
             request_digest: prepared.request_digest.clone(),
             result_digest: receipt_output
                 .as_ref()
@@ -428,7 +534,7 @@ impl GatewayService {
             receipt_signed_at_ms: None,
             receipt_signature: None,
             started_at,
-            completed_at: Some(completed_at),
+            completed_at,
             cost_units: prepared.cost_units,
         };
         self.attach_receipt_security(&mut execution_receipt, &prepared)?;
@@ -444,7 +550,7 @@ impl GatewayService {
             .map_err(map_registry_error)?;
         Ok(build_invoke_agent_response(
             agent_id,
-            Some(stored.receipt.receipt_id),
+            Some(stored.receipt.receipt_id.clone()),
             prepared.normalized_settlement,
             response,
             Some(service_signature),
@@ -559,7 +665,7 @@ impl GatewayService {
 
     async fn record_failed_invocation(
         &self,
-        receipt_id: Uuid,
+        receipt_id: &str,
         error: String,
     ) -> Result<(), GatewayError> {
         let mut stored = self
@@ -582,6 +688,46 @@ impl GatewayService {
         }
         self.sign_receipt(&mut stored.receipt)?;
         stored.stderr = Some(error);
+        self.registry
+            .record_receipt(&stored)
+            .await
+            .map_err(map_registry_error)?;
+        Ok(())
+    }
+
+    async fn track_customized_task_response(
+        &self,
+        task_id: &str,
+        response: &Value,
+    ) -> Result<(), GatewayError> {
+        let mut stored = match self.registry.get_receipt(task_id).await {
+            Ok(stored) => stored,
+            Err(RegistryError::ReceiptNotFound(_)) => return Ok(()),
+            Err(error) => return Err(map_registry_error(error)),
+        };
+        let status = receipt_status_from_task_response(response);
+        stored.receipt.status = status.clone();
+        stored.receipt.completed_at = (status != ReceiptStatus::Running).then(Utc::now);
+        stored.output = stored_invocation_output(response);
+        stored.receipt.result_digest = stored
+            .output
+            .as_ref()
+            .map(digest_value)
+            .transpose()
+            .map_err(|error| GatewayError::Execution(error.to_string()))?;
+        if let Some(attestation) = stored
+            .receipt
+            .invocation_attestation
+            .as_mut()
+            .and_then(Value::as_object_mut)
+        {
+            attestation.insert("status".to_owned(), serde_json::json!(status));
+            attestation.insert(
+                "result_digest".to_owned(),
+                serde_json::json!(stored.receipt.result_digest),
+            );
+        }
+        self.sign_receipt(&mut stored.receipt)?;
         self.registry
             .record_receipt(&stored)
             .await
@@ -1124,7 +1270,7 @@ fn receipt_signature_payload(receipt: &ExecutionReceipt) -> Result<Value, Gatewa
 
 fn build_invoke_agent_response(
     agent_id: &str,
-    receipt_id: Option<Uuid>,
+    receipt_id: Option<String>,
     settlement: Option<NormalizedSettlementRequest>,
     response: Value,
     service_signature: Option<ServiceAgentSignature>,
@@ -1163,6 +1309,20 @@ fn build_invoke_agent_response(
         output,
         service_signature,
         raw: response,
+    }
+}
+
+fn receipt_status_from_task_response(response: &Value) -> ReceiptStatus {
+    let state = response
+        .pointer("/result/task/status/state")
+        .or_else(|| response.pointer("/result/status/state"))
+        .and_then(Value::as_str)
+        .unwrap_or("TASK_STATE_UNKNOWN");
+    match state {
+        "TASK_STATE_COMPLETED" => ReceiptStatus::Succeeded,
+        "TASK_STATE_FAILED" => ReceiptStatus::Failed,
+        "TASK_STATE_CANCELED" | "TASK_STATE_REJECTED" => ReceiptStatus::Rejected,
+        _ => ReceiptStatus::Running,
     }
 }
 
@@ -1931,6 +2091,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn customized_agent_async_task_uses_task_id_as_receipt_id() {
+        let (registry, gateway) = approved_gateway().await;
+        let invoke = with_signed_agent_envelope(
+            InvokeAgentRequest {
+                message: Some("Create payment link".to_owned()),
+                input: serde_json::json!({"amount": 42}),
+                region: Some("AU".to_owned()),
+                confirm_risky: true,
+                task_id: None,
+                context_id: None,
+                skill_id: None,
+                return_immediately: Some(true),
+                settlement: None,
+                auth_token: Some("secret-token".to_owned()),
+                auth_context_id: None,
+                max_cost_units: Some(10),
+                agent_envelope: None,
+            },
+            "nonce-customized-async",
+        );
+        let invoked = gateway
+            .invoke_agent("stripe-agent", invoke)
+            .await
+            .expect("customized async invoke should succeed");
+        assert_eq!(invoked.task_id.as_deref(), Some("task-1"));
+        assert_eq!(invoked.receipt_id.as_deref(), Some("task-1"));
+
+        let running = registry
+            .get_receipt("task-1")
+            .await
+            .expect("task receipt should exist");
+        assert_eq!(running.receipt.invoke_mode, InvocationMode::Async);
+        assert_eq!(running.receipt.status, ReceiptStatus::Running);
+
+        let mut get = watt_servicenet_protocol::GetAgentTaskRequest {
+            history_length: Some(3),
+            auth_token: Some("secret-token".to_owned()),
+            auth_context_id: None,
+            agent_envelope: None,
+        };
+        get.agent_envelope = Some(signed_agent_envelope_for_sparse_message(
+            watt_servicenet_protocol::get_agent_task_envelope_message("task-1", &get),
+            "nonce-customized-get",
+        ));
+        let completed = gateway
+            .get_agent_task("stripe-agent", "task-1", get)
+            .await
+            .expect("customized task polling should succeed");
+        assert_eq!(completed.receipt_id.as_deref(), Some("task-1"));
+
+        let stored = registry
+            .get_receipt("task-1")
+            .await
+            .expect("task receipt should remain queryable");
+        assert_eq!(stored.receipt.status, ReceiptStatus::Succeeded);
+        assert!(stored.receipt.completed_at.is_some());
+    }
+
+    #[tokio::test]
     async fn list_and_cancel_customized_agent_tasks_verify_signed_a2a_responses() {
         let (_registry, gateway) = approved_gateway().await;
         let mut list_request = watt_servicenet_protocol::ListAgentTasksRequest {
@@ -2248,7 +2467,12 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_agent_async_returns_receipt_and_records_result() {
-        let (registry, gateway) = approved_gateway().await;
+        let (registry, gateway) = approved_gateway_with_modes(
+            start_mock_a2a_server().await,
+            watt_servicenet_protocol::AgentExecutionMode::WattetheriaRuntime,
+            AgentConnectionMode::ServicenetRelay,
+        )
+        .await;
         let request = with_signed_agent_envelope(
             InvokeAgentRequest {
                 task_id: None,
@@ -2275,7 +2499,7 @@ mod tests {
         let receipt_id = response.receipt_id.expect("receipt id should be returned");
 
         let mut stored = registry
-            .get_receipt(receipt_id)
+            .get_receipt(&receipt_id)
             .await
             .expect("running receipt should exist");
         assert_eq!(stored.receipt.invoke_mode, InvocationMode::Async);
@@ -2285,7 +2509,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             stored = registry
-                .get_receipt(receipt_id)
+                .get_receipt(&receipt_id)
                 .await
                 .expect("receipt should remain queryable");
         }

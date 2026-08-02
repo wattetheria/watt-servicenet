@@ -8,8 +8,8 @@ use uuid::Uuid;
 use watt_servicenet_protocol::{
     AgentArtifacts, AgentAttestations, AgentDeployment, AgentDeploymentEndpoint,
     AgentInteractionProtocol, AgentReviewProfile, ApproveAgentSubmissionRequest, ExecutionReceipt,
-    InvocationMode, ReceiptQuery, ReceiptStatus, RegisterProviderRequest, RiskLevel,
-    RotateProviderKeyRequest, StoredReceipt, SubmitAgentRequest, VerificationVerdict,
+    InvocationMode, InvokeAgentRequest, ReceiptQuery, ReceiptStatus, RegisterProviderRequest,
+    RiskLevel, RotateProviderKeyRequest, StoredReceipt, SubmitAgentRequest, VerificationVerdict,
     build_agent_attestation_payload,
 };
 use watt_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
@@ -115,7 +115,7 @@ fn agent_submission() -> SubmitAgentRequest {
 fn stored_receipt() -> StoredReceipt {
     StoredReceipt {
         receipt: ExecutionReceipt {
-            receipt_id: Uuid::new_v4(),
+            receipt_id: Uuid::new_v4().to_string(),
             agent_id: "stripe-agent".to_owned(),
             provider_id: "provider-pg".to_owned(),
             caller_agent_id: Some("did:key:zCallerPg".to_owned()),
@@ -381,7 +381,7 @@ async fn postgres_store_persists_agent_receipts_and_health() {
     let invoke_mode: String = sqlx::query_scalar(&format!(
         r#"SELECT invoke_mode FROM "{schema}"."receipts" WHERE receipt_id = $1"#
     ))
-    .bind(receipts[0].receipt.receipt_id)
+    .bind(&receipts[0].receipt.receipt_id)
     .fetch_one(&pool)
     .await
     .expect("receipt invoke mode column should be queryable");
@@ -406,4 +406,181 @@ async fn postgres_store_persists_agent_receipts_and_health() {
         agent_health[0].status,
         watt_servicenet_protocol::HealthStatus::Online
     );
+}
+
+#[tokio::test]
+async fn postgres_migration_preserves_legacy_uuid_receipts_as_text_ids() {
+    let Some(database_url) = database_url() else {
+        eprintln!("skipping postgres integration test; SERVICENET_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let schema = schema_name("registry_receipt_migration");
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("postgres pool should connect");
+    sqlx::query(&format!(r#"CREATE SCHEMA "{schema}""#))
+        .execute(&pool)
+        .await
+        .expect("legacy schema should create");
+    sqlx::query(&format!(
+        r#"CREATE TABLE "{schema}"."receipts" (
+            receipt_id UUID PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            invoke_mode TEXT NOT NULL DEFAULT 'sync',
+            caller_agent_id TEXT NULL,
+            caller_public_id TEXT NULL,
+            caller_display_name TEXT NULL,
+            caller_node_id TEXT NULL,
+            verification TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            stored_json JSONB NOT NULL
+        )"#
+    ))
+    .execute(&pool)
+    .await
+    .expect("legacy receipts table should create");
+    sqlx::query(&format!(
+        r#"CREATE TABLE "{schema}"."verifications" (
+            receipt_id UUID PRIMARY KEY,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            record_json JSONB NOT NULL
+        )"#
+    ))
+    .execute(&pool)
+    .await
+    .expect("legacy verifications table should create");
+
+    let stored = stored_receipt();
+    let legacy_id = Uuid::parse_str(&stored.receipt.receipt_id).expect("receipt id should be UUID");
+    sqlx::query(&format!(
+        r#"INSERT INTO "{schema}"."receipts"
+           (receipt_id, agent_id, provider_id, invoke_mode, verification, stored_json)
+           VALUES ($1, $2, $3, $4, $5, $6)"#
+    ))
+    .bind(legacy_id)
+    .bind(&stored.receipt.agent_id)
+    .bind(&stored.receipt.provider_id)
+    .bind("async")
+    .bind("NotRequired")
+    .bind(serde_json::to_value(&stored).expect("receipt should serialize"))
+    .execute(&pool)
+    .await
+    .expect("legacy receipt should insert");
+
+    let registry = ServiceRegistry::postgres_with_config(
+        &database_url,
+        &schema,
+        ServiceRegistryConfig::default(),
+    )
+    .await
+    .expect("postgres migration should initialize");
+    let migrated = registry
+        .get_receipt(&stored.receipt.receipt_id)
+        .await
+        .expect("legacy receipt should remain queryable");
+    assert_eq!(migrated.receipt.receipt_id, stored.receipt.receipt_id);
+
+    let column_types = sqlx::query(
+        r#"SELECT table_name, data_type
+           FROM information_schema.columns
+           WHERE table_schema = $1
+             AND table_name IN ('receipts', 'verifications')
+             AND column_name = 'receipt_id'
+           ORDER BY table_name"#,
+    )
+    .bind(&schema)
+    .fetch_all(&pool)
+    .await
+    .expect("migrated receipt columns should be queryable");
+    assert_eq!(column_types.len(), 2);
+    assert!(
+        column_types
+            .iter()
+            .all(|row| row.get::<String, _>("data_type") == "text")
+    );
+}
+
+#[tokio::test]
+async fn postgres_async_receipt_is_claimed_once_across_workers() {
+    let Some(database_url) = database_url() else {
+        eprintln!("skipping postgres integration test; SERVICENET_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let schema = schema_name("registry_async_claim");
+    let config = ServiceRegistryConfig {
+        secret_broker_key: Some(STANDARD.encode([8u8; 32])),
+        ..Default::default()
+    };
+    let registry_a = ServiceRegistry::postgres_with_config(&database_url, &schema, config.clone())
+        .await
+        .expect("first postgres registry should initialize");
+    registry_a
+        .register_provider(provider_request())
+        .await
+        .expect("provider should register");
+    registry_a
+        .submit_agent(agent_submission())
+        .await
+        .expect("agent should publish");
+
+    let mut stored = stored_receipt();
+    stored.receipt.status = ReceiptStatus::Running;
+    stored.receipt.completed_at = None;
+    stored.output = None;
+    let request = InvokeAgentRequest {
+        task_id: None,
+        context_id: None,
+        message: Some("run once".to_owned()),
+        input: json!({"amount": 7}),
+        skill_id: None,
+        return_immediately: None,
+        settlement: None,
+        auth_token: Some("postgres-private-token".to_owned()),
+        auth_context_id: None,
+        region: Some("AU".to_owned()),
+        confirm_risky: true,
+        max_cost_units: Some(7),
+        agent_envelope: Some(json!({"signed": true})),
+    };
+    registry_a
+        .enqueue_async_invocation(&stored, &request)
+        .await
+        .expect("async receipt should enqueue");
+    let registry_b = ServiceRegistry::postgres_with_config(&database_url, &schema, config)
+        .await
+        .expect("second postgres registry should initialize");
+
+    let (claim_a, claim_b) = tokio::join!(
+        registry_a.claim_async_invocations("worker-a", 60, 1),
+        registry_b.claim_async_invocations("worker-b", 60, 1),
+    );
+    let claim_a = claim_a.expect("worker a claim should succeed");
+    let claim_b = claim_b.expect("worker b claim should succeed");
+    assert_eq!(claim_a.len() + claim_b.len(), 1);
+    let claimed = claim_a
+        .first()
+        .or_else(|| claim_b.first())
+        .expect("one claim");
+    assert_eq!(claimed.receipt_id, stored.receipt.receipt_id);
+    assert_eq!(claimed.request, request);
+    assert_eq!(claimed.attempt_count, 1);
+
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("postgres pool should connect");
+    let row = sqlx::query(&format!(
+        r#"SELECT request_secret_json, lease_owner, attempt_count
+           FROM "{schema}"."receipts" WHERE receipt_id = $1"#
+    ))
+    .bind(&stored.receipt.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .expect("claimed receipt should load");
+    let encrypted: serde_json::Value = row.get("request_secret_json");
+    assert!(!encrypted.to_string().contains("postgres-private-token"));
+    assert!(row.get::<Option<String>, _>("lease_owner").is_some());
+    assert_eq!(row.get::<i32, _>("attempt_count"), 1);
 }

@@ -54,6 +54,7 @@ impl GatewayService {
             )
             .await?;
         self.verified_task_response(agent_id, prepared, response)
+            .await
     }
 
     async fn get_legacy_runtime_task(
@@ -130,6 +131,7 @@ impl GatewayService {
             )
             .await?;
         self.verified_task_response(agent_id, prepared, response)
+            .await
     }
 
     pub async fn cancel_agent_task(
@@ -163,6 +165,7 @@ impl GatewayService {
             )
             .await?;
         self.verified_task_response(agent_id, prepared, response)
+            .await
     }
 
     pub async fn subscribe_agent_task(
@@ -203,10 +206,13 @@ impl GatewayService {
                 event,
             )?;
         }
+        if let Some(event) = events.last() {
+            self.track_customized_task_response(task_id, event).await?;
+        }
         Ok(InvokeAgentResponse {
             agent_id: agent_id.to_owned(),
             status: "subscribed".to_owned(),
-            receipt_id: None,
+            receipt_id: Some(task_id.to_owned()),
             task_id: Some(task_id.to_owned()),
             context_id: None,
             message: None,
@@ -269,7 +275,7 @@ impl GatewayService {
         })
     }
 
-    fn verified_task_response(
+    async fn verified_task_response(
         &self,
         agent_id: &str,
         prepared: PreparedTaskOperation,
@@ -281,12 +287,13 @@ impl GatewayService {
             prepared.security.nonce.as_deref(),
             &response,
         )?;
-        Ok(build_invoke_agent_response(
-            agent_id,
-            None,
-            None,
-            response,
-            Some(service_signature),
-        ))
+        let mut result =
+            build_invoke_agent_response(agent_id, None, None, response, Some(service_signature));
+        if let Some(task_id) = result.task_id.clone() {
+            self.track_customized_task_response(&task_id, &result.raw)
+                .await?;
+            result.receipt_id = Some(task_id);
+        }
+        Ok(result)
     }
 }

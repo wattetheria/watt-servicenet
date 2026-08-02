@@ -90,6 +90,16 @@ nonces are replay-protected. `wattetheria_runtime` keeps the internal invocation
 and receipt flow and is rejected by these A2A Task endpoints. Streaming
 SendMessage and push-notification configuration remain deferred.
 
+Runtime `/invoke-async` work is persisted in the existing local `receipts`
+store before execution. The request payload is encrypted at rest; workers use
+leases, bounded retries, and reclaim unfinished work after a node restart. No
+separate queue table or message broker is required. For a Customized Agent with
+`return_immediately=true`, the remote A2A Task ID is also the receipt ID, and
+GetTask, CancelTask, and SubscribeToTask results update that same receipt.
+Receipts and their worker metadata remain node-local and are not federated over
+P2P; only Provider and published Service Agent records participate in federation
+sync.
+
 ## Run Locally
 
 Run with in-memory state:

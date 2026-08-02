@@ -97,7 +97,7 @@ pub enum VerificationVerdict {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionReceipt {
-    pub receipt_id: Uuid,
+    pub receipt_id: String,
     pub agent_id: String,
     pub provider_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,7 +262,7 @@ pub struct ProviderAuditEvent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VerificationRecord {
-    pub receipt_id: Uuid,
+    pub receipt_id: String,
     pub verifier_id: String,
     pub verdict: VerificationVerdict,
     pub automated: bool,
@@ -807,7 +807,7 @@ pub struct InvokeAgentResponse {
     pub agent_id: String,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub receipt_id: Option<Uuid>,
+    pub receipt_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
