@@ -18,7 +18,7 @@ use watt_servicenet_protocol::{
     ReceiptStatus, RiskLevel, ServiceAgentSignature, SettlementLayer, SettlementRequest,
     StoredReceipt, VerificationVerdict, build_service_agent_get_task_signature_params,
 };
-use watt_servicenet_registry::{RegistryError, ServiceRegistry};
+use watt_servicenet_registry::{InvocationJobKind, RegistryError, ServiceRegistry};
 
 mod protocol_client;
 mod service_identity;
@@ -33,6 +33,7 @@ const INVOCATION_REPLAY_MAX_TTL_MS: u64 = 5 * 60 * 1000;
 const INVOCATION_REPLAY_CACHE_MAX_ENTRIES: usize = 262_144;
 const ASYNC_INVOCATION_LEASE_SECONDS: i64 = 300;
 const ASYNC_INVOCATION_MAX_ATTEMPTS: u32 = 3;
+const CUSTOMIZED_TASK_POLL_INTERVAL_SECONDS: i64 = 1;
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -342,43 +343,72 @@ impl GatewayService {
         &self,
         invocation: watt_servicenet_registry::ClaimedInvocation,
     ) {
-        let result = async {
+        let result: Result<bool, GatewayError> = async {
             let stored = self
                 .registry
                 .get_receipt(&invocation.receipt_id)
                 .await
                 .map_err(map_registry_error)?;
             let agent_id = stored.receipt.agent_id.clone();
-            let prepared = self
-                .prepare_invocation_for_claim(&agent_id, &invocation.request)
-                .await?;
-            self.execute_prepared_invocation(
-                &agent_id,
-                invocation.request.clone(),
-                prepared,
-                invocation.receipt_id.clone(),
-                stored.receipt.started_at,
-                InvocationMode::Async,
-            )
-            .await
+            match invocation.kind {
+                InvocationJobKind::RuntimeInvoke => {
+                    let prepared = self
+                        .prepare_invocation_for_claim(&agent_id, &invocation.request)
+                        .await?;
+                    self.execute_prepared_invocation(
+                        &agent_id,
+                        invocation.request.clone(),
+                        prepared,
+                        invocation.receipt_id.clone(),
+                        stored.receipt.started_at,
+                        InvocationMode::Async,
+                    )
+                    .await?;
+                    Ok(false)
+                }
+                InvocationJobKind::CustomizedTask => {
+                    let response = self
+                        .poll_customized_task(
+                            &agent_id,
+                            &invocation.receipt_id,
+                            &invocation.request,
+                        )
+                        .await?;
+                    Ok(receipt_status_from_task_response(&response.raw) == ReceiptStatus::Running)
+                }
+            }
         }
         .await;
 
-        if let Err(error) = result {
-            if invocation.attempt_count < ASYNC_INVOCATION_MAX_ATTEMPTS {
-                let retry_after_seconds = i64::from(invocation.attempt_count) * 5;
+        match result {
+            Ok(true) => {
                 let _ = self
                     .registry
-                    .defer_async_invocation(
+                    .reschedule_async_invocation(
                         &invocation.receipt_id,
-                        error.to_string(),
-                        retry_after_seconds,
+                        CUSTOMIZED_TASK_POLL_INTERVAL_SECONDS,
+                        None,
+                        true,
                     )
                     .await;
-            } else {
-                let _ = self
-                    .record_failed_invocation(&invocation.receipt_id, error.to_string())
-                    .await;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                if invocation.attempt_count < ASYNC_INVOCATION_MAX_ATTEMPTS {
+                    let retry_after_seconds = i64::from(invocation.attempt_count) * 5;
+                    let _ = self
+                        .registry
+                        .defer_async_invocation(
+                            &invocation.receipt_id,
+                            error.to_string(),
+                            retry_after_seconds,
+                        )
+                        .await;
+                } else {
+                    let _ = self
+                        .record_failed_invocation(&invocation.receipt_id, error.to_string())
+                        .await;
+                }
             }
         }
     }
@@ -505,6 +535,9 @@ impl GatewayService {
             } else {
                 invoke_mode
             };
+        let should_track_customized_task = customized_agent
+            && effective_invoke_mode == InvocationMode::Async
+            && receipt_status == ReceiptStatus::Running;
         let completed_at = (receipt_status != ReceiptStatus::Running).then(Utc::now);
         let receipt_output = stored_invocation_output(&response);
 
@@ -543,11 +576,17 @@ impl GatewayService {
             output: receipt_output,
             stderr: None,
         };
-        let stored = self
-            .registry
-            .record_receipt(&receipt)
-            .await
-            .map_err(map_registry_error)?;
+        let stored = if should_track_customized_task {
+            self.registry
+                .enqueue_customized_task(&receipt, &request)
+                .await
+                .map_err(map_registry_error)?
+        } else {
+            self.registry
+                .record_receipt(&receipt)
+                .await
+                .map_err(map_registry_error)?
+        };
         Ok(build_invoke_agent_response(
             agent_id,
             Some(stored.receipt.receipt_id.clone()),
@@ -2124,29 +2163,36 @@ mod tests {
             .expect("task receipt should exist");
         assert_eq!(running.receipt.invoke_mode, InvocationMode::Async);
         assert_eq!(running.receipt.status, ReceiptStatus::Running);
-
-        let mut get = watt_servicenet_protocol::GetAgentTaskRequest {
-            history_length: Some(3),
-            auth_token: Some("secret-token".to_owned()),
-            auth_context_id: None,
-            agent_envelope: None,
-        };
-        get.agent_envelope = Some(signed_agent_envelope_for_sparse_message(
-            watt_servicenet_protocol::get_agent_task_envelope_message("task-1", &get),
-            "nonce-customized-get",
-        ));
-        let completed = gateway
-            .get_agent_task("stripe-agent", "task-1", get)
-            .await
-            .expect("customized task polling should succeed");
-        assert_eq!(completed.receipt_id.as_deref(), Some("task-1"));
-
-        let stored = registry
-            .get_receipt("task-1")
-            .await
-            .expect("task receipt should remain queryable");
+        assert_eq!(
+            gateway
+                .process_pending_invocations("customized-task-worker", 1)
+                .await
+                .expect("customized task should be claimed"),
+            1
+        );
+        let stored = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let stored = registry
+                    .get_receipt("task-1")
+                    .await
+                    .expect("task receipt should remain queryable");
+                if stored.receipt.status != ReceiptStatus::Running {
+                    break stored;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("customized task should complete automatically");
         assert_eq!(stored.receipt.status, ReceiptStatus::Succeeded);
         assert!(stored.receipt.completed_at.is_some());
+        assert!(
+            registry
+                .claim_async_invocations("terminal-check", 60, 1)
+                .await
+                .expect("terminal task job should be removed")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

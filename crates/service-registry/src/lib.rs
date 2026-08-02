@@ -140,6 +140,8 @@ pub struct EncryptedSecretEnvelope {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredInvocationJob {
     pub receipt_id: String,
+    #[serde(default)]
+    pub kind: InvocationJobKind,
     pub request_secret: EncryptedSecretEnvelope,
     pub available_at: DateTime<Utc>,
     pub lease_owner: Option<String>,
@@ -148,9 +150,18 @@ pub struct StoredInvocationJob {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationJobKind {
+    #[default]
+    RuntimeInvoke,
+    CustomizedTask,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClaimedInvocation {
     pub receipt_id: String,
+    pub kind: InvocationJobKind,
     pub request: InvokeAgentRequest,
     pub attempt_count: u32,
 }
@@ -420,6 +431,7 @@ impl PostgresRegistryStore {
                     caller_node_id TEXT NULL,
                     status TEXT NOT NULL DEFAULT 'running',
                     verification TEXT NOT NULL,
+                    job_kind TEXT NULL,
                     request_secret_json JSONB NULL,
                     available_at TIMESTAMPTZ NULL,
                     lease_owner TEXT NULL,
@@ -453,6 +465,9 @@ impl PostgresRegistryStore {
                 r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'running'"#
             ),
             format!(
+                r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS job_kind TEXT NULL"#
+            ),
+            format!(
                 r#"ALTER TABLE "{schema}"."receipts" ADD COLUMN IF NOT EXISTS request_secret_json JSONB NULL"#
             ),
             format!(
@@ -474,6 +489,11 @@ impl PostgresRegistryStore {
                 r#"UPDATE "{schema}"."receipts"
                    SET status = COALESCE(stored_json#>>'{{receipt,status}}', status)
                    WHERE status IS DISTINCT FROM COALESCE(stored_json#>>'{{receipt,status}}', status)"#
+            ),
+            format!(
+                r#"UPDATE "{schema}"."receipts"
+                   SET job_kind = 'runtime_invoke'
+                   WHERE request_secret_json IS NOT NULL AND job_kind IS NULL"#
             ),
             format!(
                 r#"CREATE INDEX IF NOT EXISTS "receipts_agent_caller_idx" ON "{schema}"."receipts" (agent_id, caller_agent_id)"#
@@ -775,7 +795,7 @@ impl RegistryStore for PostgresRegistryStore {
         }
 
         for row in sqlx::query(&format!(
-            r#"SELECT receipt_id, stored_json, request_secret_json, available_at, lease_owner, lease_expires_at, attempt_count, last_error FROM "{}"."receipts""#,
+            r#"SELECT receipt_id, stored_json, job_kind, request_secret_json, available_at, lease_owner, lease_expires_at, attempt_count, last_error FROM "{}"."receipts""#,
             self.schema
         ))
         .fetch_all(&self.pool)
@@ -791,6 +811,9 @@ impl RegistryStore for PostgresRegistryStore {
                     receipt_id.clone(),
                     StoredInvocationJob {
                         receipt_id,
+                        kind: invocation_job_kind_from_column(
+                            row.try_get::<Option<String>, _>("job_kind")?.as_deref(),
+                        ),
                         request_secret: serde_json::from_value(request_secret_json)?,
                         available_at: row
                             .try_get::<Option<DateTime<Utc>>, _>("available_at")?
@@ -1550,7 +1573,7 @@ impl RegistryStore for PostgresRegistryStore {
                    updated_at = $1
                FROM candidates
                WHERE receipt.receipt_id = candidates.receipt_id
-               RETURNING receipt.receipt_id, receipt.request_secret_json,
+               RETURNING receipt.receipt_id, receipt.job_kind, receipt.request_secret_json,
                          receipt.available_at, receipt.lease_owner,
                          receipt.lease_expires_at, receipt.attempt_count,
                          receipt.last_error"#,
@@ -1567,6 +1590,9 @@ impl RegistryStore for PostgresRegistryStore {
             .map(|row| {
                 Ok(StoredInvocationJob {
                     receipt_id: row.try_get("receipt_id")?,
+                    kind: invocation_job_kind_from_column(
+                        row.try_get::<Option<String>, _>("job_kind")?.as_deref(),
+                    ),
                     request_secret: serde_json::from_value(row.try_get("request_secret_json")?)?,
                     available_at: row.try_get("available_at")?,
                     lease_owner: row.try_get("lease_owner")?,
@@ -1588,8 +1614,8 @@ async fn upsert_receipt(
 ) -> Result<()> {
     let (created_at, updated_at) = receipt_timestamps(stored);
     sqlx::query(&format!(
-        r#"INSERT INTO "{schema}"."receipts" (receipt_id, agent_id, provider_id, invoke_mode, caller_agent_id, caller_public_id, caller_display_name, caller_node_id, status, verification, request_secret_json, available_at, lease_owner, lease_expires_at, attempt_count, last_error, created_at, updated_at, stored_json)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        r#"INSERT INTO "{schema}"."receipts" (receipt_id, agent_id, provider_id, invoke_mode, caller_agent_id, caller_public_id, caller_display_name, caller_node_id, status, verification, job_kind, request_secret_json, available_at, lease_owner, lease_expires_at, attempt_count, last_error, created_at, updated_at, stored_json)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
            ON CONFLICT (receipt_id) DO UPDATE SET
              agent_id = EXCLUDED.agent_id,
              provider_id = EXCLUDED.provider_id,
@@ -1600,6 +1626,7 @@ async fn upsert_receipt(
              caller_node_id = EXCLUDED.caller_node_id,
              status = EXCLUDED.status,
              verification = EXCLUDED.verification,
+             job_kind = EXCLUDED.job_kind,
              request_secret_json = EXCLUDED.request_secret_json,
              available_at = EXCLUDED.available_at,
              lease_owner = EXCLUDED.lease_owner,
@@ -1619,6 +1646,7 @@ async fn upsert_receipt(
     .bind(&stored.receipt.caller_node_id)
     .bind(receipt_status_column(&stored.receipt.status))
     .bind(format!("{:?}", stored.receipt.verification))
+    .bind(job.map(|job| invocation_job_kind_column(job.kind)))
     .bind(
         job.map(|job| serde_json::to_value(&job.request_secret))
             .transpose()?,
@@ -1655,6 +1683,20 @@ fn invocation_mode_column(mode: &InvocationMode) -> &'static str {
     match mode {
         InvocationMode::Sync => "sync",
         InvocationMode::Async => "async",
+    }
+}
+
+fn invocation_job_kind_column(kind: InvocationJobKind) -> &'static str {
+    match kind {
+        InvocationJobKind::RuntimeInvoke => "runtime_invoke",
+        InvocationJobKind::CustomizedTask => "customized_task",
+    }
+}
+
+fn invocation_job_kind_from_column(value: Option<&str>) -> InvocationJobKind {
+    match value {
+        Some("customized_task") => InvocationJobKind::CustomizedTask,
+        _ => InvocationJobKind::RuntimeInvoke,
     }
 }
 
@@ -2140,6 +2182,25 @@ impl ServiceRegistry {
         stored: &StoredReceipt,
         request: &InvokeAgentRequest,
     ) -> Result<StoredReceipt, RegistryError> {
+        self.enqueue_invocation_job(stored, request, InvocationJobKind::RuntimeInvoke)
+            .await
+    }
+
+    pub async fn enqueue_customized_task(
+        &self,
+        stored: &StoredReceipt,
+        request: &InvokeAgentRequest,
+    ) -> Result<StoredReceipt, RegistryError> {
+        self.enqueue_invocation_job(stored, request, InvocationJobKind::CustomizedTask)
+            .await
+    }
+
+    async fn enqueue_invocation_job(
+        &self,
+        stored: &StoredReceipt,
+        request: &InvokeAgentRequest,
+        kind: InvocationJobKind,
+    ) -> Result<StoredReceipt, RegistryError> {
         let _guard = self.receipt_mutation_lock.lock().await;
         let mut state = self.load_state().await?;
         if !state
@@ -2154,6 +2215,7 @@ impl ServiceRegistry {
             .map_err(|error| RegistryError::Storage(error.to_string()))?;
         let job = StoredInvocationJob {
             receipt_id: stored.receipt.receipt_id.clone(),
+            kind,
             request_secret: self.secret_broker.seal(&request_json)?,
             available_at: Utc::now(),
             lease_owner: None,
@@ -2199,6 +2261,7 @@ impl ServiceRegistry {
                     .map_err(|error| RegistryError::Storage(error.to_string()))?;
                 Ok(ClaimedInvocation {
                     receipt_id: job.receipt_id,
+                    kind: job.kind,
                     request,
                     attempt_count: job.attempt_count,
                 })
@@ -2212,6 +2275,17 @@ impl ServiceRegistry {
         error: String,
         retry_after_seconds: i64,
     ) -> Result<(), RegistryError> {
+        self.reschedule_async_invocation(receipt_id, retry_after_seconds, Some(error), false)
+            .await
+    }
+
+    pub async fn reschedule_async_invocation(
+        &self,
+        receipt_id: &str,
+        retry_after_seconds: i64,
+        error: Option<String>,
+        reset_attempts: bool,
+    ) -> Result<(), RegistryError> {
         let _guard = self.receipt_mutation_lock.lock().await;
         let mut state = self.load_state().await?;
         let job = state
@@ -2221,7 +2295,10 @@ impl ServiceRegistry {
         job.available_at = Utc::now() + chrono::Duration::seconds(retry_after_seconds.max(1));
         job.lease_owner = None;
         job.lease_expires_at = None;
-        job.last_error = Some(error);
+        job.last_error = error;
+        if reset_attempts {
+            job.attempt_count = 0;
+        }
         self.store
             .save_receipt_state(&state, receipt_id)
             .await
@@ -5308,6 +5385,7 @@ mod tests {
             .await
             .expect("first worker should claim");
         assert_eq!(first.len(), 1);
+        assert_eq!(first[0].kind, InvocationJobKind::RuntimeInvoke);
         assert_eq!(first[0].attempt_count, 1);
         assert_eq!(first[0].request, request);
         assert!(
@@ -5319,12 +5397,34 @@ mod tests {
         );
 
         registry
+            .reschedule_async_invocation(&stored.receipt.receipt_id, 1, None, true)
+            .await
+            .expect("nonterminal task should be rescheduled");
+        let rescheduled = registry
+            .load_state()
+            .await
+            .expect("state should load")
+            .receipt_jobs
+            .remove(&stored.receipt.receipt_id)
+            .expect("rescheduled job should remain persisted");
+        assert_eq!(rescheduled.attempt_count, 0);
+        assert!(rescheduled.lease_owner.is_none());
+        assert!(rescheduled.lease_expires_at.is_none());
+        assert!(rescheduled.last_error.is_none());
+        tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
+        let next_poll = registry
+            .claim_async_invocations("worker-b", 60, 1)
+            .await
+            .expect("rescheduled poll should claim");
+        assert_eq!(next_poll[0].attempt_count, 1);
+
+        registry
             .defer_async_invocation(&stored.receipt.receipt_id, "temporary".to_owned(), 1)
             .await
             .expect("job should defer");
         tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
         let retried = registry
-            .claim_async_invocations("worker-b", 60, 1)
+            .claim_async_invocations("worker-a", 60, 1)
             .await
             .expect("retry should claim");
         assert_eq!(retried[0].attempt_count, 2);
@@ -5383,9 +5483,9 @@ mod tests {
             agent_envelope: None,
         };
         registry
-            .enqueue_async_invocation(&stored, &request)
+            .enqueue_customized_task(&stored, &request)
             .await
-            .expect("async receipt should enqueue");
+            .expect("customized task should enqueue");
         drop(registry);
 
         let restarted = ServiceRegistry::json_file_with_config(&path, config);
@@ -5395,6 +5495,7 @@ mod tests {
             .expect("restarted registry should decrypt and claim");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].receipt_id, stored.receipt.receipt_id);
+        assert_eq!(claimed[0].kind, InvocationJobKind::CustomizedTask);
         assert_eq!(claimed[0].request, request);
     }
 

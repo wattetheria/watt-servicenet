@@ -12,7 +12,7 @@ use watt_servicenet_protocol::{
     RiskLevel, RotateProviderKeyRequest, StoredReceipt, SubmitAgentRequest, VerificationVerdict,
     build_agent_attestation_payload,
 };
-use watt_servicenet_registry::{ServiceRegistry, ServiceRegistryConfig};
+use watt_servicenet_registry::{InvocationJobKind, ServiceRegistry, ServiceRegistryConfig};
 
 fn database_url() -> Option<String> {
     std::env::var("SERVICENET_TEST_DATABASE_URL").ok()
@@ -433,6 +433,7 @@ async fn postgres_migration_preserves_legacy_uuid_receipts_as_text_ids() {
             caller_display_name TEXT NULL,
             caller_node_id TEXT NULL,
             verification TEXT NOT NULL,
+            request_secret_json JSONB NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             stored_json JSONB NOT NULL
@@ -457,14 +458,16 @@ async fn postgres_migration_preserves_legacy_uuid_receipts_as_text_ids() {
     let legacy_id = Uuid::parse_str(&stored.receipt.receipt_id).expect("receipt id should be UUID");
     sqlx::query(&format!(
         r#"INSERT INTO "{schema}"."receipts"
-           (receipt_id, agent_id, provider_id, invoke_mode, verification, stored_json)
-           VALUES ($1, $2, $3, $4, $5, $6)"#
+           (receipt_id, agent_id, provider_id, invoke_mode, verification,
+            request_secret_json, stored_json)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)"#
     ))
     .bind(legacy_id)
     .bind(&stored.receipt.agent_id)
     .bind(&stored.receipt.provider_id)
     .bind("async")
     .bind("NotRequired")
+    .bind(json!({"nonce": "legacy", "ciphertext": "legacy"}))
     .bind(serde_json::to_value(&stored).expect("receipt should serialize"))
     .execute(&pool)
     .await
@@ -501,6 +504,14 @@ async fn postgres_migration_preserves_legacy_uuid_receipts_as_text_ids() {
             .iter()
             .all(|row| row.get::<String, _>("data_type") == "text")
     );
+    let job_kind: String = sqlx::query_scalar(&format!(
+        r#"SELECT job_kind FROM "{schema}"."receipts" WHERE receipt_id = $1"#
+    ))
+    .bind(&stored.receipt.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy async job kind should be backfilled");
+    assert_eq!(job_kind, "runtime_invoke");
 }
 
 #[tokio::test]
@@ -546,9 +557,9 @@ async fn postgres_async_receipt_is_claimed_once_across_workers() {
         agent_envelope: Some(json!({"signed": true})),
     };
     registry_a
-        .enqueue_async_invocation(&stored, &request)
+        .enqueue_customized_task(&stored, &request)
         .await
-        .expect("async receipt should enqueue");
+        .expect("customized task should enqueue");
     let registry_b = ServiceRegistry::postgres_with_config(&database_url, &schema, config)
         .await
         .expect("second postgres registry should initialize");
@@ -565,6 +576,7 @@ async fn postgres_async_receipt_is_claimed_once_across_workers() {
         .or_else(|| claim_b.first())
         .expect("one claim");
     assert_eq!(claimed.receipt_id, stored.receipt.receipt_id);
+    assert_eq!(claimed.kind, InvocationJobKind::CustomizedTask);
     assert_eq!(claimed.request, request);
     assert_eq!(claimed.attempt_count, 1);
 
@@ -572,7 +584,7 @@ async fn postgres_async_receipt_is_claimed_once_across_workers() {
         .await
         .expect("postgres pool should connect");
     let row = sqlx::query(&format!(
-        r#"SELECT request_secret_json, lease_owner, attempt_count
+        r#"SELECT job_kind, request_secret_json, lease_owner, attempt_count
            FROM "{schema}"."receipts" WHERE receipt_id = $1"#
     ))
     .bind(&stored.receipt.receipt_id)
@@ -580,6 +592,7 @@ async fn postgres_async_receipt_is_claimed_once_across_workers() {
     .await
     .expect("claimed receipt should load");
     let encrypted: serde_json::Value = row.get("request_secret_json");
+    assert_eq!(row.get::<String, _>("job_kind"), "customized_task");
     assert!(!encrypted.to_string().contains("postgres-private-token"));
     assert!(row.get::<Option<String>, _>("lease_owner").is_some());
     assert_eq!(row.get::<i32, _>("attempt_count"), 1);

@@ -1,7 +1,8 @@
 use serde_json::{Value, json};
 use watt_servicenet_protocol::{
     AgentConnectionMode, AgentExecutionMode, CancelAgentTaskRequest, GetAgentTaskRequest,
-    InvokeAgentResponse, ListAgentTasksRequest, PublishedAgentRecord, SubscribeAgentTaskRequest,
+    InvokeAgentRequest, InvokeAgentResponse, ListAgentTasksRequest, PublishedAgentRecord,
+    SERVICE_AGENT_GET_TASK_DEFAULT_HISTORY_LENGTH, SubscribeAgentTaskRequest,
     cancel_agent_task_envelope_message, get_agent_task_envelope_message,
     list_agent_tasks_envelope_message, subscribe_agent_task_envelope_message,
 };
@@ -20,6 +21,65 @@ struct PreparedTaskOperation {
 }
 
 impl GatewayService {
+    pub(crate) async fn poll_customized_task(
+        &self,
+        agent_id: &str,
+        task_id: &str,
+        invocation: &InvokeAgentRequest,
+    ) -> Result<InvokeAgentResponse, GatewayError> {
+        let record = self
+            .registry
+            .get_published_agent(agent_id)
+            .await
+            .map_err(map_registry_error)?;
+        if record.deployment.connection_mode != AgentConnectionMode::ServicenetRelay
+            || record.deployment.execution_mode != AgentExecutionMode::CustomizedAgent
+        {
+            return Err(GatewayError::Rejected(
+                "automatic task polling requires a Customized Agent using ServiceNet Relay"
+                    .to_owned(),
+            ));
+        }
+        let auth_token = self
+            .resolve_agent_auth_context(&record, invocation.auth_context_id)
+            .await?
+            .or_else(|| invocation.auth_token.clone());
+        self.enforce_agent_task_access(&record, auth_token.as_deref())
+            .await?;
+        let protocol_client = protocol_client(&record.deployment.endpoint)?;
+        let request = GetAgentTaskRequest {
+            history_length: Some(SERVICE_AGENT_GET_TASK_DEFAULT_HISTORY_LENGTH),
+            ..Default::default()
+        };
+        let params = build_service_agent_get_task_signature_params(task_id, request.history_length);
+        let expected_request_digest = super::jcs_sha256_digest_value(&params)
+            .map_err(|error| GatewayError::Execution(error.to_string()))?;
+        let response = protocol_client
+            .get_task(
+                &record.deployment.endpoint.url,
+                task_id,
+                &request,
+                auth_token.as_deref(),
+            )
+            .await?;
+        let service_signature = self.service_agent_verifier.verify_response(
+            &record,
+            Some(&expected_request_digest),
+            None,
+            &response,
+        )?;
+        let result = build_invoke_agent_response(
+            agent_id,
+            Some(task_id.to_owned()),
+            None,
+            response,
+            Some(service_signature),
+        );
+        self.track_customized_task_response(task_id, &result.raw)
+            .await?;
+        Ok(result)
+    }
+
     pub async fn get_agent_task(
         &self,
         agent_id: &str,

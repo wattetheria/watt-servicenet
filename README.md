@@ -95,7 +95,9 @@ store before execution. The request payload is encrypted at rest; workers use
 leases, bounded retries, and reclaim unfinished work after a node restart. No
 separate queue table or message broker is required. For a Customized Agent with
 `return_immediately=true`, the remote A2A Task ID is also the receipt ID, and
-GetTask, CancelTask, and SubscribeToTask results update that same receipt.
+the same receipt worker automatically polls GetTask until the Task is terminal.
+Nonterminal Tasks are rescheduled without consuming the failure retry budget;
+GetTask, CancelTask, and SubscribeToTask results also update that same receipt.
 Receipts and their worker metadata remain node-local and are not federated over
 P2P; only Provider and published Service Agent records participate in federation
 sync.
