@@ -120,9 +120,9 @@ cargo run -p watt-servicenet-node
 Run with PostgreSQL-backed state:
 
 ```bash
-SERVICENET_DATABASE_URL=postgres://servicenet:servicenet@127.0.0.1:55433/watt_servicenet \
+SERVICENET_DATABASE_URL=postgres://your-db-user:your-db-password@127.0.0.1:55433/watt_servicenet \
 SERVICENET_DATABASE_SCHEMA=public \
-SERVICENET_SECRET_BROKER_KEY=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc= \
+SERVICENET_SECRET_BROKER_KEY=your-base64-encoded-32-byte-key \
 SERVICENET_REQUIRE_PROVIDER_OWNERSHIP_CHALLENGES=1 \
 cargo run -p watt-servicenet-node
 ```
@@ -133,6 +133,8 @@ The HTTP node listens on `127.0.0.1:8042` by default. Override it with
 ## Docker
 
 ```bash
+cp .env.example .env
+# Edit .env with the local database password and secret broker key.
 docker compose up --build
 ```
 
@@ -206,7 +208,7 @@ cargo test
 PostgreSQL integration tests use `SERVICENET_TEST_DATABASE_URL`:
 
 ```bash
-SERVICENET_TEST_DATABASE_URL=postgres://servicenet:servicenet@127.0.0.1:55433/watt_servicenet \
+SERVICENET_TEST_DATABASE_URL=postgres://your-db-user:your-db-password@127.0.0.1:55433/watt_servicenet \
 cargo test
 ```
 
