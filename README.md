@@ -120,7 +120,7 @@ cargo run -p watt-servicenet-node
 Run with PostgreSQL-backed state:
 
 ```bash
-SERVICENET_DATABASE_URL=postgres://servicenet:servicenet@127.0.0.1:55433/watt-servicenet \
+SERVICENET_DATABASE_URL=postgres://servicenet:servicenet@127.0.0.1:55433/watt_servicenet \
 SERVICENET_DATABASE_SCHEMA=public \
 SERVICENET_SECRET_BROKER_KEY=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc= \
 SERVICENET_REQUIRE_PROVIDER_OWNERSHIP_CHALLENGES=1 \
@@ -206,7 +206,7 @@ cargo test
 PostgreSQL integration tests use `SERVICENET_TEST_DATABASE_URL`:
 
 ```bash
-SERVICENET_TEST_DATABASE_URL=postgres://servicenet:servicenet@127.0.0.1:55433/watt-servicenet \
+SERVICENET_TEST_DATABASE_URL=postgres://servicenet:servicenet@127.0.0.1:55433/watt_servicenet \
 cargo test
 ```
 
