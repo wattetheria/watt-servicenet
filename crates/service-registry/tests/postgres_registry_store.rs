@@ -21,20 +21,20 @@ struct PgPool {
 
 impl PgPool {
     async fn connect(database_url: &str) -> Result<Self, postgres::Error> {
-        Client::connect(database_url, NoTls)?;
-        Ok(Self {
-            database_url: database_url.to_owned(),
+        let database_url = database_url.to_owned();
+        tokio::task::spawn_blocking({
+            let database_url = database_url.clone();
+            move || Client::connect(&database_url, NoTls)
         })
-    }
-
-    fn client(&self) -> Result<Client, postgres::Error> {
-        Client::connect(&self.database_url, NoTls)
+        .await
+        .expect("postgres connection task should join")?;
+        Ok(Self { database_url })
     }
 }
 
 struct Query {
     statement: String,
-    parameters: Vec<Box<dyn ToSql + Sync>>,
+    parameters: Vec<Box<dyn ToSql + Sync + Send>>,
 }
 
 fn query(statement: &str) -> Query {
@@ -51,14 +51,14 @@ fn query_scalar(statement: &str) -> ScalarQuery {
 }
 
 trait IntoParameter {
-    fn into_parameter(self) -> Box<dyn ToSql + Sync>;
+    fn into_parameter(self) -> Box<dyn ToSql + Sync + Send>;
 }
 
 macro_rules! owned_parameter {
     ($($ty:ty),+ $(,)?) => {
         $(
             impl IntoParameter for $ty {
-                fn into_parameter(self) -> Box<dyn ToSql + Sync> {
+                fn into_parameter(self) -> Box<dyn ToSql + Sync + Send> {
                     Box::new(self)
                 }
             }
@@ -69,19 +69,19 @@ macro_rules! owned_parameter {
 owned_parameter!(String, Uuid, serde_json::Value, Vec<String>);
 
 impl IntoParameter for &str {
-    fn into_parameter(self) -> Box<dyn ToSql + Sync> {
+    fn into_parameter(self) -> Box<dyn ToSql + Sync + Send> {
         Box::new(self.to_owned())
     }
 }
 
 impl IntoParameter for &String {
-    fn into_parameter(self) -> Box<dyn ToSql + Sync> {
+    fn into_parameter(self) -> Box<dyn ToSql + Sync + Send> {
         Box::new(self.clone())
     }
 }
 
 impl IntoParameter for &Uuid {
-    fn into_parameter(self) -> Box<dyn ToSql + Sync> {
+    fn into_parameter(self) -> Box<dyn ToSql + Sync + Send> {
         Box::new(*self)
     }
 }
@@ -92,27 +92,51 @@ impl Query {
         self
     }
 
-    fn parameter_refs(&self) -> Vec<&(dyn ToSql + Sync)> {
-        self.parameters.iter().map(|value| value.as_ref()).collect()
-    }
-
     async fn execute(self, pool: &PgPool) -> Result<u64, postgres::Error> {
-        let mut client = pool.client()?;
-        let parameters = self.parameter_refs();
-        client.execute(&self.statement, &parameters)
+        let database_url = pool.database_url.clone();
+        let statement = self.statement;
+        let parameters = self.parameters;
+        tokio::task::spawn_blocking(move || {
+            let mut client = Client::connect(&database_url, NoTls)?;
+            let parameters = parameter_refs(&parameters);
+            client.execute(&statement, &parameters)
+        })
+        .await
+        .expect("postgres query task should join")
     }
 
     async fn fetch_all(self, pool: &PgPool) -> Result<Vec<Row>, postgres::Error> {
-        let mut client = pool.client()?;
-        let parameters = self.parameter_refs();
-        client.query(&self.statement, &parameters)
+        let database_url = pool.database_url.clone();
+        let statement = self.statement;
+        let parameters = self.parameters;
+        tokio::task::spawn_blocking(move || {
+            let mut client = Client::connect(&database_url, NoTls)?;
+            let parameters = parameter_refs(&parameters);
+            client.query(&statement, &parameters)
+        })
+        .await
+        .expect("postgres query task should join")
     }
 
     async fn fetch_one(self, pool: &PgPool) -> Result<Row, postgres::Error> {
-        let mut client = pool.client()?;
-        let parameters = self.parameter_refs();
-        client.query_one(&self.statement, &parameters)
+        let database_url = pool.database_url.clone();
+        let statement = self.statement;
+        let parameters = self.parameters;
+        tokio::task::spawn_blocking(move || {
+            let mut client = Client::connect(&database_url, NoTls)?;
+            let parameters = parameter_refs(&parameters);
+            client.query_one(&statement, &parameters)
+        })
+        .await
+        .expect("postgres query task should join")
     }
+}
+
+fn parameter_refs(parameters: &[Box<dyn ToSql + Sync + Send>]) -> Vec<&(dyn ToSql + Sync)> {
+    parameters
+        .iter()
+        .map(|value| value.as_ref() as &(dyn ToSql + Sync))
+        .collect()
 }
 
 impl ScalarQuery {
