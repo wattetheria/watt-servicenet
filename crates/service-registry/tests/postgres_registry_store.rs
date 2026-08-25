@@ -2,8 +2,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
+use postgres::types::{FromSqlOwned, ToSql};
+use postgres::{Client, NoTls, Row};
 use serde_json::json;
-use sqlx::Row;
 use uuid::Uuid;
 use watt_servicenet_protocol::{
     AgentArtifacts, AgentAttestations, AgentDeployment, AgentDeploymentEndpoint,
@@ -13,6 +14,117 @@ use watt_servicenet_protocol::{
     build_agent_attestation_payload,
 };
 use watt_servicenet_registry::{InvocationJobKind, ServiceRegistry, ServiceRegistryConfig};
+
+struct PgPool {
+    database_url: String,
+}
+
+impl PgPool {
+    async fn connect(database_url: &str) -> Result<Self, postgres::Error> {
+        Client::connect(database_url, NoTls)?;
+        Ok(Self {
+            database_url: database_url.to_owned(),
+        })
+    }
+
+    fn client(&self) -> Result<Client, postgres::Error> {
+        Client::connect(&self.database_url, NoTls)
+    }
+}
+
+struct Query {
+    statement: String,
+    parameters: Vec<Box<dyn ToSql + Sync>>,
+}
+
+fn query(statement: &str) -> Query {
+    Query {
+        statement: statement.to_owned(),
+        parameters: Vec::new(),
+    }
+}
+
+struct ScalarQuery(Query);
+
+fn query_scalar(statement: &str) -> ScalarQuery {
+    ScalarQuery(query(statement))
+}
+
+trait IntoParameter {
+    fn into_parameter(self) -> Box<dyn ToSql + Sync>;
+}
+
+macro_rules! owned_parameter {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl IntoParameter for $ty {
+                fn into_parameter(self) -> Box<dyn ToSql + Sync> {
+                    Box::new(self)
+                }
+            }
+        )+
+    };
+}
+
+owned_parameter!(String, Uuid, serde_json::Value, Vec<String>);
+
+impl IntoParameter for &str {
+    fn into_parameter(self) -> Box<dyn ToSql + Sync> {
+        Box::new(self.to_owned())
+    }
+}
+
+impl IntoParameter for &String {
+    fn into_parameter(self) -> Box<dyn ToSql + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+impl IntoParameter for &Uuid {
+    fn into_parameter(self) -> Box<dyn ToSql + Sync> {
+        Box::new(*self)
+    }
+}
+
+impl Query {
+    fn bind<T: IntoParameter>(mut self, value: T) -> Self {
+        self.parameters.push(value.into_parameter());
+        self
+    }
+
+    fn parameter_refs(&self) -> Vec<&(dyn ToSql + Sync)> {
+        self.parameters.iter().map(|value| value.as_ref()).collect()
+    }
+
+    async fn execute(self, pool: &PgPool) -> Result<u64, postgres::Error> {
+        let mut client = pool.client()?;
+        let parameters = self.parameter_refs();
+        client.execute(&self.statement, &parameters)
+    }
+
+    async fn fetch_all(self, pool: &PgPool) -> Result<Vec<Row>, postgres::Error> {
+        let mut client = pool.client()?;
+        let parameters = self.parameter_refs();
+        client.query(&self.statement, &parameters)
+    }
+
+    async fn fetch_one(self, pool: &PgPool) -> Result<Row, postgres::Error> {
+        let mut client = pool.client()?;
+        let parameters = self.parameter_refs();
+        client.query_one(&self.statement, &parameters)
+    }
+}
+
+impl ScalarQuery {
+    fn bind<T: IntoParameter>(mut self, value: T) -> Self {
+        self.0 = self.0.bind(value);
+        self
+    }
+
+    async fn fetch_one<T: FromSqlOwned>(self, pool: &PgPool) -> Result<T, postgres::Error> {
+        Ok(self.0.fetch_one(pool).await?.try_get(0)?)
+    }
+}
 
 fn database_url() -> Option<String> {
     std::env::var("SERVICENET_TEST_DATABASE_URL").ok()
@@ -164,10 +276,10 @@ fn registry_tables() -> Vec<String> {
 }
 
 async fn assert_temporal_columns_exist(database_url: &str, schema: &str) {
-    let pool = sqlx::PgPool::connect(database_url)
+    let pool = PgPool::connect(database_url)
         .await
         .expect("postgres pool should connect");
-    let rows = sqlx::query(
+    let rows = query(
         r#"
         SELECT table_name, column_name
         FROM information_schema.columns
@@ -205,10 +317,10 @@ async fn postgres_store_handles_provider_agent_and_rotation_flow() {
         .register_provider(provider_request())
         .await
         .expect("provider should register");
-    let pool = sqlx::PgPool::connect(&database_url)
+    let pool = PgPool::connect(&database_url)
         .await
         .expect("postgres pool should connect");
-    let provider_created_at_before: chrono::DateTime<Utc> = sqlx::query(&format!(
+    let provider_created_at_before: chrono::DateTime<Utc> = query(&format!(
         r#"SELECT created_at FROM "{schema}"."providers" WHERE provider_id = $1"#
     ))
     .bind("provider-pg")
@@ -236,7 +348,7 @@ async fn postgres_store_handles_provider_agent_and_rotation_flow() {
         approved.service_address.as_deref(),
         Some("stripe@wattetheria")
     );
-    let mut legacy_record_json: serde_json::Value = sqlx::query_scalar(&format!(
+    let mut legacy_record_json: serde_json::Value = query_scalar(&format!(
         r#"SELECT record_json FROM "{schema}"."published_agents" WHERE agent_id = $1"#
     ))
     .bind("stripe-agent")
@@ -247,7 +359,7 @@ async fn postgres_store_handles_provider_agent_and_rotation_flow() {
         .as_object_mut()
         .expect("published agent record_json should be an object")
         .remove("service_address");
-    sqlx::query(&format!(
+    query(&format!(
         r#"UPDATE "{schema}"."published_agents" SET record_json = $1 WHERE agent_id = $2"#
     ))
     .bind(legacy_record_json)
@@ -293,7 +405,7 @@ async fn postgres_store_handles_provider_agent_and_rotation_flow() {
         rotated.provider_did,
         "did:key:z6MkhY7vL8T5d4w8n8f1M5uH1D2e4Q9zP3n5K7s2V4x6Y8Za"
     );
-    let provider_created_at_after: chrono::DateTime<Utc> = sqlx::query(&format!(
+    let provider_created_at_after: chrono::DateTime<Utc> = query(&format!(
         r#"SELECT created_at FROM "{schema}"."providers" WHERE provider_id = $1"#
     ))
     .bind("provider-pg")
@@ -375,10 +487,10 @@ async fn postgres_store_persists_agent_receipts_and_health() {
     );
     assert_eq!(receipts[0].receipt.invoke_mode, InvocationMode::Async);
 
-    let pool = sqlx::PgPool::connect(&database_url)
+    let pool = PgPool::connect(&database_url)
         .await
         .expect("postgres pool should connect");
-    let invoke_mode: String = sqlx::query_scalar(&format!(
+    let invoke_mode: String = query_scalar(&format!(
         r#"SELECT invoke_mode FROM "{schema}"."receipts" WHERE receipt_id = $1"#
     ))
     .bind(&receipts[0].receipt.receipt_id)
@@ -415,14 +527,14 @@ async fn postgres_migration_preserves_legacy_uuid_receipts_as_text_ids() {
         return;
     };
     let schema = schema_name("registry_receipt_migration");
-    let pool = sqlx::PgPool::connect(&database_url)
+    let pool = PgPool::connect(&database_url)
         .await
         .expect("postgres pool should connect");
-    sqlx::query(&format!(r#"CREATE SCHEMA "{schema}""#))
+    query(&format!(r#"CREATE SCHEMA "{schema}""#))
         .execute(&pool)
         .await
         .expect("legacy schema should create");
-    sqlx::query(&format!(
+    query(&format!(
         r#"CREATE TABLE "{schema}"."receipts" (
             receipt_id UUID PRIMARY KEY,
             agent_id TEXT NOT NULL,
@@ -442,7 +554,7 @@ async fn postgres_migration_preserves_legacy_uuid_receipts_as_text_ids() {
     .execute(&pool)
     .await
     .expect("legacy receipts table should create");
-    sqlx::query(&format!(
+    query(&format!(
         r#"CREATE TABLE "{schema}"."verifications" (
             receipt_id UUID PRIMARY KEY,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -456,7 +568,7 @@ async fn postgres_migration_preserves_legacy_uuid_receipts_as_text_ids() {
 
     let stored = stored_receipt();
     let legacy_id = Uuid::parse_str(&stored.receipt.receipt_id).expect("receipt id should be UUID");
-    sqlx::query(&format!(
+    query(&format!(
         r#"INSERT INTO "{schema}"."receipts"
            (receipt_id, agent_id, provider_id, invoke_mode, verification,
             request_secret_json, stored_json)
@@ -486,7 +598,7 @@ async fn postgres_migration_preserves_legacy_uuid_receipts_as_text_ids() {
         .expect("legacy receipt should remain queryable");
     assert_eq!(migrated.receipt.receipt_id, stored.receipt.receipt_id);
 
-    let column_types = sqlx::query(
+    let column_types = query(
         r#"SELECT table_name, data_type
            FROM information_schema.columns
            WHERE table_schema = $1
@@ -502,9 +614,9 @@ async fn postgres_migration_preserves_legacy_uuid_receipts_as_text_ids() {
     assert!(
         column_types
             .iter()
-            .all(|row| row.get::<String, _>("data_type") == "text")
+            .all(|row| row.get::<_, String>("data_type") == "text")
     );
-    let job_kind: String = sqlx::query_scalar(&format!(
+    let job_kind: String = query_scalar(&format!(
         r#"SELECT job_kind FROM "{schema}"."receipts" WHERE receipt_id = $1"#
     ))
     .bind(&stored.receipt.receipt_id)
@@ -580,10 +692,10 @@ async fn postgres_async_receipt_is_claimed_once_across_workers() {
     assert_eq!(claimed.request, request);
     assert_eq!(claimed.attempt_count, 1);
 
-    let pool = sqlx::PgPool::connect(&database_url)
+    let pool = PgPool::connect(&database_url)
         .await
         .expect("postgres pool should connect");
-    let row = sqlx::query(&format!(
+    let row = query(&format!(
         r#"SELECT job_kind, request_secret_json, lease_owner, attempt_count
            FROM "{schema}"."receipts" WHERE receipt_id = $1"#
     ))
@@ -592,8 +704,8 @@ async fn postgres_async_receipt_is_claimed_once_across_workers() {
     .await
     .expect("claimed receipt should load");
     let encrypted: serde_json::Value = row.get("request_secret_json");
-    assert_eq!(row.get::<String, _>("job_kind"), "customized_task");
+    assert_eq!(row.get::<_, String>("job_kind"), "customized_task");
     assert!(!encrypted.to_string().contains("postgres-private-token"));
-    assert!(row.get::<Option<String>, _>("lease_owner").is_some());
-    assert_eq!(row.get::<i32, _>("attempt_count"), 1);
+    assert!(row.get::<_, Option<String>>("lease_owner").is_some());
+    assert_eq!(row.get::<_, i32>("attempt_count"), 1);
 }

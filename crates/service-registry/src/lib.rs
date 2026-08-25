@@ -1,3 +1,4 @@
+use crate::postgres_driver::{PgPool, PgPoolOptions, Transaction, query, query_scalar};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -7,7 +8,6 @@ use chacha20poly1305::{
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,6 +36,7 @@ use watt_servicenet_protocol::{
     WATTETHERIA_ADAPTER_RUNTIME, build_agent_attestation_payload, build_agent_unpublish_payload,
 };
 
+mod postgres_driver;
 mod service_identity;
 
 #[derive(Debug, Error)]
@@ -640,7 +641,7 @@ impl PostgresRegistryStore {
             ),
         ];
         for statement in statements {
-            sqlx::query(&statement)
+            query(&statement)
                 .execute(&self.pool)
                 .await
                 .with_context(|| format!("failed to run migration: {statement}"))?;
@@ -650,7 +651,7 @@ impl PostgresRegistryStore {
                 let statement = format!(
                     r#"ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS {column} TIMESTAMPTZ NOT NULL DEFAULT NOW()"#
                 );
-                sqlx::query(&statement)
+                query(&statement)
                     .execute(&self.pool)
                     .await
                     .with_context(|| format!("failed to run migration: {statement}"))?;
@@ -659,7 +660,7 @@ impl PostgresRegistryStore {
         let published_agent_service_address_statement = format!(
             r#"ALTER TABLE "{schema}"."published_agents" ADD COLUMN IF NOT EXISTS service_address TEXT NULL"#
         );
-        sqlx::query(&published_agent_service_address_statement)
+        query(&published_agent_service_address_statement)
             .execute(&self.pool)
             .await
             .with_context(|| {
@@ -670,7 +671,7 @@ impl PostgresRegistryStore {
                ON "{schema}"."published_agents" (service_address)
                WHERE service_address IS NOT NULL"#
         );
-        sqlx::query(&published_agent_service_address_index_statement)
+        query(&published_agent_service_address_index_statement)
             .execute(&self.pool)
             .await
             .with_context(|| {
@@ -767,7 +768,7 @@ impl PostgresRegistryStore {
             ),
         ];
         for statement in backfills {
-            sqlx::query(&statement)
+            query(&statement)
                 .execute(&self.pool)
                 .await
                 .with_context(|| format!("failed to run migration: {statement}"))?;
@@ -781,7 +782,7 @@ impl RegistryStore for PostgresRegistryStore {
     async fn load_state(&self) -> Result<RegistryState> {
         let mut state = RegistryState::default();
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT record_json FROM "{}"."providers""#,
             self.schema
         ))
@@ -794,7 +795,7 @@ impl RegistryStore for PostgresRegistryStore {
                 .insert(provider.provider_id.clone(), provider);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT receipt_id, stored_json, job_kind, request_secret_json, available_at, lease_owner, lease_expires_at, attempt_count, last_error FROM "{}"."receipts""#,
             self.schema
         ))
@@ -804,7 +805,7 @@ impl RegistryStore for PostgresRegistryStore {
             let stored: StoredReceipt = serde_json::from_value(row.try_get("stored_json")?)?;
             let receipt_id = stored.receipt.receipt_id.clone();
             state.receipts.insert(receipt_id.clone(), stored);
-            if let Some(request_secret_json) = row.try_get::<Option<serde_json::Value>, _>(
+            if let Some(request_secret_json) = row.try_get::<_, Option<serde_json::Value>>(
                 "request_secret_json",
             )? {
                 state.receipt_jobs.insert(
@@ -812,15 +813,15 @@ impl RegistryStore for PostgresRegistryStore {
                     StoredInvocationJob {
                         receipt_id,
                         kind: invocation_job_kind_from_column(
-                            row.try_get::<Option<String>, _>("job_kind")?.as_deref(),
+                            row.try_get::<_, Option<String>>("job_kind")?.as_deref(),
                         ),
                         request_secret: serde_json::from_value(request_secret_json)?,
                         available_at: row
-                            .try_get::<Option<DateTime<Utc>>, _>("available_at")?
+                            .try_get::<_, Option<DateTime<Utc>>>("available_at")?
                             .unwrap_or_else(Utc::now),
                         lease_owner: row.try_get("lease_owner")?,
                         lease_expires_at: row.try_get("lease_expires_at")?,
-                        attempt_count: u32::try_from(row.try_get::<i32, _>("attempt_count")?)
+                        attempt_count: u32::try_from(row.try_get::<_, i32>("attempt_count")?)
                             .unwrap_or(u32::MAX),
                         last_error: row.try_get("last_error")?,
                     },
@@ -828,7 +829,7 @@ impl RegistryStore for PostgresRegistryStore {
             }
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT record_json FROM "{}"."provider_health""#,
             self.schema
         ))
@@ -841,7 +842,7 @@ impl RegistryStore for PostgresRegistryStore {
                 .insert(record.provider_id.clone(), record);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT record_json FROM "{}"."agent_health""#,
             self.schema
         ))
@@ -852,7 +853,7 @@ impl RegistryStore for PostgresRegistryStore {
             state.agent_health.insert(record.agent_id.clone(), record);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT record_json FROM "{}"."provider_trust""#,
             self.schema
         ))
@@ -865,7 +866,7 @@ impl RegistryStore for PostgresRegistryStore {
                 .insert(record.provider_id.clone(), record);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT record_json FROM "{}"."agent_trust""#,
             self.schema
         ))
@@ -876,7 +877,7 @@ impl RegistryStore for PostgresRegistryStore {
             state.agent_trust.insert(record.agent_id.clone(), record);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT record_json FROM "{}"."verifications""#,
             self.schema
         ))
@@ -890,7 +891,7 @@ impl RegistryStore for PostgresRegistryStore {
             }
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT record_json FROM "{}"."auth_contexts""#,
             self.schema
         ))
@@ -901,7 +902,7 @@ impl RegistryStore for PostgresRegistryStore {
             state.auth_contexts.insert(record.auth_context_id, record);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT auth_context_id, secret_json FROM "{}"."auth_context_secrets""#,
             self.schema
         ))
@@ -914,7 +915,7 @@ impl RegistryStore for PostgresRegistryStore {
             state.auth_context_secrets.insert(auth_context_id, envelope);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT challenge_json FROM "{}"."provider_ownership_challenges""#,
             self.schema
         ))
@@ -928,7 +929,7 @@ impl RegistryStore for PostgresRegistryStore {
                 .insert(challenge.challenge_id, challenge);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT event_json FROM "{}"."provider_audit_events" ORDER BY created_at ASC"#,
             self.schema
         ))
@@ -939,7 +940,7 @@ impl RegistryStore for PostgresRegistryStore {
             state.provider_audit_events.push(event);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT case_json FROM "{}"."moderation_cases""#,
             self.schema
         ))
@@ -950,7 +951,7 @@ impl RegistryStore for PostgresRegistryStore {
             state.moderation_cases.insert(case.case_id, case);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT record_json FROM "{}"."agent_submissions""#,
             self.schema
         ))
@@ -962,7 +963,7 @@ impl RegistryStore for PostgresRegistryStore {
             state.agent_submissions.insert(record.submission_id, record);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT record_json, service_address FROM "{}"."published_agents""#,
             self.schema
         ))
@@ -973,14 +974,14 @@ impl RegistryStore for PostgresRegistryStore {
                 serde_json::from_value(row.try_get("record_json")?)?;
             hydrate_published_agent_service_address(
                 &mut record,
-                row.try_get::<Option<String>, _>("service_address")?,
+                row.try_get::<_, Option<String>>("service_address")?,
             );
             state
                 .published_agents
                 .insert(record.agent_id.clone(), record);
         }
 
-        for row in sqlx::query(&format!(
+        for row in query(&format!(
             r#"SELECT record_json FROM "{}"."consumed_attestation_nonces""#,
             self.schema
         ))
@@ -1003,13 +1004,13 @@ impl RegistryStore for PostgresRegistryStore {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<PublishedAgentRecord>, usize)> {
-        let known_count = sqlx::query_scalar::<_, i64>(&format!(
+        let known_count: i64 = query_scalar(&format!(
             r#"SELECT COUNT(*) FROM "{}"."published_agents" WHERE status = 'Approved'"#,
             self.schema
         ))
         .fetch_one(&self.pool)
         .await?;
-        let rows = sqlx::query(&format!(
+        let rows = query(&format!(
             r#"SELECT record_json, service_address FROM "{}"."published_agents" WHERE status = 'Approved' ORDER BY agent_id ASC LIMIT $1 OFFSET $2"#,
             self.schema
         ))
@@ -1023,7 +1024,7 @@ impl RegistryStore for PostgresRegistryStore {
                 serde_json::from_value(row.try_get("record_json")?)?;
             hydrate_published_agent_service_address(
                 &mut record,
-                row.try_get::<Option<String>, _>("service_address")?,
+                row.try_get::<_, Option<String>>("service_address")?,
             );
             items.push(record);
         }
@@ -1035,7 +1036,7 @@ impl RegistryStore for PostgresRegistryStore {
 
         for provider in state.providers.values() {
             let (created_at, updated_at) = provider_record_timestamps(provider);
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."providers" (provider_id, status, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4, $5)
                    ON CONFLICT (provider_id) DO UPDATE SET
@@ -1049,12 +1050,12 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(created_at)
             .bind(updated_at)
             .bind(serde_json::to_value(provider)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         for record in state.provider_health.values() {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."provider_health" (provider_id, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4)
                    ON CONFLICT (provider_id) DO UPDATE SET
@@ -1066,12 +1067,12 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.updated_at)
             .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         for record in state.agent_health.values() {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."agent_health" (agent_id, provider_id, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4, $5)
                    ON CONFLICT (agent_id) DO UPDATE SET
@@ -1085,12 +1086,12 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.updated_at)
             .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         for record in state.provider_trust.values() {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."provider_trust" (provider_id, blocked, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4, $5)
                    ON CONFLICT (provider_id) DO UPDATE SET
@@ -1104,12 +1105,12 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.updated_at)
             .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         for record in state.agent_trust.values() {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."agent_trust" (agent_id, blocked, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4, $5)
                    ON CONFLICT (agent_id) DO UPDATE SET
@@ -1123,12 +1124,12 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.updated_at)
             .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         for record in state.auth_contexts.values() {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."auth_contexts" (auth_context_id, provider_id, subject_did, expires_at, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4, $5, $6, $7)
                    ON CONFLICT (auth_context_id) DO UPDATE SET
@@ -1146,7 +1147,7 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.created_at)
             .bind(record.created_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
@@ -1156,7 +1157,7 @@ impl RegistryStore for PostgresRegistryStore {
                 .get(auth_context_id)
                 .map(|record| record.created_at)
                 .unwrap_or_else(Utc::now);
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."auth_context_secrets" (auth_context_id, created_at, updated_at, secret_json)
                    VALUES ($1, $2, $3, $4)
                    ON CONFLICT (auth_context_id) DO UPDATE SET
@@ -1168,13 +1169,13 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(created_at)
             .bind(created_at)
             .bind(serde_json::to_value(envelope)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         for challenge in state.provider_ownership_challenges.values() {
             let updated_at = challenge.completed_at.unwrap_or(challenge.issued_at);
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."provider_ownership_challenges" (challenge_id, provider_id, operation, expires_at, created_at, updated_at, challenge_json)
                    VALUES ($1, $2, $3, $4, $5, $6, $7)
                    ON CONFLICT (challenge_id) DO UPDATE SET
@@ -1192,12 +1193,12 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(challenge.issued_at)
             .bind(updated_at)
             .bind(serde_json::to_value(challenge)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         for event in &state.provider_audit_events {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."provider_audit_events" (event_id, provider_id, created_at, updated_at, event_json)
                    VALUES ($1, $2, $3, $4, $5)
                    ON CONFLICT (event_id) DO UPDATE SET
@@ -1211,12 +1212,12 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(event.created_at)
             .bind(event.created_at)
             .bind(serde_json::to_value(event)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         for case in state.moderation_cases.values() {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."moderation_cases" (case_id, target_kind, target_id, status, created_at, updated_at, case_json)
                    VALUES ($1, $2, $3, $4, $5, $6, $7)
                    ON CONFLICT (case_id) DO UPDATE SET
@@ -1234,12 +1235,12 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(case.created_at)
             .bind(case.updated_at)
             .bind(serde_json::to_value(case)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         for record in state.agent_submissions.values() {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."agent_submissions" (submission_id, provider_id, agent_id, status, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4, $5, $6, $7)
                    ON CONFLICT (submission_id) DO UPDATE SET
@@ -1257,12 +1258,12 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.submitted_at)
             .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         for record in state.published_agents.values() {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."published_agents" (agent_id, provider_id, service_address, status, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4, $5, $6, $7)
                    ON CONFLICT (agent_id) DO UPDATE SET
@@ -1280,14 +1281,14 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.approved_at)
             .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         for record in state.consumed_attestation_nonces.values() {
             let key = ConsumedAttestationNonce::key(&record.attester_did, &record.nonce);
             let created_at = unix_ms_to_datetime(record.consumed_at_ms);
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."consumed_attestation_nonces" (key, attester_did, nonce, provider_id, agent_id, expires_at_ms, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                    ON CONFLICT (key) DO UPDATE SET
@@ -1309,7 +1310,7 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(created_at)
             .bind(created_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
@@ -1455,7 +1456,7 @@ impl RegistryStore for PostgresRegistryStore {
         if let Some(records) = state.verifications.get(receipt_id)
             && let Some((created_at, updated_at)) = verification_timestamps(records)
         {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."verifications" (receipt_id, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4)
                    ON CONFLICT (receipt_id) DO UPDATE SET
@@ -1467,12 +1468,12 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(created_at)
             .bind(updated_at)
             .bind(serde_json::to_value(records)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
         if let Some(record) = state.provider_health.get(&stored.receipt.provider_id) {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."provider_health" (provider_id, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4)
                    ON CONFLICT (provider_id) DO UPDATE SET
@@ -1484,11 +1485,11 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.updated_at)
             .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
         if let Some(record) = state.agent_health.get(&stored.receipt.agent_id) {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."agent_health" (agent_id, provider_id, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4, $5)
                    ON CONFLICT (agent_id) DO UPDATE SET
@@ -1502,11 +1503,11 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.updated_at)
             .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
         if let Some(record) = state.provider_trust.get(&stored.receipt.provider_id) {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."provider_trust" (provider_id, blocked, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4, $5)
                    ON CONFLICT (provider_id) DO UPDATE SET
@@ -1520,11 +1521,11 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.updated_at)
             .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
         if let Some(record) = state.agent_trust.get(&stored.receipt.agent_id) {
-            sqlx::query(&format!(
+            query(&format!(
                 r#"INSERT INTO "{}"."agent_trust" (agent_id, blocked, created_at, updated_at, record_json)
                    VALUES ($1, $2, $3, $4, $5)
                    ON CONFLICT (agent_id) DO UPDATE SET
@@ -1538,7 +1539,7 @@ impl RegistryStore for PostgresRegistryStore {
             .bind(record.updated_at)
             .bind(record.updated_at)
             .bind(serde_json::to_value(record)?)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
         }
 
@@ -1553,7 +1554,7 @@ impl RegistryStore for PostgresRegistryStore {
         lease_expires_at: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<StoredInvocationJob>> {
-        let rows = sqlx::query(&format!(
+        let rows = query(&format!(
             r#"WITH candidates AS (
                    SELECT receipt_id
                    FROM "{}"."receipts"
@@ -1591,13 +1592,13 @@ impl RegistryStore for PostgresRegistryStore {
                 Ok(StoredInvocationJob {
                     receipt_id: row.try_get("receipt_id")?,
                     kind: invocation_job_kind_from_column(
-                        row.try_get::<Option<String>, _>("job_kind")?.as_deref(),
+                        row.try_get::<_, Option<String>>("job_kind")?.as_deref(),
                     ),
                     request_secret: serde_json::from_value(row.try_get("request_secret_json")?)?,
                     available_at: row.try_get("available_at")?,
                     lease_owner: row.try_get("lease_owner")?,
                     lease_expires_at: row.try_get("lease_expires_at")?,
-                    attempt_count: u32::try_from(row.try_get::<i32, _>("attempt_count")?)
+                    attempt_count: u32::try_from(row.try_get::<_, i32>("attempt_count")?)
                         .unwrap_or(u32::MAX),
                     last_error: row.try_get("last_error")?,
                 })
@@ -1607,13 +1608,13 @@ impl RegistryStore for PostgresRegistryStore {
 }
 
 async fn upsert_receipt(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction,
     schema: &str,
     stored: &StoredReceipt,
     job: Option<&StoredInvocationJob>,
 ) -> Result<()> {
     let (created_at, updated_at) = receipt_timestamps(stored);
-    sqlx::query(&format!(
+    query(&format!(
         r#"INSERT INTO "{schema}"."receipts" (receipt_id, agent_id, provider_id, invoke_mode, caller_agent_id, caller_public_id, caller_display_name, caller_node_id, status, verification, job_kind, request_secret_json, available_at, lease_owner, lease_expires_at, attempt_count, last_error, created_at, updated_at, stored_json)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
            ON CONFLICT (receipt_id) DO UPDATE SET
@@ -1662,7 +1663,7 @@ async fn upsert_receipt(
     .bind(created_at)
     .bind(updated_at)
     .bind(serde_json::to_value(stored)?)
-    .execute(&mut **tx)
+    .execute(tx)
     .await?;
     Ok(())
 }
@@ -1726,33 +1727,33 @@ fn unix_ms_to_datetime(timestamp_ms: u64) -> DateTime<Utc> {
 }
 
 async fn delete_stale_text_rows(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction,
     schema: &str,
     table: &str,
     column: &str,
     keys: Vec<String>,
 ) -> Result<()> {
-    sqlx::query(&format!(
+    query(&format!(
         r#"DELETE FROM "{schema}"."{table}" WHERE NOT ({column} = ANY($1))"#
     ))
     .bind(keys)
-    .execute(&mut **tx)
+    .execute(tx)
     .await?;
     Ok(())
 }
 
 async fn delete_stale_uuid_rows(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction,
     schema: &str,
     table: &str,
     column: &str,
     keys: Vec<Uuid>,
 ) -> Result<()> {
-    sqlx::query(&format!(
+    query(&format!(
         r#"DELETE FROM "{schema}"."{table}" WHERE NOT ({column} = ANY($1))"#
     ))
     .bind(keys)
-    .execute(&mut **tx)
+    .execute(tx)
     .await?;
     Ok(())
 }
