@@ -30,11 +30,14 @@ impl PgPoolOptions {
         let database_url = database_url.to_owned();
         tokio::task::spawn_blocking({
             let database_url = database_url.clone();
-            move || Client::connect(&database_url, NoTls)
+            move || -> Result<()> {
+                let _client = Client::connect(&database_url, NoTls)
+                    .context("failed to connect to postgres")?;
+                Ok(())
+            }
         })
         .await
-        .context("postgres connection task failed")?
-        .context("failed to connect to postgres")?;
+        .context("postgres connection task failed")??;
         Ok(PgPool { database_url })
     }
 }
@@ -318,5 +321,19 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_connection_is_dropped_inside_blocking_worker() {
+        let Ok(database_url) = std::env::var("SERVICENET_TEST_DATABASE_URL") else {
+            return;
+        };
+
+        let pool = super::PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("postgres connection should succeed");
+        let result = super::query("SELECT 1").fetch_all(&pool).await;
+        assert!(result.is_ok());
     }
 }

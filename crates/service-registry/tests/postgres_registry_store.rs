@@ -24,7 +24,10 @@ impl PgPool {
         let database_url = database_url.to_owned();
         tokio::task::spawn_blocking({
             let database_url = database_url.clone();
-            move || Client::connect(&database_url, NoTls)
+            move || -> Result<(), postgres::Error> {
+                let _client = Client::connect(&database_url, NoTls)?;
+                Ok(())
+            }
         })
         .await
         .expect("postgres connection task should join")?;
